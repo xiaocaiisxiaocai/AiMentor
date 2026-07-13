@@ -46,6 +46,7 @@ flowchart LR
 cd C:\Users\SAC\Desktop\Agent\src\AiMentor
 dotnet build .\AiMentor.slnx
 dotnet test .\AiMentor.slnx
+$env:ASPNETCORE_ENVIRONMENT = 'Development'
 dotnet run --project .\src\AiMentor.Api\AiMentor.Api.csproj --urls http://127.0.0.1:5080
 ```
 
@@ -54,9 +55,6 @@ dotnet run --project .\src\AiMentor.Api\AiMentor.Api.csproj --urls http://127.0.
 ```powershell
 $body = @{
   question = 'Access Token 默认有效多久？'
-  tenantId = 'demo-beichen'
-  subjectId = 'user-001'
-  groups = @('all-rnd')
 } | ConvertTo-Json
 Invoke-RestMethod http://127.0.0.1:5080/api/v1/questions -Method Post -ContentType 'application/json' -Headers @{
   'X-Correlation-ID' = 'demo-request-001'
@@ -93,22 +91,52 @@ dotnet run --project .\src\AiMentor.Api\AiMentor.Api.csproj --urls http://127.0.
 - `GET /api/v1/knowledge/stats`：文档与分块数量。
 - `POST /api/v1/questions`：完整可信回答对象，含决策、答案、审核结果、引用与轨迹；响应头返回 `X-Run-ID`。
 - `POST /api/v1/questions/stream`：SSE 事件流，发出 `run.started` 与 `answer.completed`，禁用代理缓冲。
-- 原 `/api/questions`、`/api/questions/stream` 和 `/api/knowledge/stats` 暂时保留兼容，但不会出现在 OpenAPI 中。
+- 原 V0 接口默认关闭；只有非 Production 环境显式设置 `Api:EnableLegacyV0=true` 才会挂载兼容入口。
 
 请求体使用 DataAnnotations 自动校验，错误统一返回 RFC 7807 Problem Details。问答端点默认按调用方地址或已认证用户的 `sub` 声明限制为每分钟 60 次，可通过 `Api:QuestionRateLimitPerMinute` 调整。客户端可传 `X-Correlation-ID`，合法值会成为 Run ID，便于跨系统排障。
 
 ### API 成熟度与安全边界
 
-当前 v1 已可供本地前端、内部服务和自动化联调使用。它还不是公网生产 API：`TenantId`、`SubjectId`、`Groups` 暂由请求体提供，恶意调用方可以伪造这些字段。生产开放前必须完成 OIDC/JWT 验证，并仅从服务端验证后的 claims 构造 `AccessContext`；届时请求体将只保留问题和可选会话参数。
+当前 v1 请求体只接受问题，不接受调用方自报租户、用户或权限组。开发模式使用服务端配置的固定身份；OIDC JWT 模式通过提供方的 discovery metadata、签名、issuer、audience 和有效期验证 Access Token，然后从 `sub`、`tenant_id`、`groups` claims 构造 `AccessContext`。
+
+Production 环境有强制启动门禁：必须使用 `Authentication:Mode=OidcJwt`，必须提供 HTTPS Authority 和 Audience，并且必须关闭 V0。任何条件不满足都会启动失败，避免错误配置后“带病上线”。
+
+开发身份配置：
+
+```json
+{
+  "Authentication": {
+    "Mode": "Development",
+    "Development": {
+      "TenantId": "demo-beichen",
+      "SubjectId": "development-user",
+      "Groups": [ "all-rnd" ]
+    }
+  }
+}
+```
+
+OIDC/JWT 生产配置应通过环境变量或机密配置注入：
+
+```powershell
+$env:Authentication__Mode = 'OidcJwt'
+$env:Authentication__Authority = 'https://identity.example.com'
+$env:Authentication__Audience = 'aimentor-api'
+$env:Authentication__SubjectClaim = 'sub'
+$env:Authentication__TenantClaim = 'tenant_id'
+$env:Authentication__GroupsClaim = 'groups'
+```
+
+调用时添加 `Authorization: Bearer <access-token>`。OIDC JWT 模式生成的 OpenAPI 会声明 Bearer 安全方案，并只给受保护的 v1 端点添加安全要求；健康检查保持匿名可用。
 
 依赖审计曾阻止引入存在 CVE-2026-49451 的 `Microsoft.OpenApi 2.0.0`，当前已显式固定到官方修复版本 2.7.5，并通过全解决方案传递依赖漏洞检查。
 
 ## 下一阶段
 
 1. 引入独立证据充分性判定器和重排器，覆盖“文档相关但没有问题所求字段”的语义拒答，并对比归一化加权、RRF 等融合策略。
-2. 将身份改为 OIDC/JWT 验证后的服务端声明，禁止客户端自报用户组。
-3. 将规则审核扩展为输入、检索内容、工具参数、模型输出四道审核，并接入策略版本管理。
-4. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率和引用正确率门禁。
+2. 将规则审核扩展为输入、检索内容、工具参数、模型输出四道审核，并接入策略版本管理。
+3. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率和引用正确率门禁。
+4. 接入真实身份提供方做有效 Token 端到端验收，并覆盖密钥轮换、过期 Token、错误 audience 和组变更场景。
 5. 接入真实模型及嵌入供应商并运行同一套契约测试和 150 条回归，确认沙箱与生产适配器行为边界。
 
 ## 验证状态

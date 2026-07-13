@@ -5,6 +5,7 @@
     <RootNamespace>AiMentor.Tests</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
+    <ProjectReference Include="..\..\src\AiMentor.Api\AiMentor.Api.csproj" />
     <ProjectReference Include="..\..\src\AiMentor.Application\AiMentor.Application.csproj" />
     <ProjectReference Include="..\..\src\AiMentor.Domain\AiMentor.Domain.csproj" />
     <ProjectReference Include="..\..\src\AiMentor.Infrastructure\AiMentor.Infrastructure.csproj" />
@@ -18,4 +19,3 @@
     </PackageReference>
   </ItemGroup>
 </Project>
-
