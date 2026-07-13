@@ -7,7 +7,7 @@
 - 后端：C#、ASP.NET Core、.NET 10。
 - Agent 编排：[Microsoft Agent Framework](https://github.com/microsoft/agent-framework) 的 `ChatClientAgent`，没有使用已经过时的 Semantic Kernel Planner。
 - 模型契约：`Microsoft.Extensions.AI.IChatClient`。当前默认实现为无需密钥的确定性沙箱模型，真实模型接入时只替换这一适配器。
-- RAG：当前为 Markdown + YAML Front Matter 导入、按二级标题切分、ACL 前置过滤、中文双字词与英文词法召回。这是可测试的 V1 沙箱，不是生产级向量/混合检索。
+- RAG：支持本地 Markdown 词法沙箱和 OpenSearch 3.5 混合检索两种适配器。OpenSearch 路径使用 BM25 + 256 维向量 + 分数归一化加权融合，并在两个召回分支中都执行租户和 ACL 前置过滤。
 - 知识：默认加载 `AI-Agent-V1合成数据包\knowledge` 中 23 份已发布合成文档，共 74 个分块。
 - 测评：完整读取 150 条 JSONL 测评集并输出分类指标和失败样本。
 
@@ -18,7 +18,7 @@ flowchart LR
     U["调用者：问题 + 租户 + 用户组"] --> S["输入安全审核"]
     S -->|拒绝| R["安全拒答"]
     S -->|通过| A["ACL 前置过滤"]
-    A --> K["知识检索与分块召回"]
+    A --> K["本地词法 / OpenSearch 混合召回"]
     K --> G{"证据充分？"}
     G -->|否| N["明确拒答：证据不足"]
     G -->|是| M["Agent Framework / ChatClientAgent"]
@@ -71,6 +71,19 @@ dotnet run --project .\src\AiMentor.Evaluation\AiMentor.Evaluation.csproj
 
 若知识包不在默认相邻目录，可设置 `AIMENTOR_KNOWLEDGE_ROOT` 为绝对路径。
 
+### 启用 OpenSearch 混合检索
+
+```powershell
+docker compose up -d
+$env:Rag__Provider = 'OpenSearch'
+$env:OpenSearch__Endpoint = 'http://127.0.0.1:9200'
+dotnet run --project .\src\AiMentor.Api\AiMentor.Api.csproj --urls http://127.0.0.1:5080
+```
+
+首次启动会创建 `aimentor-knowledge-v1` 索引、`aimentor-hybrid-v1` 搜索管线，并幂等写入 74 个分块。默认权重为 BM25 0.45、向量 0.55。开发环境使用确定性特征哈希嵌入，只用于打通链路；生产环境必须将 `ITextEmbeddingGenerator` 替换为经过评测的中文/多语言嵌入模型。
+
+若 OpenSearch 开启安全插件，通过 `AIMENTOR_OPENSEARCH_USERNAME` 和 `AIMENTOR_OPENSEARCH_PASSWORD` 注入凭证，不应把密码写入 `appsettings.json`。客户端不允许关闭 TLS 证书校验。
+
 ## API
 
 - `GET /health`：服务和知识加载状态。
@@ -80,11 +93,15 @@ dotnet run --project .\src\AiMentor.Evaluation\AiMentor.Evaluation.csproj
 
 ## 下一阶段
 
-1. 用 OpenSearch 混合检索适配器替换本地词法检索，加入向量召回、BM25、RRF、重排和查询改写。
-2. 引入独立证据充分性判定器，覆盖“文档相关但没有问题所求字段”的语义拒答。
-3. 将身份改为 OIDC/JWT 验证后的服务端声明，禁止客户端自报用户组。
-4. 将规则审核扩展为输入、检索内容、工具参数、模型输出四道审核，并接入策略版本管理。
-5. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率和引用正确率门禁。
-6. 接入真实模型供应商并运行同一套契约测试和 150 条回归，确认沙箱与生产适配器行为边界。
+1. 引入独立证据充分性判定器和重排器，覆盖“文档相关但没有问题所求字段”的语义拒答，并对比归一化加权、RRF 等融合策略。
+2. 将身份改为 OIDC/JWT 验证后的服务端声明，禁止客户端自报用户组。
+3. 将规则审核扩展为输入、检索内容、工具参数、模型输出四道审核，并接入策略版本管理。
+4. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率和引用正确率门禁。
+5. 接入真实模型及嵌入供应商并运行同一套契约测试和 150 条回归，确认沙箱与生产适配器行为边界。
+
+## 验证状态
+
+- OpenSearch 请求契约已由自动化测试验证：索引映射、搜索管线、批量摄取，以及 BM25/k-NN 两个分支中的租户和 ACL 过滤。
+- 2026-07-13 尝试拉取 `opensearchproject/opensearch:3.5.0` 做真实容器验收，但镜像仓库连续两次无下载进度并超时，未创建镜像或容器。因此真实集群验收尚未通过，网络恢复后必须重新执行 `docker compose up -d` 和 HTTP 闭环。
 
 生产化时可参考 [Microsoft Agent Framework 官方仓库](https://github.com/microsoft/agent-framework)、[Microsoft Kernel Memory](https://github.com/microsoft/kernel-memory) 的摄取与检索管线思想，以及 [OpenSearch neural search](https://github.com/opensearch-project/neural-search) 的混合检索实现。具体选型和版本必须在实施时按官方文档再次核验。

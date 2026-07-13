@@ -9,6 +9,17 @@ public interface IKnowledgeRepository
     KnowledgeStatistics Statistics { get; }
 }
 
+public interface IKnowledgeChunkSource
+{
+    Task<IReadOnlyList<KnowledgeChunk>> ReadAllChunksAsync(CancellationToken cancellationToken = default);
+}
+
+public interface ITextEmbeddingGenerator
+{
+    int Dimensions { get; }
+    Task<float[]> GenerateAsync(string text, CancellationToken cancellationToken = default);
+}
+
 public sealed record KnowledgeStatistics(int Documents, int Chunks);
 
 public interface IInputSafetyService

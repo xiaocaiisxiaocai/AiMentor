@@ -6,11 +6,12 @@ using AiMentor.Domain;
 
 namespace AiMentor.Infrastructure;
 
-public sealed class MarkdownKnowledgeRepository(string rootPath) : IKnowledgeRepository, IDisposable
+public sealed class MarkdownKnowledgeRepository(string rootPath) : IKnowledgeRepository, IKnowledgeChunkSource, IDisposable
 {
     private readonly string _rootPath = Path.GetFullPath(rootPath);
     private KnowledgeDocument[] _documents = [];
     private readonly SemaphoreSlim _initializationLock = new(1, 1);
+    private int _disposed;
 
     public KnowledgeStatistics Statistics { get; private set; } = new(0, 0);
 
@@ -28,7 +29,7 @@ public sealed class MarkdownKnowledgeRepository(string rootPath) : IKnowledgeRep
                 async (path, token) =>
                 {
                     var text = await File.ReadAllTextAsync(path, token);
-                    var document = Parse(path, text);
+                    var document = Parse(path, Path.GetRelativePath(_rootPath, path), text);
                     if (document is { Status: "published" }) documents.Add(document);
                 });
 
@@ -60,12 +61,18 @@ public sealed class MarkdownKnowledgeRepository(string rootPath) : IKnowledgeRep
             .ToArray();
     }
 
-    public void Dispose()
+    public async Task<IReadOnlyList<KnowledgeChunk>> ReadAllChunksAsync(CancellationToken cancellationToken = default)
     {
-        _initializationLock.Dispose();
+        await InitializeAsync(cancellationToken);
+        return _documents.SelectMany(document => document.Chunks).ToArray();
     }
 
-    private static KnowledgeDocument? Parse(string path, string text)
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) == 0) _initializationLock.Dispose();
+    }
+
+    private static KnowledgeDocument? Parse(string path, string sourcePath, string text)
     {
         var frontMatter = Regex.Match(text, @"\A---\s*\r?\n(?<yaml>.*?)\r?\n---\s*\r?\n(?<body>.*)\z", RegexOptions.Singleline);
         if (!frontMatter.Success) return null;
@@ -77,8 +84,8 @@ public sealed class MarkdownKnowledgeRepository(string rootPath) : IKnowledgeRep
         var title = Required("title");
         var tenant = Required("tenant_id");
         var groups = ParseList(metadata.GetValueOrDefault("acl_allow_groups"));
-        var chunks = SplitIntoChunks(id, version, title, tenant, groups, path, frontMatter.Groups["body"].Value);
-        return new KnowledgeDocument(id, version, title, tenant, groups, metadata.GetValueOrDefault("status", "draft"), path, chunks);
+        var chunks = SplitIntoChunks(id, version, title, tenant, groups, sourcePath, frontMatter.Groups["body"].Value);
+        return new KnowledgeDocument(id, version, title, tenant, groups, metadata.GetValueOrDefault("status", "draft"), sourcePath, chunks);
 
         string Required(string key) => metadata.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)
             ? value : throw new InvalidDataException($"{path} 缺少必需元数据 {key}。");
