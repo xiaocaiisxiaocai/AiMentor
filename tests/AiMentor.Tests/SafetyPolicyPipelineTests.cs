@@ -130,7 +130,7 @@ public sealed class SafetyPolicyPipelineTests
         new(new StaticKnowledgeRepository(evidence), new RuleBasedQueryNormalizer(), new RuleBasedInputSafetyService(),
             new RuleBasedRetrievedContentSafetyService(), new LexicalEvidenceReranker(),
             new RuleBasedEvidenceSufficiencyEvaluator(), composer, new RuleBasedOutputSafetyService(),
-            new InMemoryTraceSink(), new TrustedQuestionOptions());
+        new InMemoryTraceSink(), new TrustedQuestionOptions(), new EmptyMemoryContextProvider());
 
     private static Evidence CreateEvidence(string content) => new(new KnowledgeChunk(
         "BK-POL-002#token", "BK-POL-002", "v1", "身份认证策略", "Token 生命周期", content,
@@ -147,6 +147,7 @@ public sealed class SafetyPolicyPipelineTests
     private sealed class FixedAnswerComposer(string answer) : IAnswerComposer
     {
         public Task<string> ComposeAsync(string question, IReadOnlyList<Evidence> evidence,
+            IReadOnlyList<MemoryContextItem> memories,
             CancellationToken cancellationToken = default) => Task.FromResult(answer);
     }
 }

@@ -4,6 +4,7 @@ using AiMentor.Domain;
 
 namespace AiMentor.Infrastructure;
 
+/// <summary>供单元测试使用的进程内记忆存储，保持与持久化实现相同的所有权语义。</summary>
 public sealed class InMemoryMemoryStore : IMemoryStore
 {
     private readonly object _gate = new();

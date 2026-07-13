@@ -2,6 +2,7 @@ using AiMentor.Domain;
 
 namespace AiMentor.Application;
 
+/// <summary>强制执行“先提案、后批准”以及租户隔离、内容审核和保留期约束。</summary>
 public sealed class MemoryWorkflowService(
     IMemoryStore store,
     IMemoryContentSafetyService contentSafety,
@@ -126,11 +127,11 @@ public sealed class MemoryWorkflowService(
     }
 
     private static MemoryWorkflowException CreateMutationFailure(MemoryStoreStatus status) => status switch
-        {
-            MemoryStoreStatus.Conflict => new MemoryWorkflowException("MEMORY_VERSION_CONFLICT", "记忆已被其他操作更新，请重新读取后再提交。", MemoryWorkflowErrorKind.Conflict),
-            MemoryStoreStatus.RetentionExceeded => new MemoryWorkflowException("MEMORY_RETENTION_EXTENSION_DENIED", "更正操作只能缩短保留期，延长保留期必须重新提案并批准。", MemoryWorkflowErrorKind.Validation),
-            _ => new MemoryWorkflowException("MEMORY_NOT_FOUND", "没有找到当前用户可操作的记忆。", MemoryWorkflowErrorKind.NotFound)
-        };
+    {
+        MemoryStoreStatus.Conflict => new MemoryWorkflowException("MEMORY_VERSION_CONFLICT", "记忆已被其他操作更新，请重新读取后再提交。", MemoryWorkflowErrorKind.Conflict),
+        MemoryStoreStatus.RetentionExceeded => new MemoryWorkflowException("MEMORY_RETENTION_EXTENSION_DENIED", "更正操作只能缩短保留期，延长保留期必须重新提案并批准。", MemoryWorkflowErrorKind.Validation),
+        _ => new MemoryWorkflowException("MEMORY_NOT_FOUND", "没有找到当前用户可操作的记忆。", MemoryWorkflowErrorKind.NotFound)
+    };
 
     private DateTimeOffset ResolveExpiration(MemoryScope scope, DateTimeOffset? requested, DateTimeOffset now)
     {

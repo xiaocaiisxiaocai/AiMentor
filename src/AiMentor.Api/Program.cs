@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Threading.RateLimiting;
+using System.Security.Cryptography;
 using AiMentor.Api;
 using AiMentor.Application;
 using AiMentor.Domain;
@@ -168,9 +169,19 @@ builder.Services.AddSingleton(new TrustedQuestionOptions());
 builder.Services.AddSingleton<ITrustedQuestionService, TrustedQuestionService>();
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton(new MemoryWorkflowOptions());
-builder.Services.AddSingleton<IMemoryStore, InMemoryMemoryStore>();
+var memoryDataDirectory = Path.Combine(builder.Environment.ContentRootPath, "data");
+var memoryStorePath = builder.Configuration["Memory:StorePath"]
+    ?? Path.Combine(memoryDataDirectory, "aimentor-memory.json");
+var memoryKey = ResolveMemoryMasterKey(
+    builder.Configuration["Memory:EncryptionKey"] ?? Environment.GetEnvironmentVariable("AIMENTOR_MEMORY_ENCRYPTION_KEY"),
+    Path.Combine(memoryDataDirectory, "memory.key"), builder.Environment.IsProduction());
+builder.Services.AddSingleton<IMemoryCipher>(new AesGcmMemoryCipher(memoryKey));
+builder.Services.AddSingleton(new EncryptedFileMemoryStoreOptions { FilePath = memoryStorePath });
+builder.Services.AddSingleton<IMemoryStore, EncryptedFileMemoryStore>();
 builder.Services.AddSingleton<IMemoryContentSafetyService, RuleBasedMemoryContentSafetyService>();
 builder.Services.AddSingleton<IMemoryWorkflowService, MemoryWorkflowService>();
+builder.Services.AddSingleton(new MemoryContextOptions());
+builder.Services.AddSingleton<IMemoryContextProvider, SafeMemoryContextProvider>();
 
 var app = builder.Build();
 app.UseExceptionHandler();
@@ -292,7 +303,7 @@ static async Task<IResult> AskAsync(AskV1Request request, ITrustedQuestionServic
     var correlationId = GetCorrelationId(context);
     var access = accessProvider.GetAccessContext(context.User);
     var answer = await service.AskAsync(new TrustedQuestion(request.Question,
-        access, correlationId), cancellationToken);
+        access, correlationId, request.SessionId), cancellationToken);
     context.Response.Headers["X-Run-ID"] = answer.RunId;
     if (answer.Decision != AnswerDecision.Failed) return Results.Ok(answer);
     return Results.Problem(statusCode: StatusCodes.Status503ServiceUnavailable, title: "回答生成失败",
@@ -310,7 +321,7 @@ static async Task StreamAsync(AskV1Request request, ITrustedQuestionService serv
     await WriteEventAsync(context.Response, "run.started", new { runId }, jsonOptions.Value.SerializerOptions, cancellationToken);
     var access = accessProvider.GetAccessContext(context.User);
     var answer = await service.AskAsync(new TrustedQuestion(request.Question,
-        access, runId), cancellationToken);
+        access, runId, request.SessionId), cancellationToken);
     await WriteEventAsync(context.Response, "answer.completed", answer, jsonOptions.Value.SerializerOptions, cancellationToken);
 }
 
@@ -459,4 +470,34 @@ static string GetCorrelationId(HttpContext context)
     if (requested.Length is > 0 and <= 128 && requested.All(character => char.IsLetterOrDigit(character) || character is '-' or '_' or '.'))
         return requested;
     return Guid.NewGuid().ToString("N");
+}
+
+static byte[] ResolveMemoryMasterKey(string? configuredKey, string developmentKeyPath, bool production)
+{
+    if (!string.IsNullOrWhiteSpace(configuredKey))
+    {
+        try
+        {
+            var key = Convert.FromBase64String(configuredKey.Trim());
+            if (key.Length == 32) return key;
+        }
+        catch (FormatException)
+        {
+            // 统一使用下方的安全配置错误，避免回显密钥内容。
+        }
+        throw new InvalidOperationException("Memory:EncryptionKey 必须是 Base64 编码的 32 字节密钥。");
+    }
+    if (production)
+        throw new InvalidOperationException("Production 环境必须通过 AIMENTOR_MEMORY_ENCRYPTION_KEY 提供记忆加密密钥。");
+
+    Directory.CreateDirectory(Path.GetDirectoryName(developmentKeyPath)!);
+    if (File.Exists(developmentKeyPath))
+    {
+        var existing = Convert.FromBase64String(File.ReadAllText(developmentKeyPath).Trim());
+        if (existing.Length == 32) return existing;
+        throw new InvalidOperationException("开发记忆密钥文件格式无效，请先备份数据库后重新生成密钥。");
+    }
+    var generated = RandomNumberGenerator.GetBytes(32);
+    File.WriteAllText(developmentKeyPath, Convert.ToBase64String(generated));
+    return generated;
 }

@@ -4,6 +4,7 @@ using Microsoft.OpenApi;
 
 namespace AiMentor.Api;
 
+/// <summary>只为启用 JWT 的受保护 v1 操作生成 Bearer OpenAPI 安全声明。</summary>
 public sealed class BearerSecuritySchemeTransformer : IOpenApiDocumentTransformer, IOpenApiOperationTransformer
 {
     public Task TransformAsync(OpenApiDocument document, OpenApiDocumentTransformerContext context,

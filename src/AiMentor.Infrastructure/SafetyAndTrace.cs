@@ -33,6 +33,7 @@ public sealed partial class RuleBasedInputSafetyService : IInputSafetyService
     private static partial Regex MemoryMutationPattern();
 }
 
+/// <summary>供开发和测试读取运行轨迹的进程内实现。</summary>
 public sealed class InMemoryTraceSink : ITraceSink
 {
     private readonly ConcurrentDictionary<string, IReadOnlyList<TraceStep>> _traces = new(StringComparer.Ordinal);

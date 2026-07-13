@@ -20,7 +20,7 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
             new RuleBasedRetrievedContentSafetyService(),
             new LexicalEvidenceReranker(), new RuleBasedEvidenceSufficiencyEvaluator(),
             new AgentFrameworkAnswerComposer(_chatClient), new RuleBasedOutputSafetyService(),
-            new InMemoryTraceSink(), new TrustedQuestionOptions());
+            new InMemoryTraceSink(), new TrustedQuestionOptions(), new EmptyMemoryContextProvider());
     }
 
     public Task DisposeAsync() => Task.CompletedTask;

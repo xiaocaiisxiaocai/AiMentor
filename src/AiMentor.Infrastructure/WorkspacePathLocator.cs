@@ -1,5 +1,6 @@
 namespace AiMentor.Infrastructure;
 
+/// <summary>在开发、测试和命令行入口间统一定位知识包与评测文件。</summary>
 public static class WorkspacePathLocator
 {
     public static string FindKnowledgeRoot(string? configuredPath = null)

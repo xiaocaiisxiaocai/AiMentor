@@ -3,6 +3,7 @@ using AiMentor.Domain;
 
 namespace AiMentor.Api;
 
+/// <summary>配置开发身份或 OIDC JWT 声明映射。</summary>
 public sealed class AiMentorAuthenticationOptions
 {
     public string Mode { get; init; } = "Development";
@@ -16,11 +17,13 @@ public sealed class AiMentorAuthenticationOptions
     public string[] DevelopmentGroups { get; init; } = ["all-rnd"];
 }
 
+/// <summary>从已验证主体构造应用层访问上下文。</summary>
 public interface IRequestAccessContextProvider
 {
     AccessContext GetAccessContext(ClaimsPrincipal principal);
 }
 
+/// <summary>仅在开发模式使用服务端固定身份，避免请求体自报权限。</summary>
 public sealed class DevelopmentAccessContextProvider(AiMentorAuthenticationOptions options) : IRequestAccessContextProvider
 {
     public AccessContext GetAccessContext(ClaimsPrincipal principal) => AccessContext.Create(
@@ -29,6 +32,7 @@ public sealed class DevelopmentAccessContextProvider(AiMentorAuthenticationOptio
         options.DevelopmentGroups);
 }
 
+/// <summary>从通过签名和受众验证的 JWT claims 构造访问身份。</summary>
 public sealed class ClaimsAccessContextProvider(AiMentorAuthenticationOptions options) : IRequestAccessContextProvider
 {
     public AccessContext GetAccessContext(ClaimsPrincipal principal)

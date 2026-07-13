@@ -9,6 +9,7 @@ using AiMentor.Domain;
 
 namespace AiMentor.Infrastructure;
 
+/// <summary>配置 OpenSearch 索引、混合检索管线和启动同步行为。</summary>
 public sealed class OpenSearchOptions
 {
     public string IndexName { get; init; } = "aimentor-knowledge-v1";
@@ -128,12 +129,19 @@ public sealed partial class OpenSearchKnowledgeRepository(
                 ["dynamic"] = "strict",
                 ["properties"] = new Dictionary<string, object?>
                 {
-                    ["chunk_id"] = Field("keyword"), ["document_id"] = Field("keyword"), ["version"] = Field("keyword"),
-                    ["title"] = Field("text"), ["section"] = Field("text"), ["content"] = Field("text"),
-                    ["tenant_id"] = Field("keyword"), ["allowed_groups"] = Field("keyword"), ["source_path"] = Field("keyword", false),
+                    ["chunk_id"] = Field("keyword"),
+                    ["document_id"] = Field("keyword"),
+                    ["version"] = Field("keyword"),
+                    ["title"] = Field("text"),
+                    ["section"] = Field("text"),
+                    ["content"] = Field("text"),
+                    ["tenant_id"] = Field("keyword"),
+                    ["allowed_groups"] = Field("keyword"),
+                    ["source_path"] = Field("keyword", false),
                     ["embedding"] = new Dictionary<string, object?>
                     {
-                        ["type"] = "knn_vector", ["dimension"] = embeddings.Dimensions,
+                        ["type"] = "knn_vector",
+                        ["dimension"] = embeddings.Dimensions,
                         ["method"] = new Dictionary<string, object?> { ["name"] = "hnsw", ["engine"] = "lucene", ["space_type"] = "cosinesimil" }
                     }
                 }

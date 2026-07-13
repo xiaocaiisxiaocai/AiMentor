@@ -6,6 +6,7 @@ using AiMentor.Domain;
 
 namespace AiMentor.Infrastructure;
 
+/// <summary>构建名称唯一且只读的服务器工具白名单。</summary>
 public sealed class ServerToolRegistry : IToolRegistry
 {
     private readonly Dictionary<string, IServerTool> _tools;
@@ -30,6 +31,7 @@ public sealed class ServerToolRegistry : IToolRegistry
     public bool TryGet(string toolName, out IServerTool? tool) => _tools.TryGetValue(toolName, out tool);
 }
 
+/// <summary>在工具实现运行前后执行身份、风险、参数、超时、幂等和结果大小门禁。</summary>
 public sealed class SafeToolExecutor(
     IToolRegistry registry,
     IToolInvocationSafetyService safety,
@@ -208,6 +210,7 @@ public sealed class SafeToolExecutor(
     private sealed record IdempotentExecution(DateTimeOffset CreatedAt, Lazy<Task<ToolExecutionResult>> Task);
 }
 
+/// <summary>返回不含文档正文的只读知识库规模统计。</summary>
 public sealed class KnowledgeStatisticsTool(IKnowledgeRepository repository) : IServerTool
 {
     public ToolDescriptor Descriptor { get; } = new("knowledge.stats", "返回当前知识库文档和分块数量。",

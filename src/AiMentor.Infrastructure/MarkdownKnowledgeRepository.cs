@@ -6,6 +6,7 @@ using AiMentor.Domain;
 
 namespace AiMentor.Infrastructure;
 
+/// <summary>加载本地 Markdown 知识并在内存中执行租户与 ACL 前置过滤检索。</summary>
 public sealed class MarkdownKnowledgeRepository(string rootPath) : IKnowledgeRepository, IKnowledgeChunkSource, IDisposable
 {
     private readonly string _rootPath = Path.GetFullPath(rootPath);

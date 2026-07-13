@@ -20,6 +20,7 @@ public sealed partial class RuleBasedQueryNormalizer : IQueryNormalizer
     private static partial Regex Whitespace();
 }
 
+/// <summary>使用可解释词项覆盖率重排证据，同时保留原始检索分用于引用。</summary>
 public sealed class LexicalEvidenceReranker : IEvidenceReranker
 {
     public Task<IReadOnlyList<Evidence>> RerankAsync(string question, IReadOnlyList<Evidence> evidence,

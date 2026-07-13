@@ -14,7 +14,7 @@ var service = new TrustedQuestionService(repository, new RuleBasedQueryNormalize
     new RuleBasedRetrievedContentSafetyService(),
     new LexicalEvidenceReranker(), new RuleBasedEvidenceSufficiencyEvaluator(),
     new AgentFrameworkAnswerComposer(chatClient), new RuleBasedOutputSafetyService(),
-    new InMemoryTraceSink(), new TrustedQuestionOptions());
+    new InMemoryTraceSink(), new TrustedQuestionOptions(), new EmptyMemoryContextProvider());
 
 var inputJsonOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
 var cases = (await File.ReadAllLinesAsync(evaluationFile))

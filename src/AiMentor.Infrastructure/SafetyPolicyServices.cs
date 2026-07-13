@@ -7,6 +7,7 @@ using AiMentor.Domain;
 
 namespace AiMentor.Infrastructure;
 
+/// <summary>集中管理写入审计轨迹的安全策略版本。</summary>
 public static class SafetyPolicyVersions
 {
     public const string Current = "2026-07-13.2";
@@ -41,6 +42,7 @@ public sealed partial class RuleBasedRetrievedContentSafetyService : IRetrievedC
     private static partial Regex EmbeddedInstruction();
 }
 
+/// <summary>配置允许工具及其网络目标白名单。</summary>
 public sealed class ToolSafetyOptions
 {
     public IReadOnlySet<string> AllowedTools { get; init; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase);

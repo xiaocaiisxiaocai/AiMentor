@@ -2,6 +2,7 @@ using AiMentor.Domain;
 
 namespace AiMentor.Application;
 
+/// <summary>按固定顺序执行安全审核、ACL 检索、证据门禁、记忆注入、回答和输出审核。</summary>
 public sealed class TrustedQuestionService(
     IKnowledgeRepository knowledge,
     IQueryNormalizer queryNormalizer,
@@ -12,7 +13,8 @@ public sealed class TrustedQuestionService(
     IAnswerComposer composer,
     IOutputSafetyService outputSafety,
     ITraceSink traceSink,
-    TrustedQuestionOptions options) : ITrustedQuestionService
+    TrustedQuestionOptions options,
+    IMemoryContextProvider memoryContext) : ITrustedQuestionService
 {
     public async Task<TrustedAnswer> AskAsync(TrustedQuestion question, CancellationToken cancellationToken = default)
     {
@@ -83,7 +85,14 @@ public sealed class TrustedQuestionService(
         });
         try
         {
-            var answer = await composer.ComposeAsync(question.Question, evidence, cancellationToken);
+            var memories = await memoryContext.GetRelevantAsync(question.Question, question.Access, question.SessionId,
+                cancellationToken);
+            Trace("memory.context", memories.Count > 0 ? "injected" : "empty", new Dictionary<string, object?>
+            {
+                ["count"] = memories.Count,
+                ["scopes"] = string.Join(',', memories.Select(item => item.Scope).Distinct())
+            });
+            var answer = await composer.ComposeAsync(question.Question, evidence, memories, cancellationToken);
             var citationRanking = evidence.OrderByDescending(item => item.RetrievalScore ?? item.Score).ToArray();
             var topRetrievalScore = citationRanking[0].RetrievalScore ?? citationRanking[0].Score;
             var citationThreshold = Math.Max(options.MinimumTopScore, topRetrievalScore * 0.6);

@@ -4,15 +4,19 @@ using AiMentor.Domain;
 
 namespace AiMentor.Api;
 
+/// <summary>提交问题及可选会话标识；身份始终由认证上下文提供。</summary>
 public sealed record AskV1Request(
-    [property: Required, StringLength(4_000, MinimumLength = 1)] string Question);
+    [property: Required, StringLength(4_000, MinimumLength = 1)] string Question,
+    [property: StringLength(128, MinimumLength = 1)] string? SessionId = null);
 
+/// <summary>仅供非生产迁移使用的旧版请求，允许显式身份字段。</summary>
 public sealed record LegacyAskRequest(
     [property: Required, StringLength(4_000, MinimumLength = 1)] string Question,
     [property: Required, StringLength(128, MinimumLength = 1)] string TenantId,
     [property: Required, StringLength(128, MinimumLength = 1)] string SubjectId,
     [property: Required, MinLength(1), MaxLength(64)] IReadOnlyList<string> Groups);
 
+/// <summary>创建尚未生效的记忆提案。</summary>
 public sealed record ProposeMemoryRequest(
     MemoryScope Scope,
     [property: Required, StringLength(128, MinimumLength = 1)] string Key,
@@ -20,12 +24,15 @@ public sealed record ProposeMemoryRequest(
     [property: StringLength(128, MinimumLength = 1)] string? SessionId = null,
     DateTimeOffset? ExpiresAt = null);
 
+/// <summary>携带乐观版本号更正已批准记忆。</summary>
 public sealed record CorrectMemoryRequest(
     [property: Required, StringLength(1_000, MinimumLength = 1)] string Value,
     [property: Range(1, int.MaxValue)] int ExpectedVersion,
     DateTimeOffset? ExpiresAt = null);
 
+/// <summary>提交工具参数；风险等级不允许由客户端传入。</summary>
 public sealed record ExecuteToolRequest(Dictionary<string, JsonElement>? Arguments = null);
 
+/// <summary>提交给受限 Agent 的自然语言目标。</summary>
 public sealed record RunAgentRequest(
     [property: Required, StringLength(4_000, MinimumLength = 1)] string Input);
