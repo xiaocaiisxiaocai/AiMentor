@@ -10,9 +10,10 @@ namespace AiMentor.Infrastructure;
 /// <summary>集中管理写入审计轨迹的安全策略版本。</summary>
 public static class SafetyPolicyVersions
 {
-    public const string Current = "2026-07-13.2";
+    public const string Current = "2026-07-13.3";
 }
 
+/// <summary>隔离检索结果中嵌入的凭证和提示词注入，防止不可信文档成为指令。</summary>
 public sealed partial class RuleBasedRetrievedContentSafetyService : IRetrievedContentSafetyService
 {
     public string PolicyVersion => SafetyPolicyVersions.Current;
@@ -50,6 +51,7 @@ public sealed class ToolSafetyOptions
         new Dictionary<string, IReadOnlySet<string>>(StringComparer.OrdinalIgnoreCase);
 }
 
+/// <summary>审核工具白名单、参数敏感字段、租户边界、网络目标和副作用风险。</summary>
 public sealed partial class RuleBasedToolInvocationSafetyService(ToolSafetyOptions options) : IToolInvocationSafetyService
 {
     public string PolicyVersion => SafetyPolicyVersions.Current;
@@ -151,6 +153,7 @@ public sealed partial class RuleBasedToolInvocationSafetyService(ToolSafetyOptio
     private static partial Regex NetworkTargetName();
 }
 
+/// <summary>阻止凭证泄漏和策略绕过，并验证引用来源、摘录与回答证据落地性。</summary>
 public sealed partial class RuleBasedOutputSafetyService : IOutputSafetyService
 {
     public string PolicyVersion => SafetyPolicyVersions.Current;

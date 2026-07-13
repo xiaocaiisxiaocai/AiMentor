@@ -4,6 +4,7 @@ using AiMentor.Domain;
 
 namespace AiMentor.Infrastructure;
 
+/// <summary>移除常见问句脚手架，保留用于检索的核心实体和约束词。</summary>
 public sealed partial class RuleBasedQueryNormalizer : IQueryNormalizer
 {
     public string Normalize(string question)
@@ -45,6 +46,7 @@ public sealed class LexicalEvidenceReranker : IEvidenceReranker
     }
 }
 
+/// <summary>以相关性、问题完整性、答案承载句、实时性和数值类型判定证据是否足够。</summary>
 public sealed partial class RuleBasedEvidenceSufficiencyEvaluator : IEvidenceSufficiencyEvaluator
 {
     public EvidenceAssessment Evaluate(string question, IReadOnlyList<Evidence> evidence, double minimumScore)

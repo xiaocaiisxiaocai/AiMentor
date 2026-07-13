@@ -26,7 +26,7 @@ public interface IToolRegistry
 public interface IToolExecutor
 {
     Task<ToolExecutionResult> ExecuteAsync(string toolName, JsonElement arguments, AccessContext access,
-        string? idempotencyKey = null, CancellationToken cancellationToken = default);
+        string? idempotencyKey = null, string? approvalId = null, CancellationToken cancellationToken = default);
 }
 
 /// <summary>执行有界 Agent 规划并返回可审计的工具步骤和终止状态。</summary>

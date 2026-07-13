@@ -41,10 +41,10 @@ public sealed class ToolExecutorTests
     [Fact]
     public async Task ServerRiskShouldForceApprovalBeforeMutationToolRuns()
     {
-        var tool = new FakeTool("memory.mutate", ToolOperationRisk.Mutation);
+        var tool = new FakeTool("memory.mutate", ToolOperationRisk.Mutation, requiresIdempotencyKey: true);
         var executor = CreateExecutor(tool);
 
-        var result = await executor.ExecuteAsync(tool.Descriptor.Name, EmptyArguments, Access);
+        var result = await executor.ExecuteAsync(tool.Descriptor.Name, EmptyArguments, Access, "mutation-001");
 
         Assert.Equal(ToolExecutionStatus.RequiresApproval, result.Status);
         Assert.Equal("TOOL_OPERATION_REQUIRES_APPROVAL", result.Safety.Code);
@@ -102,6 +102,32 @@ public sealed class ToolExecutorTests
         Assert.True(second.IdempotentReplay);
         Assert.Equal(first.RunId, second.RunId);
         Assert.Equal(1, tool.ExecutionCount);
+    }
+
+    [Fact]
+    public async Task IdempotencyKeyShouldRejectDifferentArgumentsInsteadOfReplayingWrongResult()
+    {
+        var tool = new FakeTool("stable.read", ToolOperationRisk.ReadOnly, requiresIdempotencyKey: true);
+        var executor = CreateExecutor(tool);
+
+        await executor.ExecuteAsync(tool.Descriptor.Name, JsonSerializer.SerializeToElement(new { value = 1 }),
+            Access, "request-002");
+        var result = await executor.ExecuteAsync(tool.Descriptor.Name,
+            JsonSerializer.SerializeToElement(new { value = 2 }), Access, "request-002");
+
+        Assert.Equal(ToolExecutionStatus.Rejected, result.Status);
+        Assert.Equal("IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST", result.Safety.Code);
+        Assert.Equal(1, tool.ExecutionCount);
+    }
+
+    [Fact]
+    public void MutationToolWithoutIdempotencyRequirementShouldFailRegistration()
+    {
+        var tool = new FakeTool("unsafe.mutate", ToolOperationRisk.Mutation);
+
+        var exception = Assert.Throws<InvalidOperationException>(() => new ServerToolRegistry([tool]));
+
+        Assert.Contains("必须要求幂等键", exception.Message, StringComparison.Ordinal);
     }
 
     [Fact]

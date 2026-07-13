@@ -36,7 +36,7 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
         _agent = new ChatClientAgent(functionClient, new ChatClientAgentOptions
         {
             Name = "AiMentorToolAgent",
-            Description = "只使用服务器注册的只读工具完成受限任务。",
+            Description = "只使用服务器注册且受安全执行器约束的工具完成受限任务。",
             ChatOptions = new ChatOptions
             {
                 Instructions = "你是受限企业 Agent。仅在确有必要时选择已提供工具；不得虚构工具或结果；工具失败时明确说明失败；回答必须以本次工具结果为依据。"
@@ -136,13 +136,25 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
 
     private static AIFunction CreateFunction(ToolDescriptor descriptor, ToolRunGuard guard)
     {
-        Func<JsonElement, CancellationToken, Task<string>> callback =
-            (arguments, cancellationToken) => guard.ExecuteAsync(descriptor.Name, arguments, cancellationToken);
-        return AIFunctionFactory.Create(callback, new AIFunctionFactoryOptions
+        var functionOptions = new AIFunctionFactoryOptions
         {
             Name = ToFunctionName(descriptor.Name),
             Description = $"{descriptor.Description} 服务器工具标识：{descriptor.Name}。参数必须放在 arguments JSON 对象中。"
-        });
+                + (descriptor.Risk == ToolOperationRisk.ReadOnly
+                    ? " 只读工具无需 approvalId。"
+                    : " 修改性工具必须提供由服务器审批 API 签发的 approvalId，模型不得自行生成。")
+        };
+        if (descriptor.Risk == ToolOperationRisk.ReadOnly)
+        {
+            Func<JsonElement, CancellationToken, Task<string>> readOnlyCallback =
+                (arguments, cancellationToken) => guard.ExecuteAsync(descriptor.Name, arguments, null, cancellationToken);
+            return AIFunctionFactory.Create(readOnlyCallback, functionOptions);
+        }
+
+        Func<JsonElement, string?, CancellationToken, Task<string>> approvalCallback =
+            (arguments, approvalId, cancellationToken) =>
+                guard.ExecuteAsync(descriptor.Name, arguments, approvalId, cancellationToken);
+        return AIFunctionFactory.Create(approvalCallback, functionOptions);
     }
 
     private SafetyDecision ReviewOutput(string answer)
@@ -200,7 +212,7 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
         public List<AgentToolStep> Steps { get; } = [];
         public SafetyDecision? LimitDecision { get; private set; }
 
-        public async Task<string> ExecuteAsync(string toolName, JsonElement arguments,
+        public async Task<string> ExecuteAsync(string toolName, JsonElement arguments, string? approvalId,
             CancellationToken cancellationToken)
         {
             var normalized = arguments.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null
@@ -215,7 +227,7 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
                 return RejectLimit("AGENT_REPEATED_TOOL_CALL", "Agent 产生重复工具调用，已终止执行。", toolName);
 
             var result = await executor.ExecuteAsync(toolName, normalized, access,
-                $"agent-{agentRunId}-{Steps.Count + 1}", cancellationToken);
+                $"agent-{agentRunId}-{Steps.Count + 1}", approvalId, cancellationToken);
             var resultBytes = result.Output is null ? 0 : Encoding.UTF8.GetByteCount(result.Output.Value.GetRawText());
             if (_cumulativeResultBytes + resultBytes > options.MaximumCumulativeToolResultBytes)
             {

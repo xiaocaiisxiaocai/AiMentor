@@ -18,6 +18,9 @@ public sealed class ServerToolRegistry : IToolRegistry
         {
             if (string.IsNullOrWhiteSpace(tool.Descriptor.Name))
                 throw new InvalidOperationException("服务器工具名称不能为空。");
+            // 修改性工具一旦允许重试就可能重复产生副作用，因此注册阶段即强制幂等键约束。
+            if (tool.Descriptor.Risk != ToolOperationRisk.ReadOnly && !tool.Descriptor.RequiresIdempotencyKey)
+                throw new InvalidOperationException($"修改性工具必须要求幂等键：{tool.Descriptor.Name}");
             if (!registered.TryAdd(tool.Descriptor.Name, tool))
                 throw new InvalidOperationException($"服务器工具名称重复：{tool.Descriptor.Name}");
         }
@@ -37,12 +40,13 @@ public sealed class SafeToolExecutor(
     IToolInvocationSafetyService safety,
     ITraceSink traceSink,
     ToolExecutorOptions options,
-    TimeProvider timeProvider) : IToolExecutor
+    TimeProvider timeProvider,
+    IToolApprovalService? approvalService = null) : IToolExecutor
 {
     private readonly ConcurrentDictionary<string, IdempotentExecution> _idempotentExecutions = new(StringComparer.Ordinal);
 
     public async Task<ToolExecutionResult> ExecuteAsync(string toolName, JsonElement arguments, AccessContext access,
-        string? idempotencyKey = null, CancellationToken cancellationToken = default)
+        string? idempotencyKey = null, string? approvalId = null, CancellationToken cancellationToken = default)
     {
         var runId = Guid.NewGuid().ToString("N");
         if (string.IsNullOrWhiteSpace(toolName) || !registry.TryGet(toolName.Trim(), out var tool) || tool is null)
@@ -63,7 +67,7 @@ public sealed class SafeToolExecutor(
             return await RejectAsync(runId, tool.Descriptor.Name, "IDEMPOTENCY_KEY_INVALID", "Idempotency-Key 格式无效。", cancellationToken);
 
         if (!tool.Descriptor.RequiresIdempotencyKey)
-            return await ExecuteCoreAsync(runId, tool, normalizedArguments, access, cancellationToken);
+            return await ExecuteCoreAsync(runId, tool, normalizedArguments, access, approvalId, cancellationToken);
 
         var cacheKey = string.Join('\u001f', access.TenantId, access.SubjectId, tool.Descriptor.Name, normalizedIdempotencyKey);
         if (options.IdempotencyRetention <= TimeSpan.Zero || options.MaximumIdempotencyEntries <= 0)
@@ -75,18 +79,23 @@ public sealed class SafeToolExecutor(
             return await RejectAsync(runId, tool.Descriptor.Name, "IDEMPOTENCY_CAPACITY_EXCEEDED",
                 "服务器幂等缓存已达到容量上限，请稍后重试。", cancellationToken);
 
-        var candidate = new IdempotentExecution(timeProvider.GetUtcNow(), new Lazy<Task<ToolExecutionResult>>(
-            () => ExecuteCoreAsync(runId, tool, normalizedArguments, access, CancellationToken.None),
+        var requestFingerprint = JsonArgumentFingerprint.Create(tool.Descriptor.Name, normalizedArguments, access);
+        var candidate = new IdempotentExecution(timeProvider.GetUtcNow(), requestFingerprint,
+            new Lazy<Task<ToolExecutionResult>>(
+            () => ExecuteCoreAsync(runId, tool, normalizedArguments, access, approvalId, CancellationToken.None),
             LazyThreadSafetyMode.ExecutionAndPublication));
         var execution = _idempotentExecutions.GetOrAdd(cacheKey, candidate);
         var replay = !ReferenceEquals(candidate, execution);
+        if (replay && !string.Equals(execution.RequestFingerprint, requestFingerprint, StringComparison.Ordinal))
+            return await RejectAsync(runId, tool.Descriptor.Name, "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST",
+                "相同 Idempotency-Key 已绑定其他工具参数。", cancellationToken);
         var result = await execution.Task.Value.WaitAsync(cancellationToken);
         if (result.Status != ToolExecutionStatus.Completed) _idempotentExecutions.TryRemove(cacheKey, out _);
         return result with { IdempotentReplay = replay };
     }
 
     private async Task<ToolExecutionResult> ExecuteCoreAsync(string runId, IServerTool tool, JsonElement arguments,
-        AccessContext access, CancellationToken cancellationToken)
+        AccessContext access, string? approvalId, CancellationToken cancellationToken)
     {
         var trace = new List<TraceStep>
         {
@@ -105,11 +114,10 @@ public sealed class SafeToolExecutor(
             ["code"] = safetyDecision.Code,
             ["policyVersion"] = safety.PolicyVersion
         }));
-        if (safetyDecision.Action != SafetyAction.Allow)
+        if (safetyDecision.Action == SafetyAction.Refuse)
         {
-            var status = safetyDecision.Action == SafetyAction.RequireApproval
-                ? ToolExecutionStatus.RequiresApproval : ToolExecutionStatus.Rejected;
-            return await CompleteAsync(runId, tool.Descriptor.Name, status, null, safetyDecision, false, trace, cancellationToken);
+            return await CompleteAsync(runId, tool.Descriptor.Name, ToolExecutionStatus.Rejected, null,
+                safetyDecision, false, trace, cancellationToken);
         }
 
         var validation = tool.ValidateArguments(arguments);
@@ -122,6 +130,25 @@ public sealed class SafeToolExecutor(
         if (timeout <= TimeSpan.Zero || tool.Descriptor.MaximumResultBytes <= 0)
             return await RejectWithTraceAsync(runId, tool.Descriptor.Name, "TOOL_CONFIGURATION_INVALID",
                 "工具的超时或结果大小配置无效。", trace, cancellationToken);
+
+        if (safetyDecision.Action == SafetyAction.RequireApproval)
+        {
+            if (string.IsNullOrWhiteSpace(approvalId))
+                return await CompleteAsync(runId, tool.Descriptor.Name, ToolExecutionStatus.RequiresApproval, null,
+                    safetyDecision, false, trace, cancellationToken);
+            if (approvalService is null)
+                return await RejectWithTraceAsync(runId, tool.Descriptor.Name, "TOOL_APPROVAL_SERVICE_UNAVAILABLE",
+                    "审批服务不可用，修改性工具保持关闭。", trace, cancellationToken);
+
+            var consumption = await approvalService.ConsumeAsync(approvalId, tool.Descriptor.Name, arguments, access,
+                cancellationToken);
+            trace.Add(Step("tool.approval", consumption.Allowed ? "consumed" : "refused",
+                new Dictionary<string, object?> { ["code"] = consumption.Decision.Code }));
+            if (!consumption.Allowed)
+                return await CompleteAsync(runId, tool.Descriptor.Name, ToolExecutionStatus.Rejected, null,
+                    consumption.Decision, false, trace, cancellationToken);
+            safetyDecision = consumption.Decision;
+        }
 
         using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeoutSource.CancelAfter(timeout);
@@ -207,7 +234,8 @@ public sealed class SafeToolExecutor(
     private TraceStep Step(string name, string outcome, IReadOnlyDictionary<string, object?> details) =>
         new(name, outcome, timeProvider.GetUtcNow(), details);
 
-    private sealed record IdempotentExecution(DateTimeOffset CreatedAt, Lazy<Task<ToolExecutionResult>> Task);
+    private sealed record IdempotentExecution(DateTimeOffset CreatedAt, string RequestFingerprint,
+        Lazy<Task<ToolExecutionResult>> Task);
 }
 
 /// <summary>返回不含文档正文的只读知识库规模统计。</summary>
@@ -231,5 +259,41 @@ public sealed class KnowledgeStatisticsTool(IKnowledgeRepository repository) : I
             documents = repository.Statistics.Documents,
             chunks = repository.Statistics.Chunks
         });
+    }
+}
+
+/// <summary>
+/// 通过既有记忆工作流删除当前用户的记忆；真正执行前仍需安全执行器消费独立审批。
+/// </summary>
+public sealed class MemoryDeleteTool(IMemoryWorkflowService memoryWorkflow) : IServerTool
+{
+    public ToolDescriptor Descriptor { get; } = new("memory.delete", "按标识和预期版本删除当前用户的记忆。",
+        ToolOperationRisk.Mutation, TimeSpan.FromSeconds(3), 2 * 1024, true);
+
+    public SafetyDecision ValidateArguments(JsonElement arguments)
+    {
+        var properties = arguments.EnumerateObject().ToArray();
+        if (properties.Length != 2 || properties.Any(property =>
+                property.Name is not ("memoryId" or "expectedVersion")))
+            return new SafetyDecision(SafetyAction.Refuse, "MEMORY_DELETE_ARGUMENTS_INVALID",
+                "memory.delete 只接受 memoryId 和 expectedVersion。");
+        if (!arguments.TryGetProperty("memoryId", out var memoryId)
+            || memoryId.ValueKind != JsonValueKind.String
+            || string.IsNullOrWhiteSpace(memoryId.GetString()) || memoryId.GetString()!.Length > 128)
+            return new SafetyDecision(SafetyAction.Refuse, "MEMORY_ID_INVALID", "memoryId 格式无效。");
+        if (!arguments.TryGetProperty("expectedVersion", out var expectedVersion)
+            || expectedVersion.ValueKind != JsonValueKind.Number
+            || !expectedVersion.TryGetInt32(out var version) || version <= 0)
+            return new SafetyDecision(SafetyAction.Refuse, "MEMORY_VERSION_INVALID", "expectedVersion 必须大于 0。");
+        return new SafetyDecision(SafetyAction.Allow, "TOOL_ARGUMENTS_VALID", "记忆删除参数通过校验。");
+    }
+
+    public async Task<JsonElement> ExecuteAsync(ToolExecutionContext context, JsonElement arguments,
+        CancellationToken cancellationToken = default)
+    {
+        var memoryId = arguments.GetProperty("memoryId").GetString()!.Trim();
+        var expectedVersion = arguments.GetProperty("expectedVersion").GetInt32();
+        await memoryWorkflow.DeleteAsync(memoryId, expectedVersion, context.Access, cancellationToken);
+        return JsonSerializer.SerializeToElement(new { deleted = true, memoryId });
     }
 }

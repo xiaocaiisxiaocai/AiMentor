@@ -72,6 +72,7 @@ else
     builder.Services.AddSingleton<IRequestAccessContextProvider>(new DevelopmentAccessContextProvider(authenticationOptions));
 }
 builder.Services.ConfigureHttpJsonOptions(options => options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
+builder.Services.AddExceptionHandler<ApiExceptionHandler>();
 builder.Services.AddProblemDetails();
 builder.Services.AddOpenApi(openApiOptions =>
 {
@@ -150,11 +151,14 @@ builder.Services.AddSingleton<IQueryNormalizer, RuleBasedQueryNormalizer>();
 builder.Services.AddSingleton<IRetrievedContentSafetyService, RuleBasedRetrievedContentSafetyService>();
 builder.Services.AddSingleton(new ToolSafetyOptions
 {
-    AllowedTools = new HashSet<string>(["knowledge.stats"], StringComparer.OrdinalIgnoreCase)
+    AllowedTools = new HashSet<string>(["knowledge.stats", "memory.delete"], StringComparer.OrdinalIgnoreCase)
 });
 builder.Services.AddSingleton<IToolInvocationSafetyService, RuleBasedToolInvocationSafetyService>();
 builder.Services.AddSingleton<IServerTool, KnowledgeStatisticsTool>();
+builder.Services.AddSingleton<IServerTool, MemoryDeleteTool>();
 builder.Services.AddSingleton<IToolRegistry, ServerToolRegistry>();
+builder.Services.AddSingleton(new ToolApprovalOptions());
+builder.Services.AddSingleton<IToolApprovalService, InMemoryToolApprovalService>();
 builder.Services.AddSingleton(new ToolExecutorOptions());
 builder.Services.AddSingleton<IToolExecutor, SafeToolExecutor>();
 builder.Services.AddSingleton(new AgentExecutionOptions());
@@ -274,6 +278,31 @@ tools.MapPost("/{toolName}/execute", ExecuteToolAsync)
     .ProducesProblem(StatusCodes.Status409Conflict)
     .ProducesProblem(StatusCodes.Status413PayloadTooLarge)
     .ProducesProblem(StatusCodes.Status504GatewayTimeout)
+    .RequireRateLimiting("questions");
+
+var toolApprovals = v1.MapGroup("/tool-approvals").WithTags("AiMentor tool approvals v1");
+toolApprovals.MapPost("/", RequestToolApprovalAsync)
+    .WithName("RequestToolApprovalV1")
+    .WithSummary("为精确的修改性工具调用申请短期审批")
+    .Produces<ToolApprovalRequest>(StatusCodes.Status202Accepted)
+    .ProducesValidationProblem()
+    .ProducesProblem(StatusCodes.Status403Forbidden)
+    .ProducesProblem(StatusCodes.Status404NotFound)
+    .ProducesProblem(StatusCodes.Status409Conflict)
+    .RequireRateLimiting("questions");
+toolApprovals.MapGet("/", ListToolApprovalsAsync)
+    .WithName("ListToolApprovalsV1")
+    .WithSummary("查看当前申请人或当前租户审批人可访问的审批")
+    .Produces<IReadOnlyList<ToolApprovalRequest>>()
+    .RequireRateLimiting("questions");
+toolApprovals.MapPost("/{approvalId}/decision", DecideToolApprovalAsync)
+    .WithName("DecideToolApprovalV1")
+    .WithSummary("由独立工具审批人批准或拒绝申请")
+    .Produces<ToolApprovalRequest>()
+    .ProducesValidationProblem()
+    .ProducesProblem(StatusCodes.Status403Forbidden)
+    .ProducesProblem(StatusCodes.Status404NotFound)
+    .ProducesProblem(StatusCodes.Status409Conflict)
     .RequireRateLimiting("questions");
 
 var agents = v1.MapGroup("/agents").WithTags("AiMentor agents v1");
@@ -425,7 +454,7 @@ static async Task<IResult> ExecuteToolAsync(string toolName, ExecuteToolRequest 
 {
     var arguments = JsonSerializer.SerializeToElement(request.Arguments ?? new Dictionary<string, JsonElement>());
     var result = await executor.ExecuteAsync(toolName, arguments, accessProvider.GetAccessContext(context.User),
-        context.Request.Headers["Idempotency-Key"].ToString(), cancellationToken);
+        context.Request.Headers["Idempotency-Key"].ToString(), request.ApprovalId, cancellationToken);
     context.Response.Headers["X-Run-ID"] = result.RunId;
     var statusCode = result.Status switch
     {
@@ -439,6 +468,68 @@ static async Task<IResult> ExecuteToolAsync(string toolName, ExecuteToolRequest 
         _ => StatusCodes.Status403Forbidden
     };
     return Results.Json(result, statusCode: statusCode);
+}
+
+static async Task<IResult> RequestToolApprovalAsync(RequestToolApprovalRequest request, IToolApprovalService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        var arguments = JsonSerializer.SerializeToElement(request.Arguments ?? new Dictionary<string, JsonElement>());
+        var approval = await service.RequestAsync(request.ToolName, arguments, request.Justification,
+            accessProvider.GetAccessContext(context.User), cancellationToken);
+        return Results.Accepted($"/api/v1/tool-approvals/{approval.Id}", approval);
+    }
+    catch (ToolApprovalException exception)
+    {
+        return ToolApprovalProblem(exception, context);
+    }
+}
+
+static async Task<IResult> ListToolApprovalsAsync(ToolApprovalStatus? status, IToolApprovalService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        return Results.Ok(await service.ListAsync(accessProvider.GetAccessContext(context.User), status,
+            cancellationToken));
+    }
+    catch (ToolApprovalException exception)
+    {
+        return ToolApprovalProblem(exception, context);
+    }
+}
+
+static async Task<IResult> DecideToolApprovalAsync(string approvalId, DecideToolApprovalRequest request,
+    IToolApprovalService service, IRequestAccessContextProvider accessProvider, HttpContext context,
+    CancellationToken cancellationToken)
+{
+    try
+    {
+        var approval = await service.DecideAsync(approvalId, request.Approved, request.Reason,
+            accessProvider.GetAccessContext(context.User), cancellationToken);
+        return Results.Ok(approval);
+    }
+    catch (ToolApprovalException exception)
+    {
+        return ToolApprovalProblem(exception, context);
+    }
+}
+
+static IResult ToolApprovalProblem(ToolApprovalException exception, HttpContext context)
+{
+    var statusCode = exception.Kind switch
+    {
+        ToolApprovalErrorKind.Validation => StatusCodes.Status400BadRequest,
+        ToolApprovalErrorKind.Forbidden => StatusCodes.Status403Forbidden,
+        ToolApprovalErrorKind.NotFound => StatusCodes.Status404NotFound,
+        ToolApprovalErrorKind.Conflict => StatusCodes.Status409Conflict,
+        ToolApprovalErrorKind.Capacity => StatusCodes.Status503ServiceUnavailable,
+        _ => StatusCodes.Status500InternalServerError
+    };
+    return Results.Problem(statusCode: statusCode, title: "工具审批失败", detail: exception.Message,
+        instance: context.Request.Path,
+        extensions: new Dictionary<string, object?> { ["code"] = exception.Code });
 }
 
 static async Task<IResult> RunAgentAsync(RunAgentRequest request, IAgentRunner runner,

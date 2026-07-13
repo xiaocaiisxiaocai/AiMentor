@@ -115,11 +115,12 @@ public sealed class AgentFrameworkToolRunnerTests
         public int ExecutionCount => _executionCount;
 
         public Task<ToolExecutionResult> ExecuteAsync(string toolName, JsonElement arguments, AccessContext access,
-            string? idempotencyKey = null, CancellationToken cancellationToken = default)
+            string? idempotencyKey = null, string? approvalId = null, CancellationToken cancellationToken = default)
         {
             _ = arguments;
             _ = access;
             _ = idempotencyKey;
+            _ = approvalId;
             cancellationToken.ThrowIfCancellationRequested();
             Interlocked.Increment(ref _executionCount);
             var output = JsonSerializer.SerializeToElement(new { documents = 23, chunks = 74, padding });

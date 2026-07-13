@@ -30,8 +30,21 @@ public sealed record CorrectMemoryRequest(
     [property: Range(1, int.MaxValue)] int ExpectedVersion,
     DateTimeOffset? ExpiresAt = null);
 
-/// <summary>提交工具参数；风险等级不允许由客户端传入。</summary>
-public sealed record ExecuteToolRequest(Dictionary<string, JsonElement>? Arguments = null);
+/// <summary>提交工具参数和可选审批凭据；风险等级不允许由客户端传入。</summary>
+public sealed record ExecuteToolRequest(
+    Dictionary<string, JsonElement>? Arguments = null,
+    [property: StringLength(128, MinimumLength = 1)] string? ApprovalId = null);
+
+/// <summary>为精确的修改性工具参数申请短期、一次性审批。</summary>
+public sealed record RequestToolApprovalRequest(
+    [property: Required, StringLength(128, MinimumLength = 1)] string ToolName,
+    Dictionary<string, JsonElement>? Arguments,
+    [property: Required, StringLength(500, MinimumLength = 1)] string Justification);
+
+/// <summary>由独立审批人批准或拒绝工具调用，并记录裁决理由。</summary>
+public sealed record DecideToolApprovalRequest(
+    bool Approved,
+    [property: Required, StringLength(500, MinimumLength = 1)] string Reason);
 
 /// <summary>提交给受限 Agent 的自然语言目标。</summary>
 public sealed record RunAgentRequest(

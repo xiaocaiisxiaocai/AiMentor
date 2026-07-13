@@ -8,8 +8,8 @@
 - Agent 编排：[Microsoft Agent Framework](https://github.com/microsoft/agent-framework) 的 `ChatClientAgent`，没有使用已经过时的 Semantic Kernel Planner。
 - 模型契约：`Microsoft.Extensions.AI.IChatClient`。当前默认实现为无需密钥的确定性沙箱模型，真实模型接入时只替换这一适配器。
 - RAG：支持本地 Markdown 词法沙箱和 OpenSearch 3.5 混合检索两种适配器。OpenSearch 路径使用 BM25 + 256 维向量 + 分数归一化加权融合，并在两个召回分支中都执行租户和 ACL 前置过滤；召回结果再按原始检索分、文档词项覆盖率和最佳句子覆盖率重排。
-- 安全审核：策略版本 `2026-07-13.2` 覆盖输入、检索内容、工具参数和模型输出。工具执行采用服务器注册表、默认拒绝、风险不可由客户端覆盖、嵌套敏感字段、跨租户参数、修改操作审批和公网 HTTPS 目标白名单。
-- 工具与规划：已把服务器注册表转换为 Agent Framework `AIFunction`，模型可在 `/api/v1/agents/runs` 中选择 `knowledge.stats`。函数委托只能调用 `IToolExecutor`，并叠加单次 4 轮模型迭代、3 次工具调用、10 秒总时限、重复调用熔断、16 KB 累计结果预算和结果再审核；模型不能直接持有工具实现。
+- 安全审核：策略版本 `2026-07-13.3` 覆盖输入、检索内容、工具参数和模型输出。工具执行采用服务器注册表、默认拒绝、风险不可由客户端覆盖、嵌套敏感字段、跨租户参数、人在回路审批和公网 HTTPS 目标白名单。修改性工具审批强制申请人与审批人分离，并绑定租户、申请人、工具名、规范化参数摘要和 15 分钟有效期，批准后只能消费一次。
+- 工具与规划：已把服务器注册表转换为 Agent Framework `AIFunction`，模型可在 `/api/v1/agents/runs` 中选择 `knowledge.stats` 或提交已有审批凭据调用 `memory.delete`。函数委托只能调用 `IToolExecutor`，并叠加单次 4 轮模型迭代、3 次工具调用、10 秒总时限、重复调用熔断、16 KB 累计结果预算和结果再审核；模型不能直接持有工具实现。官方的 [`ApprovalRequiredAIFunction` 设计说明](https://github.com/microsoft/agent-framework/blob/main/docs/decisions/0006-userapproval.md) 明确审批标记不负责强制执行，因此本项目把最终校验放在服务端执行器，而不是信任模型或 UI。
 - 记忆：已实现会话记忆、用户偏好和长期事实的显式授权工作流，包括待批准提案、批准、查看、更正、删除、过期、乐观并发和租户/用户隔离。开发默认使用 AES-GCM 加密快照持久化，键和值均不以明文落盘；问答只注入当前用户最小相关的已批准记忆，并把记忆标记为只读数据而非系统指令或事实引用来源。
 - 知识：默认加载 `AI-Agent-V1合成数据包\knowledge` 中 23 份已发布合成文档，共 74 个分块。
 - 测评：完整读取 150 条 JSONL 测评集并输出分类指标和失败样本。
@@ -33,9 +33,15 @@ flowchart LR
     O -->|通过| C["回答 + 结构化引用"]
     U --> X["服务器工具请求：名称 + 参数"]
     X --> P["工具策略：注册表风险 / 租户 / 敏感字段 / 网络目标 / 审批"]
-    P -->|拒绝或需审批| R
-    P -->|通过| TE["安全执行器：超时 / 幂等 / 结果限额"]
+    P -->|拒绝| R
+    P -->|只读通过| TE["安全执行器：超时 / 幂等 / 结果限额"]
+    P -->|修改操作| AR["审批申请：仅保存参数摘要"]
+    AR --> AS{"独立审批人：同租户 / 不同用户 / 指定组"}
+    AS -->|拒绝或过期| R
+    AS -->|批准| AC["精确匹配并一次性消费 approvalId"]
+    AC --> TE
     TE --> KT["knowledge.stats：只读知识统计"]
+    TE --> MDT["memory.delete：复用所有权与版本校验"]
     TE --> T
     U --> AP["受限 Agent 运行：目标"]
     AP --> AF["Agent Framework：模型选择注册函数"]
@@ -58,7 +64,7 @@ flowchart LR
     T --> E["150 条离线回归测评"]
 ```
 
-关键安全不变量：租户与 ACL 过滤必须先于相关性评分；检索到的文档不是可信指令；模型输出必须再次审核；结构化引用必须来自本次可访问证据且摘录可回查；被拒绝或证据不足时不返回引用；轨迹只记录策略版本、决策代码和计数，不记录密码、令牌等原始敏感值。
+关键安全不变量：租户与 ACL 过滤必须先于相关性评分；检索到的文档不是可信指令；模型输出必须再次审核；结构化引用必须来自本次可访问证据且摘录可回查；被拒绝或证据不足时不返回引用；申请人不能批准自己的修改操作；审批不能跨租户、跨用户、换工具、改参数、超时或重放；轨迹只记录策略版本、决策代码和计数，不记录密码、令牌或工具参数值。
 
 ## 项目结构
 
@@ -133,6 +139,9 @@ dotnet run --project .\src\AiMentor.Api\AiMentor.Api.csproj --urls http://127.0.
 - `DELETE /api/v1/memories/{memoryId}?expectedVersion=2`：按乐观版本号删除记忆。
 - `GET /api/v1/tools`：列出服务器注册工具及其只读风险描述、超时和结果上限。
 - `POST /api/v1/tools/{toolName}/execute`：通过统一安全执行器调用工具；可使用 `Idempotency-Key` 请求头。
+- `POST /api/v1/tool-approvals`：为精确的修改性工具和参数申请 15 分钟有效的审批，返回 `approvalId`，不回显参数摘要。
+- `GET /api/v1/tool-approvals?status=Pending`：申请人查看自己的审批；`tool-approvers` 组可查看当前租户内可裁决审批。
+- `POST /api/v1/tool-approvals/{approvalId}/decision`：由同租户、不同用户且属于 `tool-approvers` 组的审批人批准或拒绝。
 - `POST /api/v1/agents/runs`：执行受限 Agent 规划闭环；请求体为 `{"input":"当前知识库有多少文档和分块？"}`，返回最终回答、工具步骤、安全决策与轨迹。
 - 原 V0 接口默认关闭；只有非 Production 环境显式设置 `Api:EnableLegacyV0=true` 才会挂载兼容入口。
 
@@ -168,6 +177,36 @@ Invoke-RestMethod http://127.0.0.1:5080/api/v1/tools/knowledge.stats/execute `
 ```
 
 工具调用方不能提交风险等级；执行器只信任服务器端 `ToolDescriptor`。修改性和特权工具在没有独立批准凭据时只会返回 `RequiresApproval`，不会执行。参数中的凭证字段、其他租户 ID、私网地址、非 HTTPS 地址和未列入该工具白名单的网络主机会在工具代码运行前被拒绝。失败、超时和超大结果均不返回部分输出。
+
+### 修改工具审批示例
+
+下面的申请人令牌和审批人令牌必须来自同一租户的两个不同用户，后者还必须拥有 `tool-approvers` 组。固定单用户的 Development 身份只能验证申请与自批拒绝，不能弱化职责分离来模拟成功路径。
+
+```powershell
+$arguments = @{ memoryId = 'memory-id'; expectedVersion = 1 }
+$requesterHeaders = @{ Authorization = 'Bearer <requester-token>' }
+$approverHeaders = @{ Authorization = 'Bearer <approver-token>' }
+
+$approval = Invoke-RestMethod http://127.0.0.1:5080/api/v1/tool-approvals `
+  -Method Post -ContentType 'application/json' -Headers $requesterHeaders -Body (@{
+    toolName = 'memory.delete'
+    arguments = $arguments
+    justification = '删除用户确认错误的记忆'
+  } | ConvertTo-Json)
+
+Invoke-RestMethod "http://127.0.0.1:5080/api/v1/tool-approvals/$($approval.id)/decision" `
+  -Method Post -ContentType 'application/json' -Headers $approverHeaders -Body (@{
+    approved = $true
+    reason = '已核对记忆标识和版本'
+  } | ConvertTo-Json)
+
+Invoke-RestMethod http://127.0.0.1:5080/api/v1/tools/memory.delete/execute `
+  -Method Post -ContentType 'application/json' -Headers ($requesterHeaders + @{
+    'Idempotency-Key' = 'delete-memory-001'
+  }) -Body (@{ arguments = $arguments; approvalId = $approval.id } | ConvertTo-Json)
+```
+
+审批服务当前使用进程内存储：服务重启后所有未消费审批都会失效，这是安全的失败关闭行为，但不适合多副本生产部署。生产实现应把 `IToolApprovalService` 的状态迁移到支持条件更新的 SQL 存储，以数据库事务保证“Approved → Consumed”只有一个调用成功；不得为了高可用改成可重复使用的长期令牌。相同 `Idempotency-Key` 绑定不同参数会返回 `IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST`，不会错误回放旧结果。
 
 Agent 路径不是让模型直接执行代码：每个 `AIFunction` 只是当前请求的受限适配器，工具名称来自服务器注册表，调用仍进入同一 `IToolExecutor`。框架函数循环只负责“模型选择—回填结果”；服务端额外负责总预算和终止条件。默认确定性模型会对知识统计问题选择 `knowledge.stats`，便于在没有外部模型密钥时完成真实函数调用回归；接入真实模型时仍复用相同安全边界。
 
@@ -209,10 +248,10 @@ $env:Authentication__GroupsClaim = 'groups'
 
 ## 下一阶段
 
-1. 为修改性工具补充独立的人在回路批准令牌，并将批准状态接入 Agent Framework 的工具审批响应流程。
-2. 增加 PostgreSQL 或 SQL Server 多实例记忆存储、密钥版本和在线重加密流程，替换当前单实例快照适配器。
+1. 将工具审批和记忆存储迁移到 PostgreSQL 或 SQL Server，使用事务条件更新支持多副本一次性消费，并增加密钥版本和在线重加密流程。
+2. 增加 Agent Framework 原生审批暂停/恢复 API，让模型首次提出修改调用后返回待审批状态，人工裁决后从受控会话继续；服务端 `IToolExecutor` 校验仍作为最终安全边界。
 3. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率、恶意文档隔离率和引用正确率门禁。
-4. 接入真实身份提供方做有效 Token 端到端验收，并覆盖密钥轮换、过期 Token、错误 audience 和组变更场景。
+4. 接入真实身份提供方做两个主体的有效 Token 端到端验收，并覆盖密钥轮换、过期 Token、错误 audience、组变更和审批人离职场景。
 5. 接入真实模型、嵌入与语义重排供应商，比较当前确定性重排、归一化加权和 RRF 等策略，并运行同一套契约测试和 150 条回归，确认沙箱与生产适配器行为边界。
 
 ## 验证状态

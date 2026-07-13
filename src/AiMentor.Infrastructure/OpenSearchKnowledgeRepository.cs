@@ -19,6 +19,7 @@ public sealed class OpenSearchOptions
     public double VectorWeight { get; init; } = 0.55;
 }
 
+/// <summary>在 OpenSearch 中同步知识分块，并执行带租户和用户组前置过滤的混合检索。</summary>
 public sealed partial class OpenSearchKnowledgeRepository(
     HttpClient httpClient,
     IKnowledgeChunkSource source,

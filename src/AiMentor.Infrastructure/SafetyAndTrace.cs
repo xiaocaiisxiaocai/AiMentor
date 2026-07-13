@@ -5,6 +5,7 @@ using AiMentor.Domain;
 
 namespace AiMentor.Infrastructure;
 
+/// <summary>在检索和模型调用前拒绝凭证索取、注入、敏感个人数据及绕过记忆工作流的输入。</summary>
 public sealed partial class RuleBasedInputSafetyService : IInputSafetyService
 {
     public string PolicyVersion => SafetyPolicyVersions.Current;

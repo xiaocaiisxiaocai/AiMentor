@@ -114,6 +114,7 @@ public sealed class InMemoryMemoryStore : IMemoryStore
         && string.Equals(subjectId, access.SubjectId, StringComparison.Ordinal);
 }
 
+/// <summary>阻止凭证、个人敏感标识和提示词注入内容进入长期记忆。</summary>
 public sealed partial class RuleBasedMemoryContentSafetyService : IMemoryContentSafetyService
 {
     public SafetyDecision Review(string key, string value)
