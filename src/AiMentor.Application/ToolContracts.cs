@@ -25,6 +25,21 @@ public interface IToolExecutor
         string? idempotencyKey = null, CancellationToken cancellationToken = default);
 }
 
+public interface IAgentRunner
+{
+    Task<AgentRunResult> RunAsync(string input, AccessContext access, string? correlationId = null,
+        CancellationToken cancellationToken = default);
+}
+
+public sealed class AgentExecutionOptions
+{
+    public int MaximumModelIterations { get; init; } = 4;
+    public int MaximumToolCalls { get; init; } = 3;
+    public int MaximumCumulativeToolResultBytes { get; init; } = 16 * 1024;
+    public int MaximumAnswerCharacters { get; init; } = 4_000;
+    public TimeSpan MaximumRunTime { get; init; } = TimeSpan.FromSeconds(10);
+}
+
 public sealed class ToolExecutorOptions
 {
     public int MaximumArgumentBytes { get; init; } = 16 * 1024;

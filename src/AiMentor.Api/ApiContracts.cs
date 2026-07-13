@@ -26,3 +26,6 @@ public sealed record CorrectMemoryRequest(
     DateTimeOffset? ExpiresAt = null);
 
 public sealed record ExecuteToolRequest(Dictionary<string, JsonElement>? Arguments = null);
+
+public sealed record RunAgentRequest(
+    [property: Required, StringLength(4_000, MinimumLength = 1)] string Input);

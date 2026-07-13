@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using AiMentor.Application;
 using AiMentor.Domain;
@@ -47,7 +48,23 @@ public sealed class DeterministicGroundedChatClient : IChatClient
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var prompt = messages.LastOrDefault()?.Text ?? string.Empty;
+        var messageList = messages.ToArray();
+        var functionResult = messageList.SelectMany(message => message.Contents)
+            .OfType<FunctionResultContent>().LastOrDefault();
+        if (functionResult is not null)
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant,
+                ComposeToolResult(functionResult.Result?.ToString()))));
+
+        var prompt = messageList.LastOrDefault()?.Text ?? string.Empty;
+        var statisticsTool = options?.Tools?.OfType<AIFunctionDeclaration>()
+            .FirstOrDefault(tool => string.Equals(tool.Name, "knowledge_stats", StringComparison.Ordinal));
+        if (statisticsTool is not null && Regex.IsMatch(prompt, "知识库|文档|分块|chunk", RegexOptions.IgnoreCase))
+        {
+            var call = new FunctionCallContent(Guid.NewGuid().ToString("N"), statisticsTool.Name,
+                new Dictionary<string, object?> { ["arguments"] = new Dictionary<string, object?>() });
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, [call])));
+        }
+
         var answer = Compose(prompt);
         return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, answer)));
     }
@@ -63,6 +80,27 @@ public sealed class DeterministicGroundedChatClient : IChatClient
         serviceKey is null && serviceType.IsInstanceOfType(Metadata) ? Metadata : null;
 
     public void Dispose() { }
+
+    private static string ComposeToolResult(string? result)
+    {
+        if (string.IsNullOrWhiteSpace(result)) return "工具没有返回可用结果。";
+        try
+        {
+            using var document = JsonDocument.Parse(result);
+            var root = document.RootElement;
+            if (!root.TryGetProperty("status", out var status)
+                || !string.Equals(status.GetString(), ToolExecutionStatus.Completed.ToString(), StringComparison.Ordinal))
+                return $"工具执行未完成：{root.GetProperty("code").GetString()}。";
+            var output = root.GetProperty("output");
+            if (output.TryGetProperty("documents", out var documents) && output.TryGetProperty("chunks", out var chunks))
+                return $"当前知识库共有 {documents.GetInt32()} 份文档、{chunks.GetInt32()} 个分块。";
+            return $"工具已完成，结果为：{output.GetRawText()}";
+        }
+        catch (JsonException)
+        {
+            return "工具结果格式无效，无法形成回答。";
+        }
+    }
 
     private static string Compose(string prompt)
     {

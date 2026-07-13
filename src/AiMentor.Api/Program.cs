@@ -156,6 +156,8 @@ builder.Services.AddSingleton<IServerTool, KnowledgeStatisticsTool>();
 builder.Services.AddSingleton<IToolRegistry, ServerToolRegistry>();
 builder.Services.AddSingleton(new ToolExecutorOptions());
 builder.Services.AddSingleton<IToolExecutor, SafeToolExecutor>();
+builder.Services.AddSingleton(new AgentExecutionOptions());
+builder.Services.AddSingleton<IAgentRunner, AgentFrameworkToolRunner>();
 builder.Services.AddSingleton<IOutputSafetyService, RuleBasedOutputSafetyService>();
 builder.Services.AddSingleton<IEvidenceReranker, LexicalEvidenceReranker>();
 builder.Services.AddSingleton<IEvidenceSufficiencyEvaluator, RuleBasedEvidenceSufficiencyEvaluator>();
@@ -261,6 +263,17 @@ tools.MapPost("/{toolName}/execute", ExecuteToolAsync)
     .ProducesProblem(StatusCodes.Status409Conflict)
     .ProducesProblem(StatusCodes.Status413PayloadTooLarge)
     .ProducesProblem(StatusCodes.Status504GatewayTimeout)
+    .RequireRateLimiting("questions");
+
+var agents = v1.MapGroup("/agents").WithTags("AiMentor agents v1");
+agents.MapPost("/runs", RunAgentAsync)
+    .WithName("RunAgentV1")
+    .WithSummary("执行受限 Agent 规划与服务器工具调用闭环")
+    .Produces<AgentRunResult>()
+    .ProducesValidationProblem()
+    .ProducesProblem(StatusCodes.Status403Forbidden)
+    .ProducesProblem(StatusCodes.Status429TooManyRequests)
+    .ProducesProblem(StatusCodes.Status503ServiceUnavailable)
     .RequireRateLimiting("questions");
 
 // V0 仅用于短期迁移，默认关闭，Production 环境禁止启用。
@@ -413,6 +426,22 @@ static async Task<IResult> ExecuteToolAsync(string toolName, ExecuteToolRequest 
         _ when result.Safety.Code == "TOOL_NOT_REGISTERED" => StatusCodes.Status404NotFound,
         _ when result.Safety.Code == "TOOL_ARGUMENTS_TOO_LARGE" => StatusCodes.Status413PayloadTooLarge,
         _ => StatusCodes.Status403Forbidden
+    };
+    return Results.Json(result, statusCode: statusCode);
+}
+
+static async Task<IResult> RunAgentAsync(RunAgentRequest request, IAgentRunner runner,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    var result = await runner.RunAsync(request.Input, accessProvider.GetAccessContext(context.User),
+        GetCorrelationId(context), cancellationToken);
+    context.Response.Headers["X-Run-ID"] = result.RunId;
+    var statusCode = result.Status switch
+    {
+        AgentRunStatus.Completed => StatusCodes.Status200OK,
+        AgentRunStatus.Refused => StatusCodes.Status403Forbidden,
+        AgentRunStatus.LimitExceeded => StatusCodes.Status422UnprocessableEntity,
+        _ => StatusCodes.Status503ServiceUnavailable
     };
     return Results.Json(result, statusCode: statusCode);
 }

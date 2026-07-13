@@ -21,3 +21,21 @@ public sealed record ToolExecutionResult(
     SafetyDecision Safety,
     bool IdempotentReplay,
     IReadOnlyList<TraceStep> Trace);
+
+public enum AgentRunStatus { Completed, Refused, LimitExceeded, Failed }
+
+public sealed record AgentToolStep(
+    int Sequence,
+    string ToolName,
+    ToolExecutionStatus Status,
+    string Code,
+    string ToolRunId,
+    int ResultBytes);
+
+public sealed record AgentRunResult(
+    string RunId,
+    AgentRunStatus Status,
+    string Answer,
+    SafetyDecision Safety,
+    IReadOnlyList<AgentToolStep> ToolSteps,
+    IReadOnlyList<TraceStep> Trace);
