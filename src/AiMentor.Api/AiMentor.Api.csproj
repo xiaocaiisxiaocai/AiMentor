@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <RootNamespace>AiMentor.Api</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\AiMentor.Application\AiMentor.Application.csproj" />
+    <ProjectReference Include="..\AiMentor.Infrastructure\AiMentor.Infrastructure.csproj" />
+  </ItemGroup>
+</Project>
+

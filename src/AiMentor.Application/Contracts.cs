@@ -1,0 +1,39 @@
+using AiMentor.Domain;
+
+namespace AiMentor.Application;
+
+public interface IKnowledgeRepository
+{
+    Task InitializeAsync(CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<Evidence>> SearchAsync(string query, AccessContext access, int limit, CancellationToken cancellationToken = default);
+    KnowledgeStatistics Statistics { get; }
+}
+
+public sealed record KnowledgeStatistics(int Documents, int Chunks);
+
+public interface IInputSafetyService
+{
+    SafetyDecision Review(string input);
+}
+
+public interface IAnswerComposer
+{
+    Task<string> ComposeAsync(string question, IReadOnlyList<Evidence> evidence, CancellationToken cancellationToken = default);
+}
+
+public interface ITraceSink
+{
+    Task WriteAsync(string runId, IReadOnlyList<TraceStep> trace, CancellationToken cancellationToken = default);
+}
+
+public interface ITrustedQuestionService
+{
+    Task<TrustedAnswer> AskAsync(TrustedQuestion question, CancellationToken cancellationToken = default);
+}
+
+public sealed class TrustedQuestionOptions
+{
+    public int SearchLimit { get; init; } = 5;
+    public double MinimumTopScore { get; init; } = 0.25;
+    public int MinimumEvidenceCount { get; init; } = 1;
+}
