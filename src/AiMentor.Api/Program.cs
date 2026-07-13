@@ -157,6 +157,11 @@ builder.Services.AddSingleton<IChatClient, DeterministicGroundedChatClient>();
 builder.Services.AddSingleton<IAnswerComposer, AgentFrameworkAnswerComposer>();
 builder.Services.AddSingleton(new TrustedQuestionOptions());
 builder.Services.AddSingleton<ITrustedQuestionService, TrustedQuestionService>();
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton(new MemoryWorkflowOptions());
+builder.Services.AddSingleton<IMemoryStore, InMemoryMemoryStore>();
+builder.Services.AddSingleton<IMemoryContentSafetyService, RuleBasedMemoryContentSafetyService>();
+builder.Services.AddSingleton<IMemoryWorkflowService, MemoryWorkflowService>();
 
 var app = builder.Build();
 app.UseExceptionHandler();
@@ -195,6 +200,42 @@ v1.MapPost("/questions/stream", StreamAsync)
     .ProducesProblem(StatusCodes.Status401Unauthorized)
     .ProducesProblem(StatusCodes.Status403Forbidden)
     .ProducesProblem(StatusCodes.Status429TooManyRequests)
+    .RequireRateLimiting("questions");
+
+var memories = v1.MapGroup("/memories").WithTags("AiMentor memory v1");
+memories.MapPost("/proposals", ProposeMemoryAsync)
+    .WithName("ProposeMemoryV1")
+    .WithSummary("提出待用户显式批准的记忆变更")
+    .Produces<MemoryProposal>(StatusCodes.Status202Accepted)
+    .ProducesValidationProblem()
+    .ProducesProblem(StatusCodes.Status400BadRequest)
+    .RequireRateLimiting("questions");
+memories.MapPost("/proposals/{proposalId}/approve", ApproveMemoryAsync)
+    .WithName("ApproveMemoryV1")
+    .WithSummary("批准记忆提案并创建正式记忆")
+    .Produces<MemoryRecord>(StatusCodes.Status201Created)
+    .ProducesProblem(StatusCodes.Status404NotFound)
+    .ProducesProblem(StatusCodes.Status409Conflict)
+    .RequireRateLimiting("questions");
+memories.MapGet("/", ListMemoriesAsync)
+    .WithName("ListMemoriesV1")
+    .WithSummary("查看当前用户尚未过期的已批准记忆")
+    .Produces<IReadOnlyList<MemoryRecord>>()
+    .RequireRateLimiting("questions");
+memories.MapPut("/{memoryId}", CorrectMemoryAsync)
+    .WithName("CorrectMemoryV1")
+    .WithSummary("使用乐观版本号更正已批准记忆")
+    .Produces<MemoryRecord>()
+    .ProducesValidationProblem()
+    .ProducesProblem(StatusCodes.Status404NotFound)
+    .ProducesProblem(StatusCodes.Status409Conflict)
+    .RequireRateLimiting("questions");
+memories.MapDelete("/{memoryId}", DeleteMemoryAsync)
+    .WithName("DeleteMemoryV1")
+    .WithSummary("使用乐观版本号删除已批准记忆")
+    .Produces(StatusCodes.Status204NoContent)
+    .ProducesProblem(StatusCodes.Status404NotFound)
+    .ProducesProblem(StatusCodes.Status409Conflict)
     .RequireRateLimiting("questions");
 
 // V0 仅用于短期迁移，默认关闭，Production 环境禁止启用。
@@ -243,6 +284,91 @@ static async Task<IResult> LegacyAskAsync(LegacyAskRequest request, ITrustedQues
         AccessContext.Create(request.TenantId, request.SubjectId, request.Groups), runId), cancellationToken);
     context.Response.Headers["X-Run-ID"] = answer.RunId;
     return Results.Ok(answer);
+}
+
+static async Task<IResult> ProposeMemoryAsync(ProposeMemoryRequest request, IMemoryWorkflowService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        var proposal = await service.ProposeAsync(new ProposeMemoryCommand(request.Scope, request.Key, request.Value,
+            request.SessionId, request.ExpiresAt), accessProvider.GetAccessContext(context.User), cancellationToken);
+        return Results.Accepted(value: proposal);
+    }
+    catch (MemoryWorkflowException exception)
+    {
+        return MemoryProblem(exception, context);
+    }
+}
+
+static async Task<IResult> ApproveMemoryAsync(string proposalId, IMemoryWorkflowService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        var memory = await service.ApproveAsync(proposalId, accessProvider.GetAccessContext(context.User), cancellationToken);
+        return Results.Created($"/api/v1/memories/{memory.Id}", memory);
+    }
+    catch (MemoryWorkflowException exception)
+    {
+        return MemoryProblem(exception, context);
+    }
+}
+
+static async Task<IResult> ListMemoriesAsync(MemoryScope? scope, string? sessionId, IMemoryWorkflowService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        var result = await service.ListAsync(accessProvider.GetAccessContext(context.User), scope, sessionId, cancellationToken);
+        return Results.Ok(result);
+    }
+    catch (MemoryWorkflowException exception)
+    {
+        return MemoryProblem(exception, context);
+    }
+}
+
+static async Task<IResult> CorrectMemoryAsync(string memoryId, CorrectMemoryRequest request, IMemoryWorkflowService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        var memory = await service.CorrectAsync(memoryId,
+            new CorrectMemoryCommand(request.Value, request.ExpectedVersion, request.ExpiresAt),
+            accessProvider.GetAccessContext(context.User), cancellationToken);
+        return Results.Ok(memory);
+    }
+    catch (MemoryWorkflowException exception)
+    {
+        return MemoryProblem(exception, context);
+    }
+}
+
+static async Task<IResult> DeleteMemoryAsync(string memoryId, int expectedVersion, IMemoryWorkflowService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        await service.DeleteAsync(memoryId, expectedVersion, accessProvider.GetAccessContext(context.User), cancellationToken);
+        return Results.NoContent();
+    }
+    catch (MemoryWorkflowException exception)
+    {
+        return MemoryProblem(exception, context);
+    }
+}
+
+static IResult MemoryProblem(MemoryWorkflowException exception, HttpContext context)
+{
+    var statusCode = exception.Kind switch
+    {
+        MemoryWorkflowErrorKind.NotFound => StatusCodes.Status404NotFound,
+        MemoryWorkflowErrorKind.Conflict => StatusCodes.Status409Conflict,
+        _ => StatusCodes.Status400BadRequest
+    };
+    return Results.Problem(statusCode: statusCode, title: "记忆工作流请求失败", detail: exception.Message,
+        instance: context.Request.Path, extensions: new Dictionary<string, object?> { ["code"] = exception.Code });
 }
 
 static async Task WriteEventAsync(HttpResponse response, string eventName, object payload, JsonSerializerOptions options,
