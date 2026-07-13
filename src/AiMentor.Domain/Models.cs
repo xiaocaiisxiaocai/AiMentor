@@ -35,7 +35,7 @@ public sealed record KnowledgeChunk(
     IReadOnlySet<string> AllowedGroups,
     string SourcePath);
 
-public sealed record Evidence(KnowledgeChunk Chunk, double Score);
+public sealed record Evidence(KnowledgeChunk Chunk, double Score, double? RetrievalScore = null);
 
 public sealed record Citation(
     string DocumentId,

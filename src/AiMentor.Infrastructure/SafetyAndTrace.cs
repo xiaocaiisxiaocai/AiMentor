@@ -14,6 +14,7 @@ public sealed partial class RuleBasedInputSafetyService : IInputSafetyService
         if (SecretPattern().IsMatch(input)) return new(SafetyAction.Refuse, "SECRET_REQUEST", "不能处理索取、展示或推断密码、令牌、密钥等敏感凭证的请求。");
         if (InjectionPattern().IsMatch(input)) return new(SafetyAction.Refuse, "PROMPT_INJECTION", "检测到试图绕过系统规则或访问隐藏指令的内容，已拒绝处理。");
         if (PersonalDataPattern().IsMatch(input)) return new(SafetyAction.Refuse, "SENSITIVE_PERSONAL_DATA", "请求涉及高风险个人敏感信息，已拒绝处理。");
+        if (MemoryMutationPattern().IsMatch(input)) return new(SafetyAction.RequireApproval, "MEMORY_OPERATION_REQUIRES_WORKFLOW", "记忆新增、修改或删除必须进入独立的授权工作流，不能作为普通知识问答处理。");
         return SafetyDecision.Allowed;
     }
 
@@ -25,6 +26,9 @@ public sealed partial class RuleBasedInputSafetyService : IInputSafetyService
 
     [GeneratedRegex(@"(?is)^(?=.{0,4000}$)(?=.*(身份证号|银行卡号|完整病历|个人征信))(?=.*(查询|导出|显示|告诉|获取|请)).*$")]
     private static partial Regex PersonalDataPattern();
+
+    [GeneratedRegex(@"(?i)(以后.{0,20}(记住|默认)|帮我记住|保存.{0,12}偏好|删除.{0,12}偏好|写入.{0,12}(长期|记忆)|Agent.{0,12}错误总结|用户\s*[AB].{0,20}偏好)")]
+    private static partial Regex MemoryMutationPattern();
 }
 
 public sealed class InMemoryTraceSink : ITraceSink

@@ -5,6 +5,8 @@ namespace AiMentor.Application;
 public sealed class TrustedQuestionService(
     IKnowledgeRepository knowledge,
     IInputSafetyService safety,
+    IEvidenceReranker reranker,
+    IEvidenceSufficiencyEvaluator sufficiencyEvaluator,
     IAnswerComposer composer,
     ITraceSink traceSink,
     TrustedQuestionOptions options) : ITrustedQuestionService
@@ -29,26 +31,48 @@ public sealed class TrustedQuestionService(
             return await CompleteAsync(AnswerDecision.Refused, invalid.Message, false, invalid, [], trace);
         }
 
-        var evidence = await knowledge.SearchAsync(question.Question, question.Access, options.SearchLimit, cancellationToken);
-        Trace("knowledge.search", evidence.Count > 0 ? "found" : "empty", new Dictionary<string, object?>
+        var candidates = await knowledge.SearchAsync(question.Question, question.Access, options.SearchLimit, cancellationToken);
+        Trace("knowledge.search", candidates.Count > 0 ? "found" : "empty", new Dictionary<string, object?>
         {
-            ["accessibleEvidenceCount"] = evidence.Count,
-            ["topScore"] = evidence.Count > 0 ? evidence[0].Score : 0
+            ["accessibleEvidenceCount"] = candidates.Count,
+            ["topScore"] = candidates.Count > 0 ? candidates[0].Score : 0
         });
 
-        var sufficient = evidence.Count >= options.MinimumEvidenceCount && evidence[0].Score >= options.MinimumTopScore;
-        if (!sufficient)
+        var evidence = await reranker.RerankAsync(question.Question, candidates, cancellationToken);
+        Trace("evidence.rerank", evidence.Count > 0 ? "ranked" : "empty", new Dictionary<string, object?>
         {
-            Trace("evidence.gate", "insufficient", new Dictionary<string, object?> { ["threshold"] = options.MinimumTopScore });
+            ["candidateCount"] = evidence.Count,
+            ["topRerankedScore"] = evidence.Count > 0 ? evidence[0].Score : 0
+        });
+        var assessment = sufficiencyEvaluator.Evaluate(question.Question, evidence, options.MinimumTopScore);
+        if (!assessment.IsSufficient || evidence.Count < options.MinimumEvidenceCount)
+        {
+            Trace("evidence.gate", "insufficient", new Dictionary<string, object?>
+            {
+                ["code"] = assessment.Code,
+                ["confidence"] = assessment.Confidence,
+                ["threshold"] = options.MinimumTopScore
+            });
             return await CompleteAsync(AnswerDecision.InsufficientEvidence, "现有且您有权访问的知识中证据不足，我不能据此给出可靠答案。", false, safetyDecision, [], trace);
         }
 
-        Trace("evidence.gate", "passed", new Dictionary<string, object?> { ["evidenceCount"] = evidence.Count });
+        Trace("evidence.gate", "passed", new Dictionary<string, object?>
+        {
+            ["evidenceCount"] = evidence.Count,
+            ["code"] = assessment.Code,
+            ["confidence"] = assessment.Confidence
+        });
         try
         {
             var answer = await composer.ComposeAsync(question.Question, evidence, cancellationToken);
-            var citationThreshold = Math.Max(options.MinimumTopScore, evidence[0].Score * 0.6);
-            var citations = evidence.Where(item => item.Score >= citationThreshold).Take(3).Select(ToCitation).ToArray();
+            var citationRanking = evidence.OrderByDescending(item => item.RetrievalScore ?? item.Score).ToArray();
+            var topRetrievalScore = citationRanking[0].RetrievalScore ?? citationRanking[0].Score;
+            var citationThreshold = Math.Max(options.MinimumTopScore, topRetrievalScore * 0.6);
+            var citations = citationRanking
+                .Where(item => (item.RetrievalScore ?? item.Score) >= citationThreshold)
+                .Take(3)
+                .Select(ToCitation)
+                .ToArray();
             Trace("answer.composed", "ok", new Dictionary<string, object?> { ["citationCount"] = citations.Length });
             return await CompleteAsync(AnswerDecision.Answered, answer, true, safetyDecision, citations, trace);
         }

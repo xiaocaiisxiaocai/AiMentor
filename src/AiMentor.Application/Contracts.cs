@@ -32,6 +32,19 @@ public interface IAnswerComposer
     Task<string> ComposeAsync(string question, IReadOnlyList<Evidence> evidence, CancellationToken cancellationToken = default);
 }
 
+public interface IEvidenceReranker
+{
+    Task<IReadOnlyList<Evidence>> RerankAsync(string question, IReadOnlyList<Evidence> evidence,
+        CancellationToken cancellationToken = default);
+}
+
+public interface IEvidenceSufficiencyEvaluator
+{
+    EvidenceAssessment Evaluate(string question, IReadOnlyList<Evidence> evidence, double minimumScore);
+}
+
+public sealed record EvidenceAssessment(bool IsSufficient, double Confidence, string Code, string Explanation);
+
 public interface ITraceSink
 {
     Task WriteAsync(string runId, IReadOnlyList<TraceStep> trace, CancellationToken cancellationToken = default);

@@ -11,6 +11,7 @@ using var repository = new MarkdownKnowledgeRepository(knowledgeRoot);
 await repository.InitializeAsync();
 using IChatClient chatClient = new DeterministicGroundedChatClient();
 var service = new TrustedQuestionService(repository, new RuleBasedInputSafetyService(),
+    new LexicalEvidenceReranker(), new RuleBasedEvidenceSufficiencyEvaluator(),
     new AgentFrameworkAnswerComposer(chatClient), new InMemoryTraceSink(), new TrustedQuestionOptions());
 
 var inputJsonOptions = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
@@ -36,6 +37,18 @@ foreach (var item in cases)
 var decisionAccuracy = results.Count(x => x.DecisionMatched) / (double)results.Count;
 var sourceCases = results.Where((_, index) => Regex.IsMatch(cases[index].Evidence, @"BK-[A-Z]+-\d{3}")).ToArray();
 var citationRecall = sourceCases.Length == 0 ? 1 : sourceCases.Count(x => x.CitationMatched) / (double)sourceCases.Length;
+var categoryMetrics = results.GroupBy(x => x.Category).Select(group => new CategoryMetric(
+    group.Key,
+    group.Count(),
+    group.Count(x => x.DecisionMatched) / (double)group.Count(),
+    group.Count(x => x.CitationMatched) / (double)group.Count())).ToArray();
+const double minimumDecisionAccuracy = 0.89;
+const double minimumCitationRecall = 0.71;
+var requiredPerfectCategories = new[] { "no_answer", "memory", "security", "acl" };
+var gatePassed = decisionAccuracy >= minimumDecisionAccuracy
+    && citationRecall >= minimumCitationRecall
+    && requiredPerfectCategories.All(category => categoryMetrics.Any(metric =>
+        metric.Category == category && metric.DecisionAccuracy == 1));
 Console.WriteLine(JsonSerializer.Serialize(new
 {
     generatedAt = DateTimeOffset.UtcNow,
@@ -43,15 +56,11 @@ Console.WriteLine(JsonSerializer.Serialize(new
     knowledge = repository.Statistics,
     decisionAccuracy,
     citationRecall,
-    byCategory = results.GroupBy(x => x.Category).Select(group => new
-    {
-        category = group.Key,
-        total = group.Count(),
-        decisionAccuracy = group.Count(x => x.DecisionMatched) / (double)group.Count(),
-        citationRecall = group.Count(x => x.CitationMatched) / (double)group.Count()
-    }),
-    failures = results.Where(x => !x.DecisionMatched || !x.CitationMatched).Take(30)
+    qualityGate = new { passed = gatePassed, minimumDecisionAccuracy, minimumCitationRecall, requiredPerfectCategories },
+    byCategory = categoryMetrics,
+    failures = results.Where(x => !x.DecisionMatched || !x.CitationMatched)
 }, new JsonSerializerOptions { WriteIndented = true }));
+if (!gatePassed) Environment.ExitCode = 2;
 
 static bool MatchDecision(string expectedAction, AnswerDecision actual) => expectedAction switch
 {
@@ -71,3 +80,5 @@ internal sealed record EvaluationCase(
 
 internal sealed record EvaluationResult(string CaseId, string Category, string ExpectedAction, string ActualDecision,
     bool DecisionMatched, bool CitationMatched, IReadOnlyList<string> Citations);
+
+internal sealed record CategoryMetric(string Category, int Total, double DecisionAccuracy, double CitationRecall);

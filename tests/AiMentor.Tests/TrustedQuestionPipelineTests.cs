@@ -17,6 +17,7 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
     {
         await _repository.InitializeAsync();
         _service = new TrustedQuestionService(_repository, new RuleBasedInputSafetyService(),
+            new LexicalEvidenceReranker(), new RuleBasedEvidenceSufficiencyEvaluator(),
             new AgentFrameworkAnswerComposer(_chatClient), new InMemoryTraceSink(), new TrustedQuestionOptions());
     }
 
@@ -69,6 +70,26 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
         var result = await AskAsync("北辰公司的年假有多少天？", "all-rnd");
 
         Assert.Equal(AnswerDecision.InsufficientEvidence, result.Decision);
+        Assert.Empty(result.Citations);
+    }
+
+    [Fact]
+    public async Task AskShouldNotTreatNumberedProcedureAsRequestedConfigurationValue()
+    {
+        var result = await AskAsync("OrionOrder 连接池大小是多少？", "all-rnd");
+
+        Assert.Equal(AnswerDecision.InsufficientEvidence, result.Decision);
+        Assert.Contains(result.Trace, step => step.Name == "evidence.gate"
+            && Equals(step.Details["code"], "EXPECTED_VALUE_MISSING"));
+    }
+
+    [Fact]
+    public async Task AskShouldRouteMemoryMutationAwayFromRag()
+    {
+        var result = await AskAsync("以后默认给我简短回答，可以记住", "all-rnd");
+
+        Assert.Equal(AnswerDecision.Refused, result.Decision);
+        Assert.Equal("MEMORY_OPERATION_REQUIRES_WORKFLOW", result.Safety.Code);
         Assert.Empty(result.Citations);
     }
 
