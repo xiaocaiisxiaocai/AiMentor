@@ -310,10 +310,20 @@ agents.MapPost("/runs", RunAgentAsync)
     .WithName("RunAgentV1")
     .WithSummary("执行受限 Agent 规划与服务器工具调用闭环")
     .Produces<AgentRunResult>()
+    .Produces<AgentRunResult>(StatusCodes.Status202Accepted)
     .ProducesValidationProblem()
     .ProducesProblem(StatusCodes.Status403Forbidden)
     .ProducesProblem(StatusCodes.Status429TooManyRequests)
     .ProducesProblem(StatusCodes.Status503ServiceUnavailable)
+    .RequireRateLimiting("questions");
+agents.MapPost("/runs/{runId}/resume", ResumeAgentAsync)
+    .WithName("ResumeAgentRunV1")
+    .WithSummary("在独立审批人裁决后恢复暂停的 Agent 运行")
+    .Produces<AgentRunResult>()
+    .Produces<AgentRunResult>(StatusCodes.Status202Accepted)
+    .ProducesProblem(StatusCodes.Status403Forbidden)
+    .ProducesProblem(StatusCodes.Status404NotFound)
+    .ProducesProblem(StatusCodes.Status409Conflict)
     .RequireRateLimiting("questions");
 
 // V0 仅用于短期迁移，默认关闭，Production 环境禁止启用。
@@ -535,17 +545,61 @@ static IResult ToolApprovalProblem(ToolApprovalException exception, HttpContext 
 static async Task<IResult> RunAgentAsync(RunAgentRequest request, IAgentRunner runner,
     IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
 {
-    var result = await runner.RunAsync(request.Input, accessProvider.GetAccessContext(context.User),
-        GetCorrelationId(context), cancellationToken);
-    context.Response.Headers["X-Run-ID"] = result.RunId;
+    try
+    {
+        var result = await runner.RunAsync(request.Input, accessProvider.GetAccessContext(context.User),
+            GetCorrelationId(context), cancellationToken);
+        context.Response.Headers["X-Run-ID"] = result.RunId;
+        return AgentRunResultResponse(result);
+    }
+    catch (AgentRunWorkflowException exception)
+    {
+        return AgentRunProblem(exception, context);
+    }
+}
+
+static async Task<IResult> ResumeAgentAsync(string runId, IAgentRunner runner,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        var result = await runner.ResumeAsync(runId, accessProvider.GetAccessContext(context.User), cancellationToken);
+        context.Response.Headers["X-Run-ID"] = result.RunId;
+        return AgentRunResultResponse(result);
+    }
+    catch (AgentRunWorkflowException exception)
+    {
+        return AgentRunProblem(exception, context);
+    }
+}
+
+static IResult AgentRunResultResponse(AgentRunResult result)
+{
     var statusCode = result.Status switch
     {
         AgentRunStatus.Completed => StatusCodes.Status200OK,
+        AgentRunStatus.AwaitingApproval => StatusCodes.Status202Accepted,
         AgentRunStatus.Refused => StatusCodes.Status403Forbidden,
         AgentRunStatus.LimitExceeded => StatusCodes.Status422UnprocessableEntity,
         _ => StatusCodes.Status503ServiceUnavailable
     };
     return Results.Json(result, statusCode: statusCode);
+}
+
+static IResult AgentRunProblem(AgentRunWorkflowException exception, HttpContext context)
+{
+    var statusCode = exception.Kind switch
+    {
+        AgentRunWorkflowErrorKind.Validation => StatusCodes.Status400BadRequest,
+        AgentRunWorkflowErrorKind.Forbidden => StatusCodes.Status403Forbidden,
+        AgentRunWorkflowErrorKind.NotFound => StatusCodes.Status404NotFound,
+        AgentRunWorkflowErrorKind.Conflict => StatusCodes.Status409Conflict,
+        AgentRunWorkflowErrorKind.Capacity => StatusCodes.Status503ServiceUnavailable,
+        _ => StatusCodes.Status500InternalServerError
+    };
+    return Results.Problem(statusCode: statusCode, title: "Agent 运行状态错误", detail: exception.Message,
+        instance: context.Request.Path,
+        extensions: new Dictionary<string, object?> { ["code"] = exception.Code });
 }
 
 static async Task WriteEventAsync(HttpResponse response, string eventName, object payload, JsonSerializerOptions options,

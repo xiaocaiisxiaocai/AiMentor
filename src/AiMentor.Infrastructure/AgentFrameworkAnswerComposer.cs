@@ -66,6 +66,27 @@ public sealed class DeterministicGroundedChatClient : IChatClient
                 ComposeToolResult(functionResult.Result?.ToString()))));
 
         var prompt = messageList.LastOrDefault()?.Text ?? string.Empty;
+        var memoryDeleteTool = options?.Tools?.OfType<AIFunctionDeclaration>()
+            .FirstOrDefault(tool => string.Equals(tool.Name, "memory_delete", StringComparison.Ordinal));
+        var memoryId = Regex.Match(prompt, @"memoryId\s*[:=]\s*(?<value>[a-zA-Z0-9._-]{1,128})",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        var expectedVersion = Regex.Match(prompt, @"expectedVersion\s*[:=]\s*(?<value>[1-9][0-9]{0,9})",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        if (memoryDeleteTool is not null && memoryId.Success && expectedVersion.Success
+            && int.TryParse(expectedVersion.Groups["value"].Value, out var version))
+        {
+            var call = new FunctionCallContent(Guid.NewGuid().ToString("N"), memoryDeleteTool.Name,
+                new Dictionary<string, object?>
+                {
+                    ["arguments"] = new Dictionary<string, object?>
+                    {
+                        ["memoryId"] = memoryId.Groups["value"].Value,
+                        ["expectedVersion"] = version
+                    }
+                });
+            return Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, [call])));
+        }
+
         var statisticsTool = options?.Tools?.OfType<AIFunctionDeclaration>()
             .FirstOrDefault(tool => string.Equals(tool.Name, "knowledge_stats", StringComparison.Ordinal));
         if (statisticsTool is not null && Regex.IsMatch(prompt, "知识库|文档|分块|chunk", RegexOptions.IgnoreCase))

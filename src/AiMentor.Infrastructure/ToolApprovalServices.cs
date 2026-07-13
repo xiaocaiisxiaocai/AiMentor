@@ -144,6 +144,27 @@ public sealed class InMemoryToolApprovalService(
         return result;
     }
 
+    public Task<ToolApprovalRequest> GetAsync(string approvalId, AccessContext access,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateOptions();
+        ValidateAccess(access);
+        cancellationToken.ThrowIfCancellationRequested();
+        var id = RequiredText(approvalId, 128, "TOOL_APPROVAL_ID_INVALID", "审批标识无效。");
+        lock (_gate)
+        {
+            if (!_requests.TryGetValue(id, out var request)
+                || !string.Equals(request.TenantId, access.TenantId, StringComparison.Ordinal)
+                || (!string.Equals(request.RequesterSubjectId, access.SubjectId, StringComparison.Ordinal)
+                    && !access.Groups.Overlaps(options.ApproverGroups)))
+                throw Failure("TOOL_APPROVAL_NOT_FOUND", "没有找到当前用户可访问的审批。",
+                    ToolApprovalErrorKind.NotFound);
+            request = ExpireIfNeeded(request, timeProvider.GetUtcNow());
+            _requests[id] = request;
+            return Task.FromResult(request);
+        }
+    }
+
     public async Task<ToolApprovalConsumption> ConsumeAsync(string approvalId, string toolName, JsonElement arguments,
         AccessContext requester, CancellationToken cancellationToken = default)
     {

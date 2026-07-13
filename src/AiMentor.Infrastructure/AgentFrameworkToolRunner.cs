@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -21,9 +22,12 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
     private readonly ITraceSink _traceSink;
     private readonly AgentExecutionOptions _options;
     private readonly TimeProvider _timeProvider;
+    private readonly IToolApprovalService? _approvalService;
+    private readonly ConcurrentDictionary<string, PendingAgentRun> _pendingRuns = new(StringComparer.Ordinal);
 
     public AgentFrameworkToolRunner(IChatClient chatClient, IToolRegistry registry, IToolExecutor executor,
-        IInputSafetyService inputSafety, ITraceSink traceSink, AgentExecutionOptions options, TimeProvider timeProvider)
+        IInputSafetyService inputSafety, ITraceSink traceSink, AgentExecutionOptions options, TimeProvider timeProvider,
+        IToolApprovalService? approvalService = null)
     {
         ValidateOptions(options);
         var functionClient = new FunctionInvokingChatClient(chatClient)
@@ -49,6 +53,7 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
         _traceSink = traceSink;
         _options = options;
         _timeProvider = timeProvider;
+        _approvalService = approvalService;
     }
 
     public async Task<AgentRunResult> RunAsync(string input, AccessContext access, string? correlationId = null,
@@ -90,19 +95,8 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
                 ToolMode = ChatToolMode.Auto
             });
             var response = await _agent.RunAsync(input.Trim(), session, runOptions, timeoutSource.Token);
-
-            if (guard.LimitDecision is not null)
-                return await CompleteAsync(runId, AgentRunStatus.LimitExceeded, guard.LimitDecision.Message,
-                    guard.LimitDecision, guard.Steps, trace, cancellationToken);
-
-            var answer = response.Text?.Trim() ?? string.Empty;
-            var outputDecision = ReviewOutput(answer);
-            trace.Add(Step("agent.output_safety", outputDecision.Action.ToString(),
-                new Dictionary<string, object?> { ["code"] = outputDecision.Code }));
-            var status = outputDecision.Action == SafetyAction.Allow ? AgentRunStatus.Completed : AgentRunStatus.Refused;
-            return await CompleteAsync(runId, status,
-                status == AgentRunStatus.Completed ? answer : outputDecision.Message,
-                outputDecision, guard.Steps, trace, cancellationToken);
+            return await ProcessResponseAsync(runId, response, session, runOptions, guard, access, trace,
+                cancellationToken);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
@@ -110,6 +104,10 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
             trace.Add(Step("agent.completed", "timeout", new Dictionary<string, object?> { ["code"] = decision.Code }));
             return await CompleteAsync(runId, AgentRunStatus.LimitExceeded, decision.Message, decision,
                 guard.Steps, trace, CancellationToken.None);
+        }
+        catch (AgentRunWorkflowException)
+        {
+            throw;
         }
         catch (Exception exception)
         {
@@ -134,6 +132,165 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
         }
     }
 
+    public async Task<AgentRunResult> ResumeAsync(string runId, AccessContext access,
+        CancellationToken cancellationToken = default)
+    {
+        var normalizedRunId = RequireRunId(runId);
+        if (!_pendingRuns.TryGetValue(normalizedRunId, out var pending))
+            throw WorkflowFailure("AGENT_RUN_NOT_FOUND", "没有找到可恢复的 Agent 运行。",
+                AgentRunWorkflowErrorKind.NotFound);
+        if (!SameOwner(pending.Access, access))
+            throw WorkflowFailure("AGENT_RUN_RESUME_FORBIDDEN", "只有原始调用者可以恢复 Agent 运行。",
+                AgentRunWorkflowErrorKind.Forbidden);
+
+        await pending.Gate.WaitAsync(cancellationToken);
+        try
+        {
+            if (!_pendingRuns.TryGetValue(normalizedRunId, out var current) || !ReferenceEquals(current, pending))
+                throw WorkflowFailure("AGENT_RUN_ALREADY_RESUMED", "Agent 运行已经恢复或终止。",
+                    AgentRunWorkflowErrorKind.Conflict);
+            if (_approvalService is null)
+                throw WorkflowFailure("AGENT_APPROVAL_SERVICE_UNAVAILABLE", "审批服务不可用，运行不能恢复。",
+                    AgentRunWorkflowErrorKind.Conflict);
+
+            var approval = await _approvalService.GetAsync(pending.Checkpoint.ApprovalId, access, cancellationToken);
+            if (approval.Status == ToolApprovalStatus.Pending)
+                return CreateAwaitingResult(pending, approval);
+
+            if (!_pendingRuns.TryRemove(new KeyValuePair<string, PendingAgentRun>(normalizedRunId, pending)))
+                throw WorkflowFailure("AGENT_RUN_ALREADY_RESUMED", "Agent 运行已经恢复或终止。",
+                    AgentRunWorkflowErrorKind.Conflict);
+
+            var approved = approval.Status == ToolApprovalStatus.Approved;
+            if (approved) pending.Guard.SetApprovalId(approval.Id);
+            var reason = approval.DecisionReason ?? (approval.Status == ToolApprovalStatus.Expired
+                ? "审批已过期。" : "审批未获批准。");
+            pending.Trace.Add(Step("agent.approval.resumed", approved ? "approved" : "rejected",
+                new Dictionary<string, object?>
+                {
+                    ["approvalId"] = approval.Id,
+                    ["tool"] = approval.ToolName,
+                    ["approvalStatus"] = approval.Status.ToString()
+                }));
+
+            using var timeoutSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutSource.CancelAfter(_options.MaximumRunTime);
+            var frameworkResponse = pending.FrameworkRequest.CreateResponse(approved, reason);
+            var response = await _agent.RunAsync(
+                [new ChatMessage(ChatRole.User, [frameworkResponse])], pending.Session, pending.RunOptions,
+                timeoutSource.Token);
+
+            if (!approved)
+            {
+                var code = approval.Status == ToolApprovalStatus.Expired
+                    ? "AGENT_TOOL_APPROVAL_EXPIRED" : "AGENT_TOOL_APPROVAL_REJECTED";
+                var decision = new SafetyDecision(SafetyAction.Refuse, code,
+                    approval.Status == ToolApprovalStatus.Expired ? "工具审批已过期，Agent 运行终止。" : "工具审批被拒绝，Agent 运行终止。");
+                return await CompleteAsync(normalizedRunId, AgentRunStatus.Refused, decision.Message, decision,
+                    pending.Guard.Steps, pending.Trace, cancellationToken);
+            }
+
+            return await ProcessResponseAsync(normalizedRunId, response, pending.Session, pending.RunOptions,
+                pending.Guard, access, pending.Trace, cancellationToken);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            var decision = new SafetyDecision(SafetyAction.Refuse, "AGENT_RESUME_TIMEOUT", "Agent 恢复执行超过服务器总时限。");
+            return await CompleteAsync(normalizedRunId, AgentRunStatus.LimitExceeded, decision.Message, decision,
+                pending.Guard.Steps, pending.Trace, CancellationToken.None);
+        }
+        catch (AgentRunWorkflowException)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            _pendingRuns.TryRemove(new KeyValuePair<string, PendingAgentRun>(normalizedRunId, pending));
+            var decision = new SafetyDecision(SafetyAction.Refuse, "AGENT_RESUME_FAILED", "Agent 恢复失败，未返回不完整结果。");
+            pending.Trace.Add(Step("agent.resume", "failed", new Dictionary<string, object?>
+            {
+                ["code"] = decision.Code,
+                ["exceptionType"] = exception.GetType().Name
+            }));
+            return await CompleteAsync(normalizedRunId, AgentRunStatus.Failed, decision.Message, decision,
+                pending.Guard.Steps, pending.Trace, cancellationToken);
+        }
+        finally
+        {
+            pending.Gate.Release();
+        }
+    }
+
+    private async Task<AgentRunResult> ProcessResponseAsync(string runId, AgentResponse response, AgentSession session,
+        ChatClientAgentRunOptions runOptions, ToolRunGuard guard, AccessContext access, List<TraceStep> trace,
+        CancellationToken cancellationToken)
+    {
+        if (guard.LimitDecision is not null)
+            return await CompleteAsync(runId, AgentRunStatus.LimitExceeded, guard.LimitDecision.Message,
+                guard.LimitDecision, guard.Steps, trace, cancellationToken);
+
+        var approvalRequests = response.Messages.SelectMany(message => message.Contents)
+            .OfType<ToolApprovalRequestContent>().ToArray();
+        if (approvalRequests.Length > 0)
+            return await PauseForApprovalAsync(runId, approvalRequests, session, runOptions, guard, access, trace,
+                cancellationToken);
+
+        var answer = response.Text?.Trim() ?? string.Empty;
+        var outputDecision = ReviewOutput(answer);
+        trace.Add(Step("agent.output_safety", outputDecision.Action.ToString(),
+            new Dictionary<string, object?> { ["code"] = outputDecision.Code }));
+        var status = outputDecision.Action == SafetyAction.Allow ? AgentRunStatus.Completed : AgentRunStatus.Refused;
+        return await CompleteAsync(runId, status,
+            status == AgentRunStatus.Completed ? answer : outputDecision.Message,
+            outputDecision, guard.Steps, trace, cancellationToken);
+    }
+
+    private async Task<AgentRunResult> PauseForApprovalAsync(string runId,
+        ToolApprovalRequestContent[] requests, AgentSession session, ChatClientAgentRunOptions runOptions,
+        ToolRunGuard guard, AccessContext access, List<TraceStep> trace, CancellationToken cancellationToken)
+    {
+        if (_approvalService is null)
+            return await CompleteAsync(runId, AgentRunStatus.Failed, "审批服务不可用，修改性工具保持关闭。",
+                new SafetyDecision(SafetyAction.Refuse, "AGENT_APPROVAL_SERVICE_UNAVAILABLE", "审批服务不可用，修改性工具保持关闭。"),
+                guard.Steps, trace, cancellationToken);
+        if (requests.Length != 1 || requests[0].ToolCall is not FunctionCallContent functionCall)
+            return await CompleteAsync(runId, AgentRunStatus.Failed, "Agent 返回了无法安全处理的审批请求。",
+                new SafetyDecision(SafetyAction.Refuse, "AGENT_APPROVAL_REQUEST_INVALID", "Agent 返回了无法安全处理的审批请求。"),
+                guard.Steps, trace, cancellationToken);
+
+        var descriptor = _registry.Descriptors.FirstOrDefault(item =>
+            string.Equals(ToFunctionName(item.Name), functionCall.Name, StringComparison.Ordinal));
+        if (descriptor is null || descriptor.Risk == ToolOperationRisk.ReadOnly)
+            return await CompleteAsync(runId, AgentRunStatus.Failed, "审批请求没有匹配的修改性服务器工具。",
+                new SafetyDecision(SafetyAction.Refuse, "AGENT_APPROVAL_TOOL_MISMATCH", "审批请求没有匹配的修改性服务器工具。"),
+                guard.Steps, trace, cancellationToken);
+
+        PruneExpiredPendingRuns();
+        if (_pendingRuns.Count >= _options.MaximumPendingApprovalRuns)
+            throw WorkflowFailure("AGENT_PENDING_CAPACITY_EXCEEDED", "等待审批的 Agent 运行已达到容量上限。",
+                AgentRunWorkflowErrorKind.Capacity);
+
+        var arguments = ExtractToolArguments(functionCall);
+        var approval = await _approvalService.RequestAsync(descriptor.Name, arguments,
+            $"Agent 运行 {runId} 请求执行修改性工具。", access, cancellationToken);
+        var checkpoint = new AgentApprovalCheckpoint(approval.Id, approval.ToolName, approval.Risk,
+            approval.ArgumentNames, approval.CreatedAt, approval.ExpiresAt);
+        trace.Add(Step("agent.approval.required", "pending", new Dictionary<string, object?>
+        {
+            ["approvalId"] = approval.Id,
+            ["tool"] = approval.ToolName,
+            ["expiresAt"] = approval.ExpiresAt
+        }));
+        var pending = new PendingAgentRun(access, session, runOptions, guard, trace, requests[0], checkpoint);
+        if (!_pendingRuns.TryAdd(runId, pending))
+            throw WorkflowFailure("AGENT_RUN_ALREADY_PENDING", "相同运行标识已有等待审批的 Agent 运行。",
+                AgentRunWorkflowErrorKind.Conflict);
+        await _traceSink.WriteAsync(runId, trace, cancellationToken);
+        return new AgentRunResult(runId, AgentRunStatus.AwaitingApproval, "工具调用等待独立审批人裁决。",
+            new SafetyDecision(SafetyAction.RequireApproval, "AGENT_TOOL_APPROVAL_REQUIRED", "工具调用等待独立审批人裁决。"),
+            guard.Steps.ToArray(), trace.ToArray(), checkpoint);
+    }
+
     private static AIFunction CreateFunction(ToolDescriptor descriptor, ToolRunGuard guard)
     {
         var functionOptions = new AIFunctionFactoryOptions
@@ -142,19 +299,14 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
             Description = $"{descriptor.Description} 服务器工具标识：{descriptor.Name}。参数必须放在 arguments JSON 对象中。"
                 + (descriptor.Risk == ToolOperationRisk.ReadOnly
                     ? " 只读工具无需 approvalId。"
-                    : " 修改性工具必须提供由服务器审批 API 签发的 approvalId，模型不得自行生成。")
+                    : " 修改性工具调用会暂停并进入服务器审批流程，模型不得尝试自行批准。")
         };
-        if (descriptor.Risk == ToolOperationRisk.ReadOnly)
-        {
-            Func<JsonElement, CancellationToken, Task<string>> readOnlyCallback =
-                (arguments, cancellationToken) => guard.ExecuteAsync(descriptor.Name, arguments, null, cancellationToken);
-            return AIFunctionFactory.Create(readOnlyCallback, functionOptions);
-        }
-
-        Func<JsonElement, string?, CancellationToken, Task<string>> approvalCallback =
-            (arguments, approvalId, cancellationToken) =>
-                guard.ExecuteAsync(descriptor.Name, arguments, approvalId, cancellationToken);
-        return AIFunctionFactory.Create(approvalCallback, functionOptions);
+        Func<JsonElement, CancellationToken, Task<string>> callback =
+            (arguments, cancellationToken) =>
+                guard.ExecuteAsync(descriptor.Name, arguments, guard.ActiveApprovalId, cancellationToken);
+        var function = AIFunctionFactory.Create(callback, functionOptions);
+        // 这里只声明单次原生暂停；长期“永远批准”会扩大授权范围，故不接入 ToolApprovalAgent 规则。
+        return descriptor.Risk == ToolOperationRisk.ReadOnly ? function : new ApprovalRequiredAIFunction(function);
     }
 
     private SafetyDecision ReviewOutput(string answer)
@@ -199,6 +351,7 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
     {
         if (options.MaximumModelIterations < 2 || options.MaximumToolCalls <= 0
             || options.MaximumCumulativeToolResultBytes <= 0 || options.MaximumAnswerCharacters <= 0
+            || options.MaximumPendingApprovalRuns <= 0
             || options.MaximumRunTime <= TimeSpan.Zero)
             throw new InvalidOperationException("Agent 执行预算配置无效。");
     }
@@ -211,6 +364,10 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
 
         public List<AgentToolStep> Steps { get; } = [];
         public SafetyDecision? LimitDecision { get; private set; }
+        public string? ActiveApprovalId { get; private set; }
+        public string AgentRunId => agentRunId;
+
+        public void SetApprovalId(string approvalId) => ActiveApprovalId = approvalId;
 
         public async Task<string> ExecuteAsync(string toolName, JsonElement arguments, string? approvalId,
             CancellationToken cancellationToken)
@@ -262,5 +419,61 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
 
         private static string SerializeEnvelope(ToolExecutionStatus status, string code, JsonElement? output) =>
             JsonSerializer.Serialize(new { status = status.ToString(), code, output });
+    }
+
+    private static AgentRunResult CreateAwaitingResult(PendingAgentRun pending, ToolApprovalRequest approval) =>
+        new(pending.Guard.AgentRunId, AgentRunStatus.AwaitingApproval, "工具调用仍在等待独立审批人裁决。",
+            new SafetyDecision(SafetyAction.RequireApproval, "AGENT_TOOL_APPROVAL_PENDING", "工具调用仍在等待独立审批人裁决。"),
+            pending.Guard.Steps.ToArray(), pending.Trace.ToArray(), pending.Checkpoint with
+            {
+                ExpiresAt = approval.ExpiresAt
+            });
+
+    private void PruneExpiredPendingRuns()
+    {
+        var now = _timeProvider.GetUtcNow();
+        foreach (var item in _pendingRuns)
+        {
+            if (item.Value.Checkpoint.ExpiresAt <= now)
+                _pendingRuns.TryRemove(new KeyValuePair<string, PendingAgentRun>(item.Key, item.Value));
+        }
+    }
+
+    private static JsonElement ExtractToolArguments(FunctionCallContent functionCall)
+    {
+        if (functionCall.Arguments is null || !functionCall.Arguments.TryGetValue("arguments", out var value)
+            || value is null)
+            return JsonSerializer.SerializeToElement(new Dictionary<string, object?>());
+        var element = value is JsonElement json ? json.Clone() : JsonSerializer.SerializeToElement(value);
+        return element.ValueKind == JsonValueKind.Object
+            ? element : JsonSerializer.SerializeToElement(new Dictionary<string, object?>());
+    }
+
+    private static string RequireRunId(string? value)
+    {
+        var normalized = value?.Trim();
+        if (normalized is not { Length: > 0 and <= 128 }
+            || !normalized.All(character => char.IsLetterOrDigit(character) || character is '-' or '_' or '.'))
+            throw WorkflowFailure("AGENT_RUN_ID_INVALID", "Agent 运行标识无效。", AgentRunWorkflowErrorKind.Validation);
+        return normalized;
+    }
+
+    private static bool SameOwner(AccessContext left, AccessContext right) =>
+        string.Equals(left.TenantId, right.TenantId, StringComparison.Ordinal)
+        && string.Equals(left.SubjectId, right.SubjectId, StringComparison.Ordinal);
+
+    private static AgentRunWorkflowException WorkflowFailure(string code, string message,
+        AgentRunWorkflowErrorKind kind) => new(code, message, kind);
+
+    private sealed record PendingAgentRun(
+        AccessContext Access,
+        AgentSession Session,
+        ChatClientAgentRunOptions RunOptions,
+        ToolRunGuard Guard,
+        List<TraceStep> Trace,
+        ToolApprovalRequestContent FrameworkRequest,
+        AgentApprovalCheckpoint Checkpoint)
+    {
+        public SemaphoreSlim Gate { get; } = new(1, 1);
     }
 }

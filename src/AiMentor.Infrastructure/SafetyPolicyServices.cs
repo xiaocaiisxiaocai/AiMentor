@@ -10,7 +10,7 @@ namespace AiMentor.Infrastructure;
 /// <summary>集中管理写入审计轨迹的安全策略版本。</summary>
 public static class SafetyPolicyVersions
 {
-    public const string Current = "2026-07-13.3";
+    public const string Current = "2026-07-13.4";
 }
 
 /// <summary>隔离检索结果中嵌入的凭证和提示词注入，防止不可信文档成为指令。</summary>

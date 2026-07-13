@@ -12,6 +12,8 @@ public interface IToolApprovalService
         CancellationToken cancellationToken = default);
     Task<IReadOnlyList<ToolApprovalRequest>> ListAsync(AccessContext access, ToolApprovalStatus? status = null,
         CancellationToken cancellationToken = default);
+    Task<ToolApprovalRequest> GetAsync(string approvalId, AccessContext access,
+        CancellationToken cancellationToken = default);
     Task<ToolApprovalConsumption> ConsumeAsync(string approvalId, string toolName, JsonElement arguments,
         AccessContext requester, CancellationToken cancellationToken = default);
 }

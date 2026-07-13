@@ -95,6 +95,99 @@ public sealed class AgentFrameworkToolRunnerTests
         Assert.Equal(0, executor.ExecutionCount);
     }
 
+    [Fact]
+    public async Task MutationToolShouldPauseUntilIndependentApprovalThenResumeOnce()
+    {
+        var fixture = CreateApprovalRunner();
+        var initial = await fixture.Runner.RunAsync(
+            "请删除记忆 memoryId=memory-1 expectedVersion=1", Access, "agent-approval-success");
+
+        Assert.Equal(AgentRunStatus.AwaitingApproval, initial.Status);
+        Assert.NotNull(initial.Approval);
+        Assert.Equal("memory.delete", initial.Approval.ToolName);
+        Assert.Equal(0, fixture.Tool.ExecutionCount);
+
+        var stillPending = await fixture.Runner.ResumeAsync(initial.RunId, Access);
+        Assert.Equal(AgentRunStatus.AwaitingApproval, stillPending.Status);
+        await fixture.Approvals.DecideAsync(initial.Approval.ApprovalId, true, "已核对删除范围", fixture.Approver);
+        var completed = await fixture.Runner.ResumeAsync(initial.RunId, Access);
+
+        Assert.Equal(AgentRunStatus.Completed, completed.Status);
+        Assert.Equal(1, fixture.Tool.ExecutionCount);
+        Assert.Equal(ToolExecutionStatus.Completed, Assert.Single(completed.ToolSteps).Status);
+        var replay = await Assert.ThrowsAsync<AgentRunWorkflowException>(() =>
+            fixture.Runner.ResumeAsync(initial.RunId, Access));
+        Assert.Equal("AGENT_RUN_NOT_FOUND", replay.Code);
+    }
+
+    [Fact]
+    public async Task RejectedOrExpiredApprovalShouldResumeAsRefusalWithoutExecutingTool()
+    {
+        var rejectedFixture = CreateApprovalRunner();
+        var rejectedRun = await rejectedFixture.Runner.RunAsync(
+            "请删除记忆 memoryId=memory-2 expectedVersion=1", Access, "agent-approval-rejected");
+        await rejectedFixture.Approvals.DecideAsync(rejectedRun.Approval!.ApprovalId, false, "删除依据不足",
+            rejectedFixture.Approver);
+        var rejected = await rejectedFixture.Runner.ResumeAsync(rejectedRun.RunId, Access);
+
+        var expiredFixture = CreateApprovalRunner(TimeSpan.FromMinutes(1));
+        var expiredRun = await expiredFixture.Runner.RunAsync(
+            "请删除记忆 memoryId=memory-3 expectedVersion=1", Access, "agent-approval-expired");
+        expiredFixture.Clock.Advance(TimeSpan.FromMinutes(2));
+        var expired = await expiredFixture.Runner.ResumeAsync(expiredRun.RunId, Access);
+
+        Assert.Equal(AgentRunStatus.Refused, rejected.Status);
+        Assert.Equal("AGENT_TOOL_APPROVAL_REJECTED", rejected.Safety.Code);
+        Assert.Equal(0, rejectedFixture.Tool.ExecutionCount);
+        Assert.Equal(AgentRunStatus.Refused, expired.Status);
+        Assert.Equal("AGENT_TOOL_APPROVAL_EXPIRED", expired.Safety.Code);
+        Assert.Equal(0, expiredFixture.Tool.ExecutionCount);
+    }
+
+    [Fact]
+    public async Task OnlyOriginalRequesterShouldResumeAndConcurrentResumeShouldExecuteOnce()
+    {
+        var fixture = CreateApprovalRunner();
+        var initial = await fixture.Runner.RunAsync(
+            "请删除记忆 memoryId=memory-4 expectedVersion=1", Access, "agent-approval-concurrent");
+        var otherUser = AccessContext.Create("tenant-a", "user-b", ["readers"]);
+        var forbidden = await Assert.ThrowsAsync<AgentRunWorkflowException>(() =>
+            fixture.Runner.ResumeAsync(initial.RunId, otherUser));
+        await fixture.Approvals.DecideAsync(initial.Approval!.ApprovalId, true, "批准", fixture.Approver);
+
+        var attempts = await Task.WhenAll(Enumerable.Range(0, 2).Select(async _ =>
+        {
+            try
+            {
+                return (Result: await fixture.Runner.ResumeAsync(initial.RunId, Access), Error: (string?)null);
+            }
+            catch (AgentRunWorkflowException exception)
+            {
+                return (Result: (AgentRunResult?)null, Error: exception.Code);
+            }
+        }));
+
+        Assert.Equal("AGENT_RUN_RESUME_FORBIDDEN", forbidden.Code);
+        Assert.Single(attempts, attempt => attempt.Result?.Status == AgentRunStatus.Completed);
+        Assert.Single(attempts, attempt => attempt.Error is "AGENT_RUN_ALREADY_RESUMED" or "AGENT_RUN_NOT_FOUND");
+        Assert.Equal(1, fixture.Tool.ExecutionCount);
+    }
+
+    [Fact]
+    public async Task PendingApprovalCapacityShouldFailClosedBeforeCreatingAnotherPause()
+    {
+        var fixture = CreateApprovalRunner(maximumPendingRuns: 1);
+        var first = await fixture.Runner.RunAsync(
+            "请删除记忆 memoryId=memory-5 expectedVersion=1", Access, "agent-capacity-1");
+
+        var exception = await Assert.ThrowsAsync<AgentRunWorkflowException>(() => fixture.Runner.RunAsync(
+            "请删除记忆 memoryId=memory-6 expectedVersion=1", Access, "agent-capacity-2"));
+
+        Assert.Equal(AgentRunStatus.AwaitingApproval, first.Status);
+        Assert.Equal("AGENT_PENDING_CAPACITY_EXCEEDED", exception.Code);
+        Assert.Equal(0, fixture.Tool.ExecutionCount);
+    }
+
     private static AgentFrameworkToolRunner CreateRunner(IChatClient chatClient, RecordingExecutor executor,
         AgentExecutionOptions? options = null)
     {
@@ -107,6 +200,35 @@ public sealed class AgentFrameworkToolRunnerTests
                 MaximumCumulativeToolResultBytes = 4_096,
                 MaximumRunTime = TimeSpan.FromSeconds(2)
             }, TimeProvider.System);
+    }
+
+    private static ApprovalRunnerFixture CreateApprovalRunner(TimeSpan? approvalLifetime = null,
+        int maximumPendingRuns = 1_000)
+    {
+        var tool = new MutationTool();
+        var registry = new ServerToolRegistry([tool]);
+        var safety = new RuleBasedToolInvocationSafetyService(new ToolSafetyOptions
+        {
+            AllowedTools = new HashSet<string>([tool.Descriptor.Name], StringComparer.OrdinalIgnoreCase)
+        });
+        var trace = new InMemoryTraceSink();
+        var clock = new ManualTimeProvider(new DateTimeOffset(2026, 7, 13, 10, 0, 0, TimeSpan.Zero));
+        var approvals = new InMemoryToolApprovalService(registry, safety, trace, new ToolApprovalOptions
+        {
+            ApprovalLifetime = approvalLifetime ?? TimeSpan.FromMinutes(15)
+        }, clock);
+        var executor = new SafeToolExecutor(registry, safety, trace, new ToolExecutorOptions(), clock, approvals);
+        var runner = new AgentFrameworkToolRunner(new DeterministicGroundedChatClient(), registry, executor,
+            new RuleBasedInputSafetyService(), trace, new AgentExecutionOptions
+            {
+                MaximumModelIterations = 4,
+                MaximumToolCalls = 3,
+                MaximumCumulativeToolResultBytes = 4_096,
+                MaximumPendingApprovalRuns = maximumPendingRuns,
+                MaximumRunTime = TimeSpan.FromSeconds(2)
+            }, clock, approvals);
+        return new ApprovalRunnerFixture(runner, approvals, tool, clock,
+            AccessContext.Create("tenant-a", "approver", ["tool-approvers"]));
     }
 
     private sealed class RecordingExecutor(string? padding = null) : IToolExecutor
@@ -140,6 +262,37 @@ public sealed class AgentFrameworkToolRunnerTests
         public Task<JsonElement> ExecuteAsync(ToolExecutionContext context, JsonElement arguments,
             CancellationToken cancellationToken = default) =>
             throw new InvalidOperationException("Agent 不得绕过 IToolExecutor 直接调用工具实现。");
+    }
+
+    private sealed class MutationTool : IServerTool
+    {
+        private int _executionCount;
+        public int ExecutionCount => _executionCount;
+        public ToolDescriptor Descriptor { get; } = new("memory.delete", "删除测试记忆。", ToolOperationRisk.Mutation,
+            TimeSpan.FromSeconds(1), 2_048, true);
+        public SafetyDecision ValidateArguments(JsonElement arguments) =>
+            arguments.TryGetProperty("memoryId", out _) && arguments.TryGetProperty("expectedVersion", out _)
+                ? SafetyDecision.Allowed
+                : new SafetyDecision(SafetyAction.Refuse, "ARGUMENTS_INVALID", "参数无效。");
+        public Task<JsonElement> ExecuteAsync(ToolExecutionContext context, JsonElement arguments,
+            CancellationToken cancellationToken = default)
+        {
+            _ = context;
+            _ = arguments;
+            cancellationToken.ThrowIfCancellationRequested();
+            Interlocked.Increment(ref _executionCount);
+            return Task.FromResult(JsonSerializer.SerializeToElement(new { deleted = true }));
+        }
+    }
+
+    private sealed record ApprovalRunnerFixture(AgentFrameworkToolRunner Runner,
+        InMemoryToolApprovalService Approvals, MutationTool Tool, ManualTimeProvider Clock, AccessContext Approver);
+
+    private sealed class ManualTimeProvider(DateTimeOffset utcNow) : TimeProvider
+    {
+        private DateTimeOffset _utcNow = utcNow;
+        public override DateTimeOffset GetUtcNow() => _utcNow;
+        public void Advance(TimeSpan duration) => _utcNow = _utcNow.Add(duration);
     }
 
     private sealed class ScriptedToolChatClient(string functionName, bool repeat) : IChatClient

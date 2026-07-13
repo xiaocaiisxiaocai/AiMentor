@@ -26,8 +26,8 @@ public sealed record ToolExecutionResult(
     bool IdempotentReplay,
     IReadOnlyList<TraceStep> Trace);
 
-/// <summary>区分正常完成、安全拒绝、预算终止和系统失败。</summary>
-public enum AgentRunStatus { Completed, Refused, LimitExceeded, Failed }
+/// <summary>区分正常完成、等待人工审批、安全拒绝、预算终止和系统失败。</summary>
+public enum AgentRunStatus { Completed, AwaitingApproval, Refused, LimitExceeded, Failed }
 
 /// <summary>记录一次真实工具执行的序号、结果大小和独立运行标识。</summary>
 public sealed record AgentToolStep(
@@ -38,6 +38,15 @@ public sealed record AgentToolStep(
     string ToolRunId,
     int ResultBytes);
 
+/// <summary>向调用方公开不含参数值的 Agent 工具审批暂停点。</summary>
+public sealed record AgentApprovalCheckpoint(
+    string ApprovalId,
+    string ToolName,
+    ToolOperationRisk Risk,
+    IReadOnlyList<string> ArgumentNames,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset ExpiresAt);
+
 /// <summary>返回受限 Agent 的最终回答、安全结论和完整可审计步骤。</summary>
 public sealed record AgentRunResult(
     string RunId,
@@ -45,4 +54,5 @@ public sealed record AgentRunResult(
     string Answer,
     SafetyDecision Safety,
     IReadOnlyList<AgentToolStep> ToolSteps,
-    IReadOnlyList<TraceStep> Trace);
+    IReadOnlyList<TraceStep> Trace,
+    AgentApprovalCheckpoint? Approval = null);
