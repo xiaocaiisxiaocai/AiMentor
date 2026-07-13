@@ -7,6 +7,8 @@ namespace AiMentor.Infrastructure;
 
 public sealed partial class RuleBasedInputSafetyService : IInputSafetyService
 {
+    public string PolicyVersion => SafetyPolicyVersions.Current;
+
     public SafetyDecision Review(string input)
     {
         if (string.IsNullOrWhiteSpace(input)) return new(SafetyAction.Refuse, "EMPTY_INPUT", "问题不能为空。");

@@ -4,10 +4,13 @@ namespace AiMentor.Application;
 
 public sealed class TrustedQuestionService(
     IKnowledgeRepository knowledge,
+    IQueryNormalizer queryNormalizer,
     IInputSafetyService safety,
+    IRetrievedContentSafetyService retrievedContentSafety,
     IEvidenceReranker reranker,
     IEvidenceSufficiencyEvaluator sufficiencyEvaluator,
     IAnswerComposer composer,
+    IOutputSafetyService outputSafety,
     ITraceSink traceSink,
     TrustedQuestionOptions options) : ITrustedQuestionService
 {
@@ -18,7 +21,11 @@ public sealed class TrustedQuestionService(
         Trace("run.started", "ok", new Dictionary<string, object?> { ["tenant"] = question.Access.TenantId, ["subject"] = question.Access.SubjectId });
 
         var safetyDecision = safety.Review(question.Question);
-        Trace("input.safety", safetyDecision.Action.ToString(), new Dictionary<string, object?> { ["code"] = safetyDecision.Code });
+        Trace("input.safety", safetyDecision.Action.ToString(), new Dictionary<string, object?>
+        {
+            ["code"] = safetyDecision.Code,
+            ["policyVersion"] = safety.PolicyVersion
+        });
         if (safetyDecision.Action != SafetyAction.Allow)
         {
             return await CompleteAsync(AnswerDecision.Refused, safetyDecision.Message, false, safetyDecision, [], trace);
@@ -31,14 +38,26 @@ public sealed class TrustedQuestionService(
             return await CompleteAsync(AnswerDecision.Refused, invalid.Message, false, invalid, [], trace);
         }
 
-        var candidates = await knowledge.SearchAsync(question.Question, question.Access, options.SearchLimit, cancellationToken);
-        Trace("knowledge.search", candidates.Count > 0 ? "found" : "empty", new Dictionary<string, object?>
+        var normalizedQuery = queryNormalizer.Normalize(question.Question);
+        Trace("query.normalized", string.Equals(normalizedQuery, question.Question, StringComparison.Ordinal) ? "unchanged" : "normalized",
+            new Dictionary<string, object?> { ["characterCount"] = normalizedQuery.Length });
+        var retrievedCandidates = await knowledge.SearchAsync(normalizedQuery, question.Access, options.SearchLimit, cancellationToken);
+        Trace("knowledge.search", retrievedCandidates.Count > 0 ? "found" : "empty", new Dictionary<string, object?>
         {
-            ["accessibleEvidenceCount"] = candidates.Count,
-            ["topScore"] = candidates.Count > 0 ? candidates[0].Score : 0
+            ["accessibleEvidenceCount"] = retrievedCandidates.Count,
+            ["topScore"] = retrievedCandidates.Count > 0 ? retrievedCandidates[0].Score : 0
         });
 
-        var evidence = await reranker.RerankAsync(question.Question, candidates, cancellationToken);
+        var contentReview = retrievedContentSafety.Review(retrievedCandidates);
+        Trace("retrieval.safety", contentReview.Rejections.Count == 0 ? "passed" : "filtered", new Dictionary<string, object?>
+        {
+            ["acceptedCount"] = contentReview.AcceptedEvidence.Count,
+            ["rejectedCount"] = contentReview.Rejections.Count,
+            ["rejectionCodes"] = string.Join(',', contentReview.Rejections.Select(item => item.Code).Distinct(StringComparer.Ordinal)),
+            ["policyVersion"] = retrievedContentSafety.PolicyVersion
+        });
+
+        var evidence = await reranker.RerankAsync(question.Question, contentReview.AcceptedEvidence, cancellationToken);
         Trace("evidence.rerank", evidence.Count > 0 ? "ranked" : "empty", new Dictionary<string, object?>
         {
             ["candidateCount"] = evidence.Count,
@@ -74,6 +93,15 @@ public sealed class TrustedQuestionService(
                 .Select(ToCitation)
                 .ToArray();
             Trace("answer.composed", "ok", new Dictionary<string, object?> { ["citationCount"] = citations.Length });
+            var outputDecision = outputSafety.Review(answer, evidence, citations);
+            Trace("output.safety", outputDecision.Action.ToString(), new Dictionary<string, object?>
+            {
+                ["code"] = outputDecision.Code,
+                ["policyVersion"] = outputSafety.PolicyVersion
+            });
+            if (outputDecision.Action != SafetyAction.Allow)
+                return await CompleteAsync(AnswerDecision.Refused, outputDecision.Message, false, outputDecision, [], trace);
+
             return await CompleteAsync(AnswerDecision.Answered, answer, true, safetyDecision, citations, trace);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
@@ -86,7 +114,7 @@ public sealed class TrustedQuestionService(
         {
             var normalized = string.Join(' ', item.Chunk.Content.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
             return new Citation(item.Chunk.DocumentId, item.Chunk.Version, item.Chunk.Title, item.Chunk.Section,
-                normalized[..Math.Min(normalized.Length, 220)], Math.Round(item.Score, 4));
+                normalized[..Math.Min(normalized.Length, 220)], Math.Round(item.RetrievalScore ?? item.Score, 4));
         }
 
         void Trace(string name, string outcome, IReadOnlyDictionary<string, object?> details) =>

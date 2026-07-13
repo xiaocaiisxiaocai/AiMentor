@@ -16,9 +16,11 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
     public async Task InitializeAsync()
     {
         await _repository.InitializeAsync();
-        _service = new TrustedQuestionService(_repository, new RuleBasedInputSafetyService(),
+        _service = new TrustedQuestionService(_repository, new RuleBasedQueryNormalizer(), new RuleBasedInputSafetyService(),
+            new RuleBasedRetrievedContentSafetyService(),
             new LexicalEvidenceReranker(), new RuleBasedEvidenceSufficiencyEvaluator(),
-            new AgentFrameworkAnswerComposer(_chatClient), new InMemoryTraceSink(), new TrustedQuestionOptions());
+            new AgentFrameworkAnswerComposer(_chatClient), new RuleBasedOutputSafetyService(),
+            new InMemoryTraceSink(), new TrustedQuestionOptions());
     }
 
     public Task DisposeAsync() => Task.CompletedTask;

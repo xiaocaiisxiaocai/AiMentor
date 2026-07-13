@@ -72,10 +72,20 @@ public sealed class DeterministicGroundedChatClient : IChatClient
 
         var keywords = Tokenize(question);
         var ranked = sources.Cast<Match>()
-            .SelectMany(source => SplitSentences(source.Groups["content"].Value)
-                .Select(sentence => new { Sentence = sentence, Score = Tokenize(sentence).Count(keywords.Contains) }))
-            .Where(item => item.Sentence.Length > 0)
+            .SelectMany((source, sourceIndex) =>
+            {
+                var contextScore = Tokenize(source.Groups["section"].Value).Count(keywords.Contains);
+                return SplitSentences(source.Groups["content"].Value)
+                    .Select(sentence => new
+                    {
+                        Sentence = sentence,
+                        Score = Tokenize(sentence).Count(keywords.Contains) + contextScore,
+                        SourceIndex = sourceIndex
+                    });
+            })
+            .Where(item => item.Sentence.Length > 0 && !Regex.IsMatch(item.Sentence, @"^#{1,6}\s"))
             .OrderByDescending(item => item.Score)
+            .ThenBy(item => item.SourceIndex)
             .ThenBy(item => item.Sentence.Length)
             .ToArray();
         var minimumScore = ranked.Length == 0 ? int.MaxValue : Math.Max(2, (int)Math.Ceiling(ranked[0].Score * 0.6));

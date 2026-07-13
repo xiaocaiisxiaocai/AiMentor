@@ -145,6 +145,11 @@ else
     builder.Services.AddSingleton<IKnowledgeRepository>(services => services.GetRequiredService<MarkdownKnowledgeRepository>());
 }
 builder.Services.AddSingleton<IInputSafetyService, RuleBasedInputSafetyService>();
+builder.Services.AddSingleton<IQueryNormalizer, RuleBasedQueryNormalizer>();
+builder.Services.AddSingleton<IRetrievedContentSafetyService, RuleBasedRetrievedContentSafetyService>();
+builder.Services.AddSingleton(new ToolSafetyOptions());
+builder.Services.AddSingleton<IToolInvocationSafetyService, RuleBasedToolInvocationSafetyService>();
+builder.Services.AddSingleton<IOutputSafetyService, RuleBasedOutputSafetyService>();
 builder.Services.AddSingleton<IEvidenceReranker, LexicalEvidenceReranker>();
 builder.Services.AddSingleton<IEvidenceSufficiencyEvaluator, RuleBasedEvidenceSufficiencyEvaluator>();
 builder.Services.AddSingleton<ITraceSink, InMemoryTraceSink>();

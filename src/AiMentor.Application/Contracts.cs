@@ -9,6 +9,11 @@ public interface IKnowledgeRepository
     KnowledgeStatistics Statistics { get; }
 }
 
+public interface IQueryNormalizer
+{
+    string Normalize(string question);
+}
+
 public interface IKnowledgeChunkSource
 {
     Task<IReadOnlyList<KnowledgeChunk>> ReadAllChunksAsync(CancellationToken cancellationToken = default);
@@ -24,7 +29,39 @@ public sealed record KnowledgeStatistics(int Documents, int Chunks);
 
 public interface IInputSafetyService
 {
+    string PolicyVersion { get; }
     SafetyDecision Review(string input);
+}
+
+public interface IRetrievedContentSafetyService
+{
+    string PolicyVersion { get; }
+    RetrievedContentReview Review(IReadOnlyList<Evidence> evidence);
+}
+
+public sealed record RetrievedContentRejection(string ChunkId, string Code);
+
+public sealed record RetrievedContentReview(
+    IReadOnlyList<Evidence> AcceptedEvidence,
+    IReadOnlyList<RetrievedContentRejection> Rejections);
+
+public interface IToolInvocationSafetyService
+{
+    string PolicyVersion { get; }
+    SafetyDecision Review(ToolInvocationRequest request, AccessContext access);
+}
+
+public enum ToolOperationRisk { ReadOnly, Mutation, Privileged }
+
+public sealed record ToolInvocationRequest(
+    string ToolName,
+    ToolOperationRisk Risk,
+    IReadOnlyDictionary<string, object?> Arguments);
+
+public interface IOutputSafetyService
+{
+    string PolicyVersion { get; }
+    SafetyDecision Review(string answer, IReadOnlyList<Evidence> evidence, IReadOnlyList<Citation> citations);
 }
 
 public interface IAnswerComposer

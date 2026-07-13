@@ -4,6 +4,22 @@ using AiMentor.Domain;
 
 namespace AiMentor.Infrastructure;
 
+public sealed partial class RuleBasedQueryNormalizer : IQueryNormalizer
+{
+    public string Normalize(string question)
+    {
+        var normalized = QuestionScaffolding().Replace(question.Trim(), " ");
+        normalized = Whitespace().Replace(normalized, " ").Trim(' ', '？', '?');
+        return string.IsNullOrWhiteSpace(normalized) ? question.Trim() : normalized;
+    }
+
+    [GeneratedRegex(@"请问|请告诉我|帮我查询|需要什么条件|必须有哪些|什么情况属于|有哪些|需要哪些|是什么|能否|是否|多久|多少|怎样|怎么|如何|什么", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex QuestionScaffolding();
+
+    [GeneratedRegex(@"\s+", RegexOptions.CultureInvariant)]
+    private static partial Regex Whitespace();
+}
+
 public sealed class LexicalEvidenceReranker : IEvidenceReranker
 {
     public Task<IReadOnlyList<Evidence>> RerankAsync(string question, IReadOnlyList<Evidence> evidence,
