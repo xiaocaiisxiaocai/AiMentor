@@ -8,7 +8,8 @@
 - Agent 编排：[Microsoft Agent Framework](https://github.com/microsoft/agent-framework) 的 `ChatClientAgent`，没有使用已经过时的 Semantic Kernel Planner。
 - 模型契约：`Microsoft.Extensions.AI.IChatClient`。当前默认实现为无需密钥的确定性沙箱模型，真实模型接入时只替换这一适配器。
 - RAG：支持本地 Markdown 词法沙箱和 OpenSearch 3.5 混合检索两种适配器。OpenSearch 路径使用 BM25 + 256 维向量 + 分数归一化加权融合，并在两个召回分支中都执行租户和 ACL 前置过滤；召回结果再按原始检索分、文档词项覆盖率和最佳句子覆盖率重排。
-- 安全审核：策略版本 `2026-07-13.1` 覆盖输入、检索内容和模型输出三条已运行路径；工具参数审核端口已实现默认拒绝、工具白名单、嵌套敏感字段、跨租户参数和修改性操作审批规则，但尚未接入真实工具执行器。
+- 安全审核：策略版本 `2026-07-13.2` 覆盖输入、检索内容、工具参数和模型输出。工具执行采用服务器注册表、默认拒绝、风险不可由客户端覆盖、嵌套敏感字段、跨租户参数、修改操作审批和公网 HTTPS 目标白名单。
+- 工具：已实现安全执行器和首个只读工具 `knowledge.stats`，包括 16 KB 参数上限、工具级超时、结果大小上限、幂等执行缓存和无原始敏感参数的运行轨迹。当前工具可通过 API 显式调用，尚未开放给模型自主选择。
 - 记忆：已实现会话记忆、用户偏好和长期事实的显式授权工作流，包括待批准提案、批准、查看、更正、删除、过期、乐观并发和租户/用户隔离。当前使用进程内存储，重启后清空，且已批准记忆尚未自动注入问答提示词。
 - 知识：默认加载 `AI-Agent-V1合成数据包\knowledge` 中 23 份已发布合成文档，共 74 个分块。
 - 测评：完整读取 150 条 JSONL 测评集并输出分类指标和失败样本。
@@ -30,7 +31,12 @@ flowchart LR
     M --> O["输出安全与引用来源/摘录/落地性审核"]
     O -->|拒绝| R
     O -->|通过| C["回答 + 结构化引用"]
-    X["未来工具执行器：尚未接入"] -.调用前必须经过.-> P["工具参数策略：白名单 / 租户 / 敏感字段 / 审批"]
+    U --> X["服务器工具请求：名称 + 参数"]
+    X --> P["工具策略：注册表风险 / 租户 / 敏感字段 / 网络目标 / 审批"]
+    P -->|拒绝或需审批| R
+    P -->|通过| TE["安全执行器：超时 / 幂等 / 结果限额"]
+    TE --> KT["knowledge.stats：只读知识统计"]
+    TE --> T
     U --> MP["记忆提案：尚未写入正式记忆"]
     MP --> MA{"用户显式批准？"}
     MA -->|否或超时| MX["不生效"]
@@ -115,6 +121,8 @@ dotnet run --project .\src\AiMentor.Api\AiMentor.Api.csproj --urls http://127.0.
 - `GET /api/v1/memories`：查看当前用户尚未过期的已批准记忆，可按 `scope` 和 `sessionId` 过滤。
 - `PUT /api/v1/memories/{memoryId}`：携带 `expectedVersion` 更正内容或缩短保留期；延长保留期必须重新提案。
 - `DELETE /api/v1/memories/{memoryId}?expectedVersion=2`：按乐观版本号删除记忆。
+- `GET /api/v1/tools`：列出服务器注册工具及其只读风险描述、超时和结果上限。
+- `POST /api/v1/tools/{toolName}/execute`：通过统一安全执行器调用工具；可使用 `Idempotency-Key` 请求头。
 - 原 V0 接口默认关闭；只有非 Production 环境显式设置 `Api:EnableLegacyV0=true` 才会挂载兼容入口。
 
 请求体使用 DataAnnotations 自动校验，错误统一返回 RFC 7807 Problem Details。问答和记忆端点默认按调用方地址或已认证用户的 `sub` 声明限制为每分钟 60 次，可通过 `Api:QuestionRateLimitPerMinute` 调整。客户端可传 `X-Correlation-ID`，合法值会成为 Run ID，便于跨系统排障。
@@ -134,6 +142,16 @@ Invoke-RestMethod http://127.0.0.1:5080/api/v1/memories
 ```
 
 会话记忆必须提供 `sessionId`，默认保留 8 小时且最长 24 小时；用户偏好默认 180 天，长期事实默认 90 天，两者最长 365 天。相同用户、范围、会话和键只能存在一条有效记忆，避免冲突偏好。身份证号、银行卡号、可用凭证和提示词注入内容不能写入记忆。所有状态操作写入不含记忆正文的审计轨迹。
+
+### 工具执行示例
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:5080/api/v1/tools
+Invoke-RestMethod http://127.0.0.1:5080/api/v1/tools/knowledge.stats/execute `
+  -Method Post -ContentType 'application/json' -Body '{}'
+```
+
+工具调用方不能提交风险等级；执行器只信任服务器端 `ToolDescriptor`。修改性和特权工具在没有独立批准凭据时只会返回 `RequiresApproval`，不会执行。参数中的凭证字段、其他租户 ID、私网地址、非 HTTPS 地址和未列入该工具白名单的网络主机会在工具代码运行前被拒绝。失败、超时和超大结果均不返回部分输出。
 
 ### API 成熟度与安全边界
 
@@ -173,7 +191,7 @@ $env:Authentication__GroupsClaim = 'groups'
 
 ## 下一阶段
 
-1. 实现真实工具注册表与执行器，把现有工具参数策略放在每次执行前的强制路径，并增加超时、幂等键、结果大小和网络目标限制。
+1. 将工具注册表以受限函数形式接入 Agent Framework，增加模型工具选择、参数生成、执行结果再审核和最大步骤数约束，不允许模型绕过 `IToolExecutor` 直接调用实现。
 2. 将记忆存储替换为支持行级租户隔离和加密的持久化适配器，并设计“只读、最小相关、可追踪”的记忆检索注入策略。
 3. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率、恶意文档隔离率和引用正确率门禁。
 4. 接入真实身份提供方做有效 Token 端到端验收，并覆盖密钥轮换、过期 Token、错误 audience 和组变更场景。

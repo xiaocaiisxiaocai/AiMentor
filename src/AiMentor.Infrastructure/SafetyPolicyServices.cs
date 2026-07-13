@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using AiMentor.Application;
@@ -8,7 +9,7 @@ namespace AiMentor.Infrastructure;
 
 public static class SafetyPolicyVersions
 {
-    public const string Current = "2026-07-13.1";
+    public const string Current = "2026-07-13.2";
 }
 
 public sealed partial class RuleBasedRetrievedContentSafetyService : IRetrievedContentSafetyService
@@ -43,6 +44,8 @@ public sealed partial class RuleBasedRetrievedContentSafetyService : IRetrievedC
 public sealed class ToolSafetyOptions
 {
     public IReadOnlySet<string> AllowedTools { get; init; } = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    public IReadOnlyDictionary<string, IReadOnlySet<string>> AllowedNetworkHosts { get; init; } =
+        new Dictionary<string, IReadOnlySet<string>>(StringComparer.OrdinalIgnoreCase);
 }
 
 public sealed partial class RuleBasedToolInvocationSafetyService(ToolSafetyOptions options) : IToolInvocationSafetyService
@@ -74,6 +77,12 @@ public sealed partial class RuleBasedToolInvocationSafetyService(ToolSafetyOptio
         if (tenantArguments.Any(property =>
             !string.Equals(PropertyValue(property.Value), access.TenantId, StringComparison.OrdinalIgnoreCase)))
             return Refuse("CROSS_TENANT_TOOL_ARGUMENT", "工具参数中的租户与当前授权上下文不一致。");
+
+        foreach (var property in properties.Where(property => NetworkTargetName().IsMatch(property.Name)))
+        {
+            var targetDecision = ReviewNetworkTarget(request.ToolName, PropertyValue(property.Value));
+            if (targetDecision.Action != SafetyAction.Allow) return targetDecision;
+        }
 
         if (request.Risk != ToolOperationRisk.ReadOnly)
             return new SafetyDecision(SafetyAction.RequireApproval, "TOOL_OPERATION_REQUIRES_APPROVAL", "修改性或特权工具操作必须获得显式批准。");
@@ -107,8 +116,37 @@ public sealed partial class RuleBasedToolInvocationSafetyService(ToolSafetyOptio
         _ => Convert.ToString(value.GetRawText(), CultureInfo.InvariantCulture)
     };
 
+    private SafetyDecision ReviewNetworkTarget(string toolName, string? value)
+    {
+        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps
+            || !string.IsNullOrEmpty(uri.UserInfo) || IsPrivateHost(uri.Host))
+            return Refuse("TOOL_NETWORK_TARGET_INVALID", "网络目标必须是无内嵌凭证的公网 HTTPS 地址。");
+        if (!options.AllowedNetworkHosts.TryGetValue(toolName, out var allowedHosts)
+            || !allowedHosts.Contains(uri.IdnHost))
+            return Refuse("TOOL_NETWORK_TARGET_NOT_ALLOWED", "网络目标不在该工具的服务器端允许清单中。");
+        return new SafetyDecision(SafetyAction.Allow, "TOOL_NETWORK_TARGET_SAFE", "网络目标通过策略审核。");
+    }
+
+    private static bool IsPrivateHost(string host)
+    {
+        if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase)) return true;
+        if (!IPAddress.TryParse(host, out var address)) return false;
+        if (IPAddress.IsLoopback(address) || address.IsIPv6LinkLocal || address.IsIPv6SiteLocal || address.IsIPv6Multicast)
+            return true;
+        if (address.AddressFamily != System.Net.Sockets.AddressFamily.InterNetwork) return false;
+        var bytes = address.GetAddressBytes();
+        return bytes[0] is 0 or 10 or 127
+            || bytes[0] == 169 && bytes[1] == 254
+            || bytes[0] == 172 && bytes[1] is >= 16 and <= 31
+            || bytes[0] == 192 && bytes[1] == 168
+            || bytes[0] >= 224;
+    }
+
     [GeneratedRegex(@"password|passwd|token|secret|api[_-]?key|private[_-]?key|authorization", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
     private static partial Regex SensitiveArgumentName();
+
+    [GeneratedRegex(@"(?:url|uri|endpoint|callback|webhook)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex NetworkTargetName();
 }
 
 public sealed partial class RuleBasedOutputSafetyService : IOutputSafetyService

@@ -51,8 +51,6 @@ public interface IToolInvocationSafetyService
     SafetyDecision Review(ToolInvocationRequest request, AccessContext access);
 }
 
-public enum ToolOperationRisk { ReadOnly, Mutation, Privileged }
-
 public sealed record ToolInvocationRequest(
     string ToolName,
     ToolOperationRisk Risk,

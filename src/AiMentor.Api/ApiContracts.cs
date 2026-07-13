@@ -1,4 +1,5 @@
 using System.ComponentModel.DataAnnotations;
+using System.Text.Json;
 using AiMentor.Domain;
 
 namespace AiMentor.Api;
@@ -23,3 +24,5 @@ public sealed record CorrectMemoryRequest(
     [property: Required, StringLength(1_000, MinimumLength = 1)] string Value,
     [property: Range(1, int.MaxValue)] int ExpectedVersion,
     DateTimeOffset? ExpiresAt = null);
+
+public sealed record ExecuteToolRequest(Dictionary<string, JsonElement>? Arguments = null);

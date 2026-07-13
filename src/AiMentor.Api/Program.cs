@@ -147,8 +147,15 @@ else
 builder.Services.AddSingleton<IInputSafetyService, RuleBasedInputSafetyService>();
 builder.Services.AddSingleton<IQueryNormalizer, RuleBasedQueryNormalizer>();
 builder.Services.AddSingleton<IRetrievedContentSafetyService, RuleBasedRetrievedContentSafetyService>();
-builder.Services.AddSingleton(new ToolSafetyOptions());
+builder.Services.AddSingleton(new ToolSafetyOptions
+{
+    AllowedTools = new HashSet<string>(["knowledge.stats"], StringComparer.OrdinalIgnoreCase)
+});
 builder.Services.AddSingleton<IToolInvocationSafetyService, RuleBasedToolInvocationSafetyService>();
+builder.Services.AddSingleton<IServerTool, KnowledgeStatisticsTool>();
+builder.Services.AddSingleton<IToolRegistry, ServerToolRegistry>();
+builder.Services.AddSingleton(new ToolExecutorOptions());
+builder.Services.AddSingleton<IToolExecutor, SafeToolExecutor>();
 builder.Services.AddSingleton<IOutputSafetyService, RuleBasedOutputSafetyService>();
 builder.Services.AddSingleton<IEvidenceReranker, LexicalEvidenceReranker>();
 builder.Services.AddSingleton<IEvidenceSufficiencyEvaluator, RuleBasedEvidenceSufficiencyEvaluator>();
@@ -236,6 +243,24 @@ memories.MapDelete("/{memoryId}", DeleteMemoryAsync)
     .Produces(StatusCodes.Status204NoContent)
     .ProducesProblem(StatusCodes.Status404NotFound)
     .ProducesProblem(StatusCodes.Status409Conflict)
+    .RequireRateLimiting("questions");
+
+var tools = v1.MapGroup("/tools").WithTags("AiMentor tools v1");
+tools.MapGet("/", (IToolRegistry registry) => Results.Ok(registry.Descriptors))
+    .WithName("ListToolsV1")
+    .WithSummary("列出服务器注册的工具及其服务端风险配置")
+    .Produces<IReadOnlyList<ToolDescriptor>>()
+    .RequireRateLimiting("questions");
+tools.MapPost("/{toolName}/execute", ExecuteToolAsync)
+    .WithName("ExecuteToolV1")
+    .WithSummary("通过强制安全执行器调用服务器注册工具")
+    .Produces<ToolExecutionResult>()
+    .ProducesProblem(StatusCodes.Status401Unauthorized)
+    .ProducesProblem(StatusCodes.Status403Forbidden)
+    .ProducesProblem(StatusCodes.Status404NotFound)
+    .ProducesProblem(StatusCodes.Status409Conflict)
+    .ProducesProblem(StatusCodes.Status413PayloadTooLarge)
+    .ProducesProblem(StatusCodes.Status504GatewayTimeout)
     .RequireRateLimiting("questions");
 
 // V0 仅用于短期迁移，默认关闭，Production 环境禁止启用。
@@ -369,6 +394,27 @@ static IResult MemoryProblem(MemoryWorkflowException exception, HttpContext cont
     };
     return Results.Problem(statusCode: statusCode, title: "记忆工作流请求失败", detail: exception.Message,
         instance: context.Request.Path, extensions: new Dictionary<string, object?> { ["code"] = exception.Code });
+}
+
+static async Task<IResult> ExecuteToolAsync(string toolName, ExecuteToolRequest request, IToolExecutor executor,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    var arguments = JsonSerializer.SerializeToElement(request.Arguments ?? new Dictionary<string, JsonElement>());
+    var result = await executor.ExecuteAsync(toolName, arguments, accessProvider.GetAccessContext(context.User),
+        context.Request.Headers["Idempotency-Key"].ToString(), cancellationToken);
+    context.Response.Headers["X-Run-ID"] = result.RunId;
+    var statusCode = result.Status switch
+    {
+        ToolExecutionStatus.Completed => StatusCodes.Status200OK,
+        ToolExecutionStatus.RequiresApproval => StatusCodes.Status409Conflict,
+        ToolExecutionStatus.TimedOut => StatusCodes.Status504GatewayTimeout,
+        ToolExecutionStatus.ResultTooLarge => StatusCodes.Status502BadGateway,
+        ToolExecutionStatus.Failed => StatusCodes.Status502BadGateway,
+        _ when result.Safety.Code == "TOOL_NOT_REGISTERED" => StatusCodes.Status404NotFound,
+        _ when result.Safety.Code == "TOOL_ARGUMENTS_TOO_LARGE" => StatusCodes.Status413PayloadTooLarge,
+        _ => StatusCodes.Status403Forbidden
+    };
+    return Results.Json(result, statusCode: statusCode);
 }
 
 static async Task WriteEventAsync(HttpResponse response, string eventName, object payload, JsonSerializerOptions options,
