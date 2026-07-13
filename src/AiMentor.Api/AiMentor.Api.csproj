@@ -6,5 +6,9 @@
     <ProjectReference Include="..\AiMentor.Application\AiMentor.Application.csproj" />
     <ProjectReference Include="..\AiMentor.Infrastructure\AiMentor.Infrastructure.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" />
+    <!-- 显式覆盖 OpenAPI 包的易受攻击传递版本，修复 CVE-2026-49451。 -->
+    <PackageReference Include="Microsoft.OpenApi" />
+  </ItemGroup>
 </Project>
-

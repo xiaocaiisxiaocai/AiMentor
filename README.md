@@ -58,7 +58,9 @@ $body = @{
   subjectId = 'user-001'
   groups = @('all-rnd')
 } | ConvertTo-Json
-Invoke-RestMethod http://127.0.0.1:5080/api/questions -Method Post -ContentType 'application/json' -Body $body
+Invoke-RestMethod http://127.0.0.1:5080/api/v1/questions -Method Post -ContentType 'application/json' -Headers @{
+  'X-Correlation-ID' = 'demo-request-001'
+} -Body $body
 ```
 
 执行全量离线测评：
@@ -86,10 +88,20 @@ dotnet run --project .\src\AiMentor.Api\AiMentor.Api.csproj --urls http://127.0.
 
 ## API
 
-- `GET /health`：服务和知识加载状态。
-- `GET /api/knowledge/stats`：文档与分块数量。
-- `POST /api/questions`：完整可信回答对象，含决策、答案、审核结果、引用与轨迹。
-- `POST /api/questions/stream`：SSE 事件流，当前发出 `run.started` 与 `answer.completed`。
+- `GET /openapi/v1.json`：机器可读的 OpenAPI 文档。
+- `GET /health`：服务、RAG 提供方和知识加载状态，不参与问答限流。
+- `GET /api/v1/knowledge/stats`：文档与分块数量。
+- `POST /api/v1/questions`：完整可信回答对象，含决策、答案、审核结果、引用与轨迹；响应头返回 `X-Run-ID`。
+- `POST /api/v1/questions/stream`：SSE 事件流，发出 `run.started` 与 `answer.completed`，禁用代理缓冲。
+- 原 `/api/questions`、`/api/questions/stream` 和 `/api/knowledge/stats` 暂时保留兼容，但不会出现在 OpenAPI 中。
+
+请求体使用 DataAnnotations 自动校验，错误统一返回 RFC 7807 Problem Details。问答端点默认按调用方地址或已认证用户的 `sub` 声明限制为每分钟 60 次，可通过 `Api:QuestionRateLimitPerMinute` 调整。客户端可传 `X-Correlation-ID`，合法值会成为 Run ID，便于跨系统排障。
+
+### API 成熟度与安全边界
+
+当前 v1 已可供本地前端、内部服务和自动化联调使用。它还不是公网生产 API：`TenantId`、`SubjectId`、`Groups` 暂由请求体提供，恶意调用方可以伪造这些字段。生产开放前必须完成 OIDC/JWT 验证，并仅从服务端验证后的 claims 构造 `AccessContext`；届时请求体将只保留问题和可选会话参数。
+
+依赖审计曾阻止引入存在 CVE-2026-49451 的 `Microsoft.OpenApi 2.0.0`，当前已显式固定到官方修复版本 2.7.5，并通过全解决方案传递依赖漏洞检查。
 
 ## 下一阶段
 
