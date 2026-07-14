@@ -21,6 +21,7 @@ var builder = WebApplication.CreateBuilder(args);
 var questionRateLimit = builder.Configuration.GetValue("Api:QuestionRateLimitPerMinute", 60);
 if (questionRateLimit <= 0) throw new InvalidOperationException("Api:QuestionRateLimitPerMinute 必须大于 0。");
 var enableLegacyV0 = builder.Configuration.GetValue("Api:EnableLegacyV0", false);
+var workflowProvider = builder.Configuration["Workflow:Provider"] ?? "InMemory";
 var authenticationOptions = new AiMentorAuthenticationOptions
 {
     Mode = builder.Configuration["Authentication:Mode"] ?? "Development",
@@ -34,8 +35,10 @@ var authenticationOptions = new AiMentorAuthenticationOptions
     DevelopmentGroups = builder.Configuration.GetSection("Authentication:Development:Groups").Get<string[]>() ?? ["all-rnd"]
 };
 var jwtAuthenticationEnabled = string.Equals(authenticationOptions.Mode, "OidcJwt", StringComparison.OrdinalIgnoreCase);
-if (builder.Environment.IsProduction() && (!jwtAuthenticationEnabled || enableLegacyV0))
-    throw new InvalidOperationException("Production 环境必须启用 Authentication:Mode=OidcJwt 且禁用 Api:EnableLegacyV0。");
+if (builder.Environment.IsProduction()
+    && (!jwtAuthenticationEnabled || enableLegacyV0
+        || !string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase)))
+    throw new InvalidOperationException("Production 环境必须启用 OIDC JWT、禁用 V0，并使用 Workflow:Provider=SqlServer。");
 if (jwtAuthenticationEnabled)
 {
     if (!Uri.TryCreate(authenticationOptions.Authority, UriKind.Absolute, out var authorityUri) || authorityUri.Scheme != Uri.UriSchemeHttps)
@@ -158,7 +161,10 @@ builder.Services.AddSingleton<IServerTool, KnowledgeStatisticsTool>();
 builder.Services.AddSingleton<IServerTool, MemoryDeleteTool>();
 builder.Services.AddSingleton<IToolRegistry, ServerToolRegistry>();
 builder.Services.AddSingleton(new ToolApprovalOptions());
-builder.Services.AddSingleton<IToolApprovalService, InMemoryToolApprovalService>();
+builder.Services.AddSingleton<IToolApprovalService>(services =>
+    string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase)
+        ? ActivatorUtilities.CreateInstance<SqlServerToolApprovalService>(services)
+        : ActivatorUtilities.CreateInstance<InMemoryToolApprovalService>(services));
 builder.Services.AddSingleton(new ToolExecutorOptions());
 builder.Services.AddSingleton<IToolExecutor, SafeToolExecutor>();
 builder.Services.AddSingleton(new AgentExecutionOptions());
@@ -180,6 +186,32 @@ var memoryKey = ResolveMemoryMasterKey(
     builder.Configuration["Memory:EncryptionKey"] ?? Environment.GetEnvironmentVariable("AIMENTOR_MEMORY_ENCRYPTION_KEY"),
     Path.Combine(memoryDataDirectory, "memory.key"), builder.Environment.IsProduction());
 builder.Services.AddSingleton<IMemoryCipher>(new AesGcmMemoryCipher(memoryKey));
+if (string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase))
+{
+    var connectionString = builder.Configuration.GetConnectionString("WorkflowSqlServer")
+        ?? Environment.GetEnvironmentVariable("AIMENTOR_SQLSERVER_CONNECTION_STRING");
+    if (string.IsNullOrWhiteSpace(connectionString))
+        throw new InvalidOperationException("Workflow:Provider=SqlServer 时必须配置 ConnectionStrings:WorkflowSqlServer。");
+    var sqlConnection = new Microsoft.Data.SqlClient.SqlConnectionStringBuilder(connectionString);
+    if (builder.Environment.IsProduction() && (!sqlConnection.Encrypt || sqlConnection.TrustServerCertificate))
+        throw new InvalidOperationException("Production SQL Server 连接必须启用 Encrypt 且禁用 TrustServerCertificate。");
+    builder.Services.AddSingleton(new SqlServerWorkflowOptions
+    {
+        ConnectionString = connectionString,
+        MaximumPendingRuns = builder.Configuration.GetValue("Workflow:MaximumPendingRuns", 10_000),
+        InitializeSchema = builder.Configuration.GetValue("Workflow:InitializeSchema", !builder.Environment.IsProduction())
+    });
+    builder.Services.AddSingleton<IAgentRunCheckpointStore, SqlServerAgentRunCheckpointStore>();
+}
+else if (string.Equals(workflowProvider, "InMemory", StringComparison.OrdinalIgnoreCase))
+{
+    builder.Services.AddSingleton<IAgentRunCheckpointStore>(services =>
+        new InMemoryAgentRunCheckpointStore(services.GetRequiredService<TimeProvider>(), 1_000));
+}
+else
+{
+    throw new InvalidOperationException("Workflow:Provider 仅支持 InMemory 或 SqlServer。");
+}
 builder.Services.AddSingleton(new EncryptedFileMemoryStoreOptions { FilePath = memoryStorePath });
 builder.Services.AddSingleton<IMemoryStore, EncryptedFileMemoryStore>();
 builder.Services.AddSingleton<IMemoryContentSafetyService, RuleBasedMemoryContentSafetyService>();
@@ -199,7 +231,7 @@ app.MapOpenApi();
 var repository = app.Services.GetRequiredService<IKnowledgeRepository>();
 await repository.InitializeAsync();
 
-app.MapGet("/health", () => Results.Ok(new { status = "healthy", ragProvider, authenticationMode = authenticationOptions.Mode, knowledge = repository.Statistics }))
+app.MapGet("/health", () => Results.Ok(new { status = "healthy", ragProvider, workflowProvider, authenticationMode = authenticationOptions.Mode, knowledge = repository.Statistics }))
     .WithName("Health").WithTags("System").DisableRateLimiting();
 
 var v1 = app.MapGroup("/api/v1").WithTags("AiMentor v1");

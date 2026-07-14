@@ -18,5 +18,24 @@ services:
       retries: 12
       start_period: 30s
 
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: aimentor-sqlserver
+    profiles: ["workflow"]
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: ${AIMENTOR_SQLSERVER_SA_PASSWORD:?请设置 AIMENTOR_SQLSERVER_SA_PASSWORD}
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserver-data:/var/opt/mssql
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q \"SELECT 1\" || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 30s
+
 volumes:
   opensearch-data:
+  sqlserver-data:

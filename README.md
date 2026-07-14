@@ -211,7 +211,24 @@ Invoke-RestMethod http://127.0.0.1:5080/api/v1/tools/memory.delete/execute `
   }) -Body (@{ arguments = $arguments; approvalId = $approval.id } | ConvertTo-Json)
 ```
 
-审批服务和暂停的 AgentSession 当前使用进程内存储：服务重启后所有未消费审批与暂停运行都会失效，这是安全的失败关闭行为，但不适合多副本生产部署。生产实现应把审批状态、Agent Session StateBag 和暂停点迁移到支持条件更新的 SQL 存储，以数据库事务保证“Approved → Consumed”和“Pending → Resuming”只有一个调用成功；不得为了高可用改成可重复使用的长期令牌。相同 `Idempotency-Key` 绑定不同参数会返回 `IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST`，不会错误回放旧结果。
+默认 `Workflow:Provider=InMemory` 适合本地开发；切换为 `SqlServer` 后，审批状态与 Agent Framework 序列化会话会共同持久化。审批裁决和“Approved → Consumed”使用可串行化事务，暂停运行通过短租约执行“Pending → Leased”，租约到期后才允许其他实例接管。参数值不会写入审批表，Agent 会话、参数和轨迹则整体加密后进入检查点表；加密认证上下文绑定 `runId`，复制或篡改密文会恢复失败。相同 `Idempotency-Key` 绑定不同参数会返回 `IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST`，不会错误回放旧结果。
+
+本地 SQL Server 启动与配置：
+
+```powershell
+$env:AIMENTOR_SQLSERVER_SA_PASSWORD = '<本地强密码>'
+docker compose --profile workflow up -d sqlserver
+
+$env:Workflow__Provider = 'SqlServer'
+$env:ConnectionStrings__WorkflowSqlServer = 'Server=127.0.0.1,1433;Database=master;User ID=sa;Password=<本地强密码>;Encrypt=True;TrustServerCertificate=True'
+# 生产环境必须从密钥系统提供固定主密钥；不得依赖本地自动生成的 data\memory.key。
+$env:AIMENTOR_MEMORY_ENCRYPTION_KEY = '<至少32字节的Base64密钥>'
+dotnet run --project src\AiMentor.Api
+```
+
+开发环境 SQL Server 模式会按需创建 `AiMentorToolApprovals` 和 `AiMentorAgentRuns`，并用数据库应用锁避免多个实例同时建表。Production 强制 `Workflow:Provider=SqlServer`、`Encrypt=True`、`TrustServerCertificate=False`，且默认关闭运行时建表；发布账号应先执行 [`deploy\sql\001_workflow.sql`](deploy/sql/001_workflow.sql)，应用账号只授予表级读写权限。
+
+数据库访问使用参数化 `SqlCommand`、异步连接和显式事务，接口依据 [Microsoft.Data.SqlClient 官方包说明](https://github.com/dotnet/SqlClient/blob/main/src/Microsoft.Data.SqlClient/src/PackageReadme.md) 核对；审批与租约的一次性语义属于本项目额外实现，不能仅依赖驱动默认行为。
 
 Agent 路径不是让模型直接执行代码：每个 `AIFunction` 只是当前请求的受限适配器，工具名称来自服务器注册表，调用仍进入同一 `IToolExecutor`。框架函数循环只负责“模型选择—回填结果”；服务端额外负责总预算和终止条件。默认确定性模型会对知识统计问题选择 `knowledge.stats`，便于在没有外部模型密钥时完成真实函数调用回归；接入真实模型时仍复用相同安全边界。
 
@@ -237,7 +254,7 @@ Invoke-RestMethod "http://127.0.0.1:5080/api/v1/agents/runs/$($run.runId)/resume
 
 当前 v1 请求体只接受问题，不接受调用方自报租户、用户或权限组。开发模式使用服务端配置的固定身份；OIDC JWT 模式通过提供方的 discovery metadata、签名、issuer、audience 和有效期验证 Access Token，然后从 `sub`、`tenant_id`、`groups` claims 构造 `AccessContext`。
 
-Production 环境有强制启动门禁：必须使用 `Authentication:Mode=OidcJwt`，必须提供 HTTPS Authority 和 Audience，并且必须关闭 V0。任何条件不满足都会启动失败，避免错误配置后“带病上线”。
+Production 环境有强制启动门禁：必须使用 `Authentication:Mode=OidcJwt`，必须提供 HTTPS Authority 和 Audience，必须关闭 V0，并且必须使用 SQL Server 工作流存储及可验证的 TLS 证书。任何条件不满足都会启动失败，避免审批或暂停会话在重启后丢失，也避免错误配置后“带病上线”。
 
 开发身份配置：
 
@@ -271,16 +288,17 @@ $env:Authentication__GroupsClaim = 'groups'
 
 ## 下一阶段
 
-1. 将工具审批、Agent Session StateBag、暂停点和记忆存储迁移到 PostgreSQL 或 SQL Server，使用事务条件更新支持多副本恢复与一次性消费，并增加密钥版本和在线重加密流程。
-2. 为长时间 Workflow 增加持久化检查点、取消、补偿和恢复租约；区分短时 Agent 工具审批与跨小时业务流程审批。
+1. 为 SQL Server 密文增加 `KeyVersion`、密钥轮换和在线重加密，并将自动建表迁移到受版本控制的数据库发布流程。
+2. 为跨小时 Workflow 增加取消、补偿、续租和人工任务队列；当前短租约只覆盖短时 Agent 工具审批恢复。
 3. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率、恶意文档隔离率和引用正确率门禁。
 4. 接入真实身份提供方做两个主体的有效 Token 端到端验收，并覆盖密钥轮换、过期 Token、错误 audience、组变更和审批人离职场景。
 5. 接入真实模型、嵌入与语义重排供应商，比较当前确定性重排、归一化加权和 RRF 等策略，并运行同一套契约测试和 150 条回归，确认沙箱与生产适配器行为边界。
 
 ## 验证状态
 
-- 2026-07-13 本地自动化测试 63/63 通过；Agent 审批覆盖暂停、待决恢复、批准、拒绝、过期、跨用户、容量、并发恢复和重放。150 条离线评测决策匹配率 90%、引用召回率 75%，质量门禁通过；NuGet 直接与传递依赖未发现已知漏洞。
+- 2026-07-14 本地自动化测试 67/67 通过；Agent 审批覆盖暂停、待决恢复、批准、拒绝、过期、跨用户、容量、并发恢复、跨运行器会话重建、租约接管和重放。真实 SQL Server LocalDB 测试验证了并发审批只消费一次、并发恢复只产生一个租约，以及检查点参数不以明文落库。150 条离线评测决策匹配率 90%、引用召回率 75%，质量门禁通过；NuGet 直接与传递依赖未发现已知漏洞。
 - OpenSearch 请求契约已由自动化测试验证：索引映射、搜索管线、批量摄取，以及 BM25/k-NN 两个分支中的租户和 ACL 过滤。
 - 2026-07-13 尝试拉取 `opensearchproject/opensearch:3.5.0` 做真实容器验收，但镜像仓库连续两次无下载进度并超时，未创建镜像或容器。因此真实集群验收尚未通过，网络恢复后必须重新执行 `docker compose up -d` 和 HTTP 闭环。
+- 2026-07-13 拉取 `mcr.microsoft.com/mssql/server:2022-latest` 在 120 秒内无下载进度并超时；2026-07-14 改用本机 SQL Server LocalDB 完成真实事务测试并通过。容器部署形态仍需在镜像网络恢复后补做启动、健康检查和进程强杀验收，但数据库事务实现已获得真实 SQL 执行证据。
 
 生产化时可参考 [Microsoft Agent Framework 官方仓库](https://github.com/microsoft/agent-framework)、[Microsoft Kernel Memory](https://github.com/microsoft/kernel-memory) 的摄取与检索管线思想，以及 [OpenSearch neural search](https://github.com/opensearch-project/neural-search) 的混合检索实现。具体选型和版本必须在实施时按官方文档再次核验。

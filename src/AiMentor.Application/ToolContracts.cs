@@ -47,6 +47,45 @@ public sealed class AgentExecutionOptions
     public int MaximumAnswerCharacters { get; init; } = 4_000;
     public int MaximumPendingApprovalRuns { get; init; } = 1_000;
     public TimeSpan MaximumRunTime { get; init; } = TimeSpan.FromSeconds(10);
+    public TimeSpan ResumeLeaseDuration { get; init; } = TimeSpan.FromSeconds(30);
+}
+
+/// <summary>持久化 Agent 原生会话、审批请求和执行预算，供其他实例安全恢复。</summary>
+public sealed record AgentRunCheckpoint(
+    string RunId,
+    AccessContext Access,
+    string ApprovalId,
+    string FrameworkRequestId,
+    string FunctionCallId,
+    string FunctionName,
+    Dictionary<string, object?> FunctionArguments,
+    JsonElement SessionState,
+    IReadOnlyList<AgentToolStep> ToolSteps,
+    IReadOnlyList<TraceStep> Trace,
+    IReadOnlyList<string> ToolFingerprints,
+    int CumulativeResultBytes,
+    AgentApprovalCheckpoint Approval,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset ExpiresAt);
+
+/// <summary>描述原子获取恢复租约后的结果；只有 Acquired 才携带可执行检查点。</summary>
+public sealed record AgentRunLeaseResult(
+    AgentRunLeaseStatus Status,
+    string? LeaseToken = null,
+    AgentRunCheckpoint? Checkpoint = null);
+
+/// <summary>区分恢复租约成功、越权、忙碌、过期和不存在。</summary>
+public enum AgentRunLeaseStatus { Acquired, Forbidden, Busy, Expired, NotFound }
+
+/// <summary>为暂停运行提供可替换的持久化存储，并通过短租约阻止多实例重复恢复。</summary>
+public interface IAgentRunCheckpointStore
+{
+    Task SavePendingAsync(AgentRunCheckpoint checkpoint, string? leaseToken = null,
+        CancellationToken cancellationToken = default);
+    Task<AgentRunLeaseResult> TryAcquireAsync(string runId, AccessContext access, string leaseOwner,
+        TimeSpan leaseDuration, CancellationToken cancellationToken = default);
+    Task ReleaseAsync(string runId, string leaseToken, CancellationToken cancellationToken = default);
+    Task CompleteAsync(string runId, string leaseToken, CancellationToken cancellationToken = default);
 }
 
 /// <summary>区分 Agent 暂停运行恢复时的输入、权限、资源和状态错误。</summary>

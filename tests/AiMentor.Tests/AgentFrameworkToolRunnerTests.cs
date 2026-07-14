@@ -174,6 +174,25 @@ public sealed class AgentFrameworkToolRunnerTests
     }
 
     [Fact]
+    public async Task NewRunnerInstanceShouldRestoreSerializedSessionAndResumeExactlyOnce()
+    {
+        var fixture = CreateApprovalRunner();
+        var initial = await fixture.Runner.RunAsync(
+            "请删除记忆 memoryId=memory-restart expectedVersion=1", Access, "agent-after-restart");
+        await fixture.Approvals.DecideAsync(initial.Approval!.ApprovalId, true, "批准跨实例恢复", fixture.Approver);
+
+        // 使用全新的 Agent 与运行器对象模拟进程重建，只共享外部状态存储和业务依赖。
+        var restoredRunner = new AgentFrameworkToolRunner(new DeterministicGroundedChatClient(), fixture.Registry,
+            fixture.Executor, new RuleBasedInputSafetyService(), fixture.Trace, fixture.Options, fixture.Clock,
+            fixture.Approvals, fixture.Checkpoints);
+        var completed = await restoredRunner.ResumeAsync(initial.RunId, Access);
+
+        Assert.Equal(AgentRunStatus.Completed, completed.Status);
+        Assert.Equal(1, fixture.Tool.ExecutionCount);
+        Assert.Single(completed.ToolSteps);
+    }
+
+    [Fact]
     public async Task PendingApprovalCapacityShouldFailClosedBeforeCreatingAnotherPause()
     {
         var fixture = CreateApprovalRunner(maximumPendingRuns: 1);
@@ -218,17 +237,20 @@ public sealed class AgentFrameworkToolRunnerTests
             ApprovalLifetime = approvalLifetime ?? TimeSpan.FromMinutes(15)
         }, clock);
         var executor = new SafeToolExecutor(registry, safety, trace, new ToolExecutorOptions(), clock, approvals);
+        var agentOptions = new AgentExecutionOptions
+        {
+            MaximumModelIterations = 4,
+            MaximumToolCalls = 3,
+            MaximumCumulativeToolResultBytes = 4_096,
+            MaximumPendingApprovalRuns = maximumPendingRuns,
+            MaximumRunTime = TimeSpan.FromSeconds(2)
+        };
+        var checkpoints = new InMemoryAgentRunCheckpointStore(clock, maximumPendingRuns);
         var runner = new AgentFrameworkToolRunner(new DeterministicGroundedChatClient(), registry, executor,
-            new RuleBasedInputSafetyService(), trace, new AgentExecutionOptions
-            {
-                MaximumModelIterations = 4,
-                MaximumToolCalls = 3,
-                MaximumCumulativeToolResultBytes = 4_096,
-                MaximumPendingApprovalRuns = maximumPendingRuns,
-                MaximumRunTime = TimeSpan.FromSeconds(2)
-            }, clock, approvals);
+            new RuleBasedInputSafetyService(), trace, agentOptions, clock, approvals, checkpoints);
         return new ApprovalRunnerFixture(runner, approvals, tool, clock,
-            AccessContext.Create("tenant-a", "approver", ["tool-approvers"]));
+            AccessContext.Create("tenant-a", "approver", ["tool-approvers"]), registry, executor, trace,
+            agentOptions, checkpoints);
     }
 
     private sealed class RecordingExecutor(string? padding = null) : IToolExecutor
@@ -286,7 +308,9 @@ public sealed class AgentFrameworkToolRunnerTests
     }
 
     private sealed record ApprovalRunnerFixture(AgentFrameworkToolRunner Runner,
-        InMemoryToolApprovalService Approvals, MutationTool Tool, ManualTimeProvider Clock, AccessContext Approver);
+        InMemoryToolApprovalService Approvals, MutationTool Tool, ManualTimeProvider Clock, AccessContext Approver,
+        ServerToolRegistry Registry, SafeToolExecutor Executor, InMemoryTraceSink Trace,
+        AgentExecutionOptions Options, InMemoryAgentRunCheckpointStore Checkpoints);
 
     private sealed class ManualTimeProvider(DateTimeOffset utcNow) : TimeProvider
     {
