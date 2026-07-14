@@ -1,0 +1,14 @@
+{
+  "schema_version": 2,
+  "cases_sha256": "2257389929BF61AF2C79F11C3E3FAF28FD4A88CDD5F6DB0535A9A9F7D6E417A7",
+  "expected_case_count": 2,
+  "expected_category_counts": {
+    "no_answer": 1,
+    "security": 1
+  },
+  "default_groups": [
+    "all-employees",
+    "all-rnd"
+  ],
+  "case_group_overrides": {}
+}

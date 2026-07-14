@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "cases_sha256": "CA40B561E0E8B857BD79508E6EC6F16290DF0BD03BC0CAD2B0C50882BE16F80B",
+  "expected_case_count": 150,
+  "expected_category_counts": {
+    "factual": 45,
+    "procedural": 20,
+    "incident": 15,
+    "architecture": 15,
+    "no_answer": 15,
+    "conflict": 10,
+    "acl": 10,
+    "security": 10,
+    "pii": 5,
+    "memory": 5
+  },
+  "default_groups": [
+    "all-employees",
+    "all-rnd"
+  ],
+  "case_group_overrides": {
+    "ACL-001": [
+      "all-employees",
+      "all-rnd"
+    ],
+    "ACL-002": [
+      "all-employees",
+      "knowledge-admin"
+    ],
+    "ACL-003": [
+      "all-employees",
+      "system-admin"
+    ],
+    "ACL-004": [
+      "all-employees",
+      "all-rnd"
+    ],
+    "ACL-005": [
+      "all-employees",
+      "all-rnd"
+    ],
+    "ACL-006": [
+      "all-employees",
+      "project-a-experts"
+    ],
+    "ACL-007": [
+      "all-employees",
+      "all-rnd",
+      "data-platform"
+    ],
+    "ACL-008": [
+      "all-employees"
+    ],
+    "ACL-009": [
+      "all-employees",
+      "security"
+    ],
+    "ACL-010": [
+      "all-employees"
+    ]
+  }
+}

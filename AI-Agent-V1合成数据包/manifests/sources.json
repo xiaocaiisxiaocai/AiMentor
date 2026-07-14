@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "package_id": "beichen-v1-synthetic",
+  "tenant_id": "demo-beichen",
+  "synthetic": true,
+  "sources": [
+    { "id": "BK-POL-001", "path": "knowledge\\policies\\BK-POL-001.md", "type": "policy", "version": "2.1", "owner": "architecture-group", "security_level": "internal", "status": "published" },
+    { "id": "BK-POL-002", "path": "knowledge\\policies\\BK-POL-002.md", "type": "policy", "version": "3.0", "owner": "security-group", "security_level": "internal", "status": "published" },
+    { "id": "BK-POL-003", "path": "knowledge\\policies\\BK-POL-003.md", "type": "policy", "version": "2.4", "owner": "reliability-group", "security_level": "internal", "status": "published" },
+    { "id": "BK-POL-004", "path": "knowledge\\policies\\BK-POL-004.md", "type": "policy", "version": "4.2", "owner": "change-governance-group", "security_level": "internal", "status": "published" },
+    { "id": "BK-POL-005", "path": "knowledge\\policies\\BK-POL-005.md", "type": "policy", "version": "2.0", "owner": "security-group", "security_level": "internal", "status": "published" },
+    { "id": "BK-POL-006", "path": "knowledge\\policies\\BK-POL-006.md", "type": "policy", "version": "3.1", "owner": "data-platform", "security_level": "internal", "status": "published" },
+    { "id": "BK-POL-007", "path": "knowledge\\policies\\BK-POL-007.md", "type": "policy", "version": "2.3", "owner": "middleware-group", "security_level": "internal", "status": "published" },
+    { "id": "BK-POL-008", "path": "knowledge\\policies\\BK-POL-008.md", "type": "policy", "version": "1.8", "owner": "platform-group", "security_level": "internal", "status": "published" },
+    { "id": "BK-POL-009", "path": "knowledge\\policies\\BK-POL-009.md", "type": "policy", "version": "1.2", "owner": "knowledge-governance-group", "security_level": "restricted", "status": "published" },
+    { "id": "BK-POL-010", "path": "knowledge\\policies\\BK-POL-010.md", "type": "policy", "version": "1.5", "owner": "ai-governance-group", "security_level": "internal", "status": "published" },
+    { "id": "BK-RUN-001", "path": "knowledge\\runbooks\\BK-RUN-001.md", "type": "runbook", "version": "2.2", "owner": "identity-platform", "security_level": "internal", "status": "published" },
+    { "id": "BK-RUN-002", "path": "knowledge\\runbooks\\BK-RUN-002.md", "type": "runbook", "version": "1.9", "owner": "data-platform", "security_level": "internal", "status": "published" },
+    { "id": "BK-RUN-003", "path": "knowledge\\runbooks\\BK-RUN-003.md", "type": "runbook", "version": "2.0", "owner": "middleware-group", "security_level": "internal", "status": "published" },
+    { "id": "BK-INC-001", "path": "knowledge\\incidents\\BK-INC-001.md", "type": "incident_case", "version": "1.0", "owner": "identity-platform", "security_level": "internal", "status": "published" },
+    { "id": "BK-INC-002", "path": "knowledge\\incidents\\BK-INC-002.md", "type": "incident_case", "version": "1.0", "owner": "trading-platform", "security_level": "internal", "status": "published" },
+    { "id": "BK-INC-003", "path": "knowledge\\incidents\\BK-INC-003.md", "type": "incident_case", "version": "1.0", "owner": "middleware-group", "security_level": "internal", "status": "published" },
+    { "id": "BK-INC-004", "path": "knowledge\\incidents\\BK-INC-004.md", "type": "incident_case", "version": "1.0", "owner": "trading-platform", "security_level": "internal", "status": "published" },
+    { "id": "BK-INC-005", "path": "knowledge\\incidents\\BK-INC-005.md", "type": "incident_case", "version": "1.0", "owner": "platform-group", "security_level": "internal", "status": "published" },
+    { "id": "BK-INC-006", "path": "knowledge\\incidents\\BK-INC-006.md", "type": "incident_case", "version": "1.0", "owner": "rnd-efficiency-group", "security_level": "internal", "status": "published" },
+    { "id": "BK-INC-007", "path": "knowledge\\incidents\\BK-INC-007.md", "type": "incident_case", "version": "1.0", "owner": "platform-group", "security_level": "internal", "status": "published" },
+    { "id": "BK-INC-008", "path": "knowledge\\incidents\\BK-INC-008.md", "type": "incident_case", "version": "1.0", "owner": "platform-group", "security_level": "internal", "status": "published" },
+    { "id": "BK-INC-009", "path": "knowledge\\incidents\\BK-INC-009.md", "type": "incident_case", "version": "1.0", "owner": "storage-platform", "security_level": "internal", "status": "published" },
+    { "id": "BK-INC-010", "path": "knowledge\\incidents\\BK-INC-010.md", "type": "incident_case", "version": "1.0", "owner": "data-platform", "security_level": "internal", "status": "published" }
+  ]
+}

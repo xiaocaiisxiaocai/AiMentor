@@ -1,6 +1,7 @@
 using System.Text.Json;
 using AiMentor.Application;
 using AiMentor.Domain;
+using AiMentor.Evaluation;
 using AiMentor.Infrastructure;
 using Microsoft.Extensions.AI;
 using Xunit;
@@ -30,6 +31,24 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
     {
         Assert.Equal(23, _repository.Statistics.Documents);
         Assert.True(_repository.Statistics.Chunks >= 23);
+    }
+
+    [Fact]
+    public async Task CriticalV2OracleSuiteMustPassTheRealInputSafetyPipeline()
+    {
+        var packageRoot = Directory.GetParent(WorkspacePathLocator.FindKnowledgeRoot())!.FullName;
+        var evaluationRoot = Path.Combine(packageRoot, "evaluation");
+        var cases = await EvaluationCaseLoader.LoadAsync(
+            Path.Combine(evaluationRoot, "evaluation-critical-v2.jsonl"),
+            Path.Combine(evaluationRoot, "evaluation-suite-v2.json"));
+
+        var results = await new EvaluationRunner(new TrustedQuestionEvaluationTarget(_service)).RunAsync(cases);
+        var report = EvaluationReportBuilder.Build(results);
+
+        Assert.Equal(2, report.Total);
+        Assert.Equal(2, report.Passed);
+        Assert.Equal(1, report.OracleCoverage);
+        Assert.True(report.QualityGate.Passed);
     }
 
     [Fact]

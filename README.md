@@ -12,7 +12,7 @@
 - 工具与规划：服务器注册表已转换为 Agent Framework `AIFunction`；只读工具自动进入安全执行器，修改工具以原生 `ApprovalRequiredAIFunction` 暂停并返回 `AwaitingApproval`，人工裁决后通过同一 `AgentSession` 恢复。模型可选择 `knowledge.stats` 或请求 `memory.delete`，但看不到、生成不了服务端批准凭据。函数委托只能调用 `IToolExecutor`，并叠加单次 4 轮模型迭代、3 次工具调用、10 秒总时限、重复调用熔断、16 KB 累计结果预算和结果再审核。官方的 [`ApprovalRequiredAIFunction` 设计说明](https://github.com/microsoft/agent-framework/blob/main/docs/decisions/0006-userapproval.md) 明确审批标记不负责强制执行，因此框架恢复后仍由服务端执行器做最终校验。
 - 记忆：已实现会话记忆、用户偏好和长期事实的显式授权工作流，包括待批准提案、批准、查看、更正、删除、过期、乐观并发和租户/用户隔离。开发默认使用 AES-GCM 加密快照持久化，键和值均不以明文落盘；问答只注入当前用户最小相关的已批准记忆，并把记忆标记为只读数据而非系统指令或事实引用来源。
 - 知识：默认加载 `AI-Agent-V1合成数据包\knowledge` 中 23 份已发布合成文档，共 74 个分块。
-- 测评：完整读取 150 条 JSONL 测评集并输出分类指标和失败样本。
+- 测评：v1 严格读取锁定的 150 条 JSONL 题目与独立主体配置，v2 独立运行已结构化的 critical Oracle；按动作、决策、安全结果、claims、引用、轨迹和 Fixture 分维度输出 `Pass / Fail / NotReady / NotApplicable`，缺少可执行 Ground Truth 不再自动算通过。
 
 ## 闭环架构
 
@@ -106,6 +106,17 @@ Invoke-RestMethod http://127.0.0.1:5080/api/v1/questions -Method Post -ContentTy
 dotnet run --project .\src\AiMentor.Evaluation\AiMentor.Evaluation.csproj
 ```
 
+执行已具备确定性 Oracle 的 v2 critical 小套件：
+
+```powershell
+dotnet run --project .\src\AiMentor.Evaluation\AiMentor.Evaluation.csproj -- `
+  .\AI-Agent-V1合成数据包\evaluation\evaluation-critical-v2.jsonl `
+  .\AI-Agent-V1合成数据包\knowledge `
+  .\AI-Agent-V1合成数据包\evaluation\evaluation-suite-v2.json
+```
+
+退出码 `0` 表示严格质量门禁通过，`2` 表示题集有效但质量或 Oracle 覆盖不足，`3` 表示题集或套件配置本身无效。当前 v1 150 题基线预期返回 `2`；CI 应把它视为真实阻断，不能改写为成功。v2 小套件必须通过才能接受新的策略变更。
+
 执行真实 SQL Server 多实例对账验收（会创建并自动销毁临时容器、数据库，最多并发七个 API 实例）：
 
 ```powershell
@@ -117,9 +128,9 @@ dotnet run --project .\src\AiMentor.Evaluation\AiMentor.Evaluation.csproj
 
 脚本要求 Docker Desktop 已运行，且指定的 SQL 与七个连续 API 端口均可绑定。它真实执行 001–008 迁移，并先验证正向工具的精确强杀窗口；随后创建真实 `memory.correct` 正向操作和加密补偿记录，在补偿账本已提交 `Executing`、快照尚未解密且 `memory.correct.restore` 尚未调用时强杀实例。脚本确认目标记忆仍保持正向值，等待租约过期后由无屏障替代实例通过 `GET /api/v1/tool-compensations?status=OutcomeUnknown` 查询冻结记录，并验证反向重试返回 409。后续仍会完成常规结果不确定探测、跨实例独立审批、第一人复核强杀、两个第二复核实例并发单胜者及 `Reconciled` 滚动回放。脚本不输出数据库密码，失败时保留诊断日志路径，成功后自动删除临时资源。
 
-2026-07-13 的当前可复现基线：150 条全部执行，决策匹配率 90.00%，复合来源按“全部命中”计算的用例级引用召回率 75.00%；无答案、记忆、安全、ACL 四类决策匹配率均为 100%。查询规范化修复了 P1 定义和 VegaBus 必需字段等被问句模板稀释的召回问题；输出审核也识别出 A-009 虽被旧实现标为“已回答”，实际生成内容无法通过证据落地检查，现改为安全拒答。架构类仍受限于总体设计文档尚未进入当前 23 份知识包文档，事故复合引用召回率也仍需通过更好的分块与多跳检索改进。这些指标是阶段性回归基线，不是生产上线验收结论。
+2026-07-14 的严格测量基线：150 条全部执行，0 条完整通过、72 条失败、78 条 `NotReady`；可判定动作准确率 46.40%，动作 Oracle 覆盖率 83.33%，必需来源 micro recall 79.59%，完整可执行 Oracle 覆盖率 0%，28 条 critical 用例全部阻断，质量门禁正确失败。独立 v2 critical 小套件为 2 Pass / 0 Fail / 0 NotReady，Oracle 覆盖率 100%，引用召回率 N/A，门禁退出码 0。此前的“决策 90%、引用 75%、安全/ACL 100%”使用了宽泛动作兜底、全权限主体和无来源即引用成功等错误口径，已经废止，不能用于版本比较。
 
-评测执行器同时是自动质量门禁：决策匹配率不得低于 89%，引用召回率不得低于 71%，并且无答案、记忆、安全、ACL 四类必须全部达到 100%。任一条件失败时进程以退出码 `2` 结束，可直接接入本地提交检查或 CI。门禁同时约束总体指标和高风险分组，防止平均数掩盖安全退化。
+评测执行器同时是严格质量门禁：可判定动作准确率不得低于 89%，动作 Oracle 覆盖率和完整 Oracle 覆盖率都必须达到 100%，必需来源 micro recall 不得低于 71%，任一 critical 用例 `Fail` 或 `NotReady` 都会无条件阻断。旧 `expected_behavior` 自由文本只保留给人工迁移，不参与自动通过判定；没有实际恶意文档、工具参数、缓存、撤权或跨用户状态的场景只能标为 `NotReady`。
 
 当前证据充分性判定是可解释的确定性实现，会分别检查原始检索相关性、问题是否过短、是否存在承载答案的句子、静态知识能否回答实时问题，以及数值型问题的高相关句子中是否真的存在数值。重排分数只影响提供给回答模型的证据顺序；引用仍依据原始检索分排序和截断，避免把启发式重排分误当成检索置信度。典型回归用例包括：Markdown 有序列表中的 `1.` 不得被误判为“连接池大小”的答案；“以后默认给我简短回答，可以记住”必须进入独立授权工作流，而不是写入记忆或交给 RAG 回答。
 
@@ -375,15 +386,16 @@ $env:Authentication__GroupsClaim = 'groups'
 
 ## 下一阶段
 
-1. 扩展反向 `OutcomeUnknown` 对账覆盖面：`memory.correct.restore` 的工具专属目标探测、证据有效期和双人裁决已经完成；下一步增加独立人工任务队列、超时升级和运营检索，并逐个为新的可补偿工具实现专属探测器。`memory.delete` 在安全快照方案完成前继续人工对账。
-2. 增加跨小时故障验收和补偿审批/执行并发争抢压力测试；正向与补偿 `Executing` 精确窗口强杀、多实例并发裁决和滚动回放已通过真实容器验证。
-3. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率、恶意文档隔离率和引用正确率门禁。
-4. 接入真实身份提供方做两个主体的有效 Token 端到端验收，并覆盖密钥轮换、过期 Token、错误 audience、组变更和审批人离职场景。
-5. 接入真实模型、嵌入与语义重排供应商，比较当前确定性重排、归一化加权和 RRF 等策略，并运行同一套契约测试和 150 条回归，确认沙箱与生产适配器行为边界。
+1. 继续迁移 critical 题：v2 已先收录不需要外部 Fixture 的 `N-004` 与 `SEC-001`；其他 26 题必须先完成同问题双主体 ACL、实际间接注入、真实工具参数、PII 脱敏、撤权缓存和跨用户记忆状态 Fixture，不得把普通证据不足当作安全正确性证明。
+2. 为事实题补 `required_claims / forbidden_claims`，为 Workflow、冲突和记忆题补阶段事件、工具调用、状态变化及终态 Oracle；人工签核前不得提升覆盖率。
+3. 接入真实身份提供方做两个主体的有效 Token 端到端验收，并覆盖密钥轮换、过期 Token、错误 audience、组变更和审批人离职场景。
+4. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率、恶意文档隔离率和引用正确率门禁。
+5. 在 V1 知识与场景主路径完成前冻结新的修改工具；现有 `OutcomeUnknown` 继续按专属探测和双人对账处理，后续再建设人工任务队列与超时升级。
+6. 接入真实模型、嵌入与语义重排供应商，比较当前确定性重排、归一化加权和 RRF 等策略，并运行同一套严格回归，确认沙箱与生产适配器行为边界。
 
 ## 验证状态
 
-- 2026-07-14 本地自动化测试 106/106 通过；InMemory 与 SQL Server 补偿路径均覆盖加密快照、正向完成后发布、独立审批、职责分离、批准过期、独立幂等回放、状态过滤、错误过滤值、错误租约配置前置拒绝、结果不确定冻结，以及 `memory.correct.restore` 专属探测和双人结案。真实 SQL Server LocalDB 执行 `001` 至 `008`，验证两个服务实例跨密钥版本审批和执行、快照密文、在线重加密、反向副作用前屏障、租约过期冻结、禁止重放和 SQL 持久化补偿复核。Docker SQL Server 2022 与最多七个并发 API 实例此前已验证正向和补偿两个精确强杀窗口；本轮脚本已纳入 008 迁移，但新增反向双人裁决尚未重新执行 Docker 强杀验收。150 条离线评测决策匹配率 90%、引用召回率 75%，质量门禁通过；NuGet 直接与传递依赖未发现已知漏洞。
+- 2026-07-14 本地自动化测试 157/157 通过；新增严格题集哈希与套件完整性校验、v1/v2 schema 隔离、结构化 Oracle、运行时 Fixture、真实输入安全链路回归、动作一致性、异常观察隔离、逐来源引用评分、critical 阻断，以及 always-answer、always-refuse、两状态作弊实现的负向控制。InMemory 与 SQL Server 补偿路径继续覆盖加密快照、职责分离、幂等、结果不确定冻结和双人结案。严格 150 题基线为 0 Pass / 72 Fail / 78 NotReady，动作准确率 46.4%、动作覆盖率 83.33%、必需来源 micro recall 79.59%、完整 Oracle 覆盖率 0%，门禁按预期失败；独立 v2 critical 套件为 2/2 Pass、Oracle 覆盖率 100%、门禁退出码 0；NuGet 直接与传递依赖未发现已知漏洞。
 - OpenSearch 请求契约已由自动化测试验证：索引映射、搜索管线、批量摄取，以及 BM25/k-NN 两个分支中的租户和 ACL 过滤。
 - 2026-07-13 尝试拉取 `opensearchproject/opensearch:3.5.0` 做真实容器验收，但镜像仓库连续两次无下载进度并超时，未创建镜像或容器。因此真实集群验收尚未通过，网络恢复后必须重新执行 `docker compose up -d` 和 HTTP 闭环。
 - 2026-07-13 首次拉取 SQL Server 镜像曾超时；2026-07-14 网络恢复后已使用 `mcr.microsoft.com/mssql/server:2022-latest` 完成迁移、健康检查、多进程强杀、租约冻结、并发裁决和滚动回放验收。

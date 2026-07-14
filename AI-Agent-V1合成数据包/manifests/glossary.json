@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "tenant_id": "demo-beichen",
+  "synthetic": true,
+  "terms": [
+    { "id": "BK-TERM-001", "term": "AtlasID", "definition": "虚构的 OIDC 身份与服务身份平台。" },
+    { "id": "BK-TERM-002", "term": "OrionOrder", "definition": "虚构的核心订单服务。" },
+    { "id": "BK-TERM-003", "term": "VegaBus", "definition": "虚构的 RabbitMQ 消息平台。" },
+    { "id": "BK-TERM-004", "term": "PolarisDB", "definition": "虚构的 PostgreSQL 托管平台。" },
+    { "id": "BK-TERM-005", "term": "NimbusObserve", "definition": "虚构的日志、指标和 Trace 平台。" },
+    { "id": "BK-TERM-006", "term": "HarborDocs", "definition": "虚构的文档、版本、ACL 和知识发布平台。" },
+    { "id": "BK-TERM-007", "term": "AuroraConfig", "definition": "虚构的配置和 Feature Flag 平台。" },
+    { "id": "BK-TERM-008", "term": "MinervaStore", "definition": "虚构的 MinIO/S3 对象存储平台。" },
+    { "id": "BK-TERM-009", "term": "Evidence Store", "definition": "保存 Agent 运行中可追溯证据的逻辑组件。" },
+    { "id": "BK-TERM-010", "term": "Knowledge Candidate", "definition": "尚未经过知识发布审核的候选内容。" },
+    { "id": "BK-TERM-011", "term": "RRF", "definition": "用于合并多个排序列表的 Reciprocal Rank Fusion 方法。" },
+    { "id": "BK-TERM-012", "term": "Parent-Child Chunk", "definition": "子块负责召回、父块负责补充上下文的切分策略。" },
+    { "id": "BK-TERM-013", "term": "Incident Commander", "definition": "负责故障协调和紧急决策的授权角色。" },
+    { "id": "BK-TERM-014", "term": "Expand-Contract", "definition": "先扩展兼容结构，完成迁移后再移除旧结构的方法。" },
+    { "id": "BK-TERM-015", "term": "Singleflight", "definition": "合并同一 Key 的并发回源请求以防止缓存击穿。" }
+  ]
+}
