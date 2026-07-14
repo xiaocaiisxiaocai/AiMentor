@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -103,7 +104,8 @@ public sealed class SafeToolExecutor(
     TimeProvider timeProvider,
     IToolApprovalService? approvalService = null,
     IToolExecutionLedger? executionLedger = null,
-    IToolExecutionBarrier? executionBarrier = null) : IToolExecutor
+    IToolExecutionBarrier? executionBarrier = null,
+    IToolCompensationService? compensationService = null) : IToolExecutor
 {
     private readonly IToolExecutionLedger _executionLedger = executionLedger ?? new InMemoryToolExecutionLedger(timeProvider);
     private readonly IToolExecutionBarrier _executionBarrier = executionBarrier ?? NoOpToolExecutionBarrier.Instance;
@@ -114,6 +116,9 @@ public sealed class SafeToolExecutor(
         var runId = Guid.NewGuid().ToString("N");
         if (string.IsNullOrWhiteSpace(toolName) || !registry.TryGet(toolName.Trim(), out var tool) || tool is null)
             return await RejectAsync(runId, toolName, "TOOL_NOT_REGISTERED", "请求的工具未在服务器注册表中。", cancellationToken);
+        if (tool is ICompensableServerTool && (compensationService is null || !compensationService.IsAvailable))
+            return await RejectAsync(runId, tool.Descriptor.Name, "TOOL_COMPENSATION_DURABLE_STORE_UNAVAILABLE",
+                "当前部署没有可用的补偿账本，可补偿修改保持关闭。", cancellationToken);
 
         var normalizedArguments = arguments.ValueKind is JsonValueKind.Undefined or JsonValueKind.Null
             ? JsonSerializer.SerializeToElement(new Dictionary<string, object?>())
@@ -163,11 +168,18 @@ public sealed class SafeToolExecutor(
                 "服务器无法建立幂等执行占位。", cancellationToken);
 
         var sideEffectStarted = false;
+        ToolCompensationPreparation? compensationPreparation = null;
         try
         {
             var result = await ExecuteCoreAsync(runId, tool, normalizedArguments, access, approvalId,
                 async token =>
                 {
+                    if (tool is ICompensableServerTool compensable)
+                    {
+                        // 快照先于 Executing 和真实副作用建立；任何准备失败都会让正向修改失败关闭。
+                        compensationPreparation = await compensationService!.PrepareForwardAsync(executionKey,
+                            compensable, new ToolExecutionContext(access, runId), normalizedArguments, token);
+                    }
                     await _executionLedger.MarkExecutingAsync(executionKey, acquired.LeaseToken, token);
                     sideEffectStarted = true;
                     // 屏障位于持久化状态变更和真实副作用之间，使进程强杀验收拥有精确窗口。
@@ -175,20 +187,38 @@ public sealed class SafeToolExecutor(
                 }, cancellationToken);
             if (!sideEffectStarted)
             {
+                if (compensationPreparation is not null)
+                    await compensationService!.DiscardAsync(compensationPreparation, CancellationToken.None);
                 await _executionLedger.AbandonAsync(executionKey, acquired.LeaseToken, CancellationToken.None);
                 return result;
             }
             if (result.Status is ToolExecutionStatus.Completed or ToolExecutionStatus.ResultTooLarge)
             {
+                if (compensationPreparation is not null)
+                {
+                    await compensationService!.ActivateAsync(compensationPreparation, CancellationToken.None);
+                    result = result with { CompensationId = compensationPreparation.Id };
+                }
                 await _executionLedger.CompleteAsync(executionKey, acquired.LeaseToken, result,
                     CancellationToken.None);
                 return result;
             }
+            if (compensationPreparation is not null)
+                await compensationService!.MarkForwardOutcomeUnknownAsync(compensationPreparation,
+                    CancellationToken.None);
             await _executionLedger.MarkOutcomeUnknownAsync(executionKey, acquired.LeaseToken, CancellationToken.None);
             return await OutcomeUnknownAsync(runId, tool.Descriptor.Name, CancellationToken.None);
         }
         catch
         {
+            if (compensationPreparation is not null)
+            {
+                if (sideEffectStarted)
+                    await compensationService!.MarkForwardOutcomeUnknownAsync(compensationPreparation,
+                        CancellationToken.None);
+                else
+                    await compensationService!.DiscardAsync(compensationPreparation, CancellationToken.None);
+            }
             if (sideEffectStarted)
                 await _executionLedger.MarkOutcomeUnknownAsync(executionKey, acquired.LeaseToken, CancellationToken.None);
             else
@@ -420,4 +450,94 @@ public sealed class MemoryDeleteTool(IMemoryWorkflowService memoryWorkflow) : IM
         await memoryWorkflow.DeleteAsync(memoryId, expectedVersion, context.Access, cancellationToken);
         return JsonSerializer.SerializeToElement(new { deleted = true, memoryId });
     }
+}
+
+/// <summary>
+/// 使用乐观版本更正当前用户记忆，并在正向执行前捕获旧值、版本和到期时间作为加密补偿快照。
+/// </summary>
+public sealed class MemoryCorrectTool(IMemoryWorkflowService memoryWorkflow) : ICompensableServerTool
+{
+    public ToolDescriptor Descriptor { get; } = new("memory.correct", "更正当前用户拥有的版本化记忆。",
+        ToolOperationRisk.Mutation, TimeSpan.FromSeconds(3), 2 * 1024, true);
+
+    public string CompensationToolName => "memory.correct.restore";
+
+    public SafetyDecision ValidateArguments(JsonElement arguments)
+    {
+        var properties = arguments.EnumerateObject().ToArray();
+        if (properties.Length is < 3 or > 4 || properties.Any(property =>
+                property.Name is not ("memoryId" or "expectedVersion" or "value" or "expiresAt")))
+            return Refuse("MEMORY_CORRECT_ARGUMENTS_INVALID",
+                "memory.correct 只接受 memoryId、expectedVersion、value 和可选 expiresAt。");
+        if (!arguments.TryGetProperty("memoryId", out var memoryId) || memoryId.ValueKind != JsonValueKind.String
+            || string.IsNullOrWhiteSpace(memoryId.GetString()) || memoryId.GetString()!.Length > 128)
+            return Refuse("MEMORY_ID_INVALID", "memoryId 格式无效。");
+        if (!arguments.TryGetProperty("expectedVersion", out var expectedVersion)
+            || expectedVersion.ValueKind != JsonValueKind.Number || !expectedVersion.TryGetInt32(out var version)
+            || version <= 0)
+            return Refuse("MEMORY_VERSION_INVALID", "expectedVersion 必须大于 0。");
+        if (!arguments.TryGetProperty("value", out var value) || value.ValueKind != JsonValueKind.String
+            || string.IsNullOrWhiteSpace(value.GetString()) || value.GetString()!.Length > 1_000)
+            return Refuse("MEMORY_VALUE_INVALID", "value 不能为空且不能超过 1000 个字符。");
+        if (arguments.TryGetProperty("expiresAt", out var expiresAt)
+            && expiresAt.ValueKind is not JsonValueKind.Null
+            && (expiresAt.ValueKind != JsonValueKind.String
+                || !DateTimeOffset.TryParse(expiresAt.GetString(), CultureInfo.InvariantCulture,
+                    DateTimeStyles.RoundtripKind, out _)))
+            return Refuse("MEMORY_EXPIRATION_INVALID", "expiresAt 必须是合法的 ISO-8601 时间或 null。");
+        return new SafetyDecision(SafetyAction.Allow, "TOOL_ARGUMENTS_VALID", "记忆更正参数通过校验。");
+    }
+
+    public async Task<JsonElement> CaptureCompensationStateAsync(ToolExecutionContext context, JsonElement arguments,
+        CancellationToken cancellationToken = default)
+    {
+        var memoryId = arguments.GetProperty("memoryId").GetString()!.Trim();
+        var expectedVersion = arguments.GetProperty("expectedVersion").GetInt32();
+        var record = (await memoryWorkflow.ListAsync(context.Access, cancellationToken: cancellationToken))
+            .SingleOrDefault(item => string.Equals(item.Id, memoryId, StringComparison.Ordinal));
+        if (record is null)
+            throw new MemoryWorkflowException("MEMORY_NOT_FOUND", "没有找到当前用户可更正的记忆。",
+                MemoryWorkflowErrorKind.NotFound);
+        if (record.Version != expectedVersion)
+            throw new MemoryWorkflowException("MEMORY_VERSION_CONFLICT", "记忆版本已经变化，请重新读取后再操作。",
+                MemoryWorkflowErrorKind.Conflict);
+
+        return JsonSerializer.SerializeToElement(new MemoryCorrectionSnapshot(record.Id, record.Value,
+            record.Version + 1, record.ExpiresAt));
+    }
+
+    public async Task<JsonElement> ExecuteAsync(ToolExecutionContext context, JsonElement arguments,
+        CancellationToken cancellationToken = default)
+    {
+        var corrected = await memoryWorkflow.CorrectAsync(arguments.GetProperty("memoryId").GetString()!.Trim(),
+            new CorrectMemoryCommand(arguments.GetProperty("value").GetString()!,
+                arguments.GetProperty("expectedVersion").GetInt32(), ReadExpiresAt(arguments)),
+            context.Access, cancellationToken);
+        return JsonSerializer.SerializeToElement(new { corrected = true, memoryId = corrected.Id, corrected.Version });
+    }
+
+    public async Task<JsonElement> CompensateAsync(ToolExecutionContext context, JsonElement compensationState,
+        CancellationToken cancellationToken = default)
+    {
+        var snapshot = compensationState.Deserialize<MemoryCorrectionSnapshot>()
+            ?? throw new InvalidOperationException("记忆更正补偿快照无效。");
+        var restored = await memoryWorkflow.CorrectAsync(snapshot.MemoryId,
+            new CorrectMemoryCommand(snapshot.PreviousValue, snapshot.ExpectedVersionAfterForward,
+                snapshot.PreviousExpiresAt), context.Access, cancellationToken);
+        return JsonSerializer.SerializeToElement(new { restored = true, memoryId = restored.Id, restored.Version });
+    }
+
+    private static DateTimeOffset? ReadExpiresAt(JsonElement arguments) =>
+        arguments.TryGetProperty("expiresAt", out var expiresAt) && expiresAt.ValueKind == JsonValueKind.String
+            ? DateTimeOffset.Parse(expiresAt.GetString()!, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind)
+            : null;
+
+    private static SafetyDecision Refuse(string code, string message) =>
+        new(SafetyAction.Refuse, code, message);
+
+    private sealed record MemoryCorrectionSnapshot(
+        string MemoryId,
+        string PreviousValue,
+        int ExpectedVersionAfterForward,
+        DateTimeOffset PreviousExpiresAt);
 }

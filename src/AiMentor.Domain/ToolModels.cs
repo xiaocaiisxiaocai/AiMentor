@@ -27,7 +27,8 @@ public sealed record ToolExecutionResult(
     JsonElement? Output,
     SafetyDecision Safety,
     bool IdempotentReplay,
-    IReadOnlyList<TraceStep> Trace);
+    IReadOnlyList<TraceStep> Trace,
+    string? CompensationId = null);
 
 /// <summary>区分正常完成、等待人工审批、安全拒绝、预算终止和系统失败。</summary>
 public enum AgentRunStatus { Completed, AwaitingApproval, Refused, LimitExceeded, Failed, Cancelled }

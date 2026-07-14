@@ -58,6 +58,83 @@ public interface IToolCompensationCatalog
     bool TryDescribe(string toolName, out ToolCompensationDescriptor? descriptor);
 }
 
+/// <summary>描述补偿从正向快照到独立审批、反向执行或结果不确定的生命周期。</summary>
+public enum ToolCompensationStatus
+{
+    Prepared, Available, AwaitingApproval, Approved, Rejected, Executing, Completed,
+    ForwardOutcomeUnknown, OutcomeUnknown, Expired
+}
+
+/// <summary>返回不含补偿快照、工具参数和审批决定理由原文的补偿记录摘要。</summary>
+public sealed record ToolCompensationSummary(
+    string Id,
+    string ForwardToolName,
+    string CompensationToolName,
+    ToolCompensationStatus Status,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset ExpiresAt,
+    string? ApprovalId = null,
+    string? Justification = null,
+    DateTimeOffset? CompletedAt = null);
+
+/// <summary>携带正向副作用提交前建立的补偿占位和仅供当前执行实例使用的准备令牌。</summary>
+public sealed record ToolCompensationPreparation(string Id, string PreparationToken);
+
+/// <summary>返回补偿反向执行终态，不回显解密快照或反向工具输出。</summary>
+public sealed record ToolCompensationExecutionResult(
+    string Id,
+    ToolCompensationStatus Status,
+    string Code,
+    bool IdempotentReplay,
+    DateTimeOffset? CompletedAt = null);
+
+/// <summary>
+/// 编排加密补偿快照、独立审批和独立幂等执行；多实例部署必须提供耐久实现，禁止回退到进程内状态。
+/// </summary>
+public interface IToolCompensationService
+{
+    bool IsAvailable { get; }
+    Task<ToolCompensationPreparation> PrepareForwardAsync(string executionKey, ICompensableServerTool tool,
+        ToolExecutionContext context, JsonElement arguments, CancellationToken cancellationToken = default);
+    Task ActivateAsync(ToolCompensationPreparation preparation, CancellationToken cancellationToken = default);
+    Task DiscardAsync(ToolCompensationPreparation preparation, CancellationToken cancellationToken = default);
+    Task MarkForwardOutcomeUnknownAsync(ToolCompensationPreparation preparation,
+        CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<ToolCompensationSummary>> ListAsync(AccessContext access,
+        CancellationToken cancellationToken = default);
+    Task<ToolCompensationSummary> RequestApprovalAsync(string compensationId, string justification,
+        AccessContext requester, CancellationToken cancellationToken = default);
+    Task<ToolCompensationSummary> DecideAsync(string compensationId, string approvalId, bool approved, string reason,
+        AccessContext approver, CancellationToken cancellationToken = default);
+    Task<ToolCompensationExecutionResult> ExecuteAsync(string compensationId, string approvalId,
+        string idempotencyKey, AccessContext requester, CancellationToken cancellationToken = default);
+}
+
+/// <summary>配置补偿快照、审批、执行租约、保留期与内存容量边界。</summary>
+public sealed class ToolCompensationOptions
+{
+    public TimeSpan CompensationLifetime { get; init; } = TimeSpan.FromHours(24);
+    public TimeSpan ApprovalLifetime { get; init; } = TimeSpan.FromMinutes(15);
+    public TimeSpan ExecutionLeaseDuration { get; init; } = TimeSpan.FromSeconds(45);
+    public int MaximumEntries { get; init; } = 10_000;
+    public int MaximumSnapshotBytes { get; init; } = 16 * 1024;
+    public IReadOnlySet<string> ApproverGroups { get; init; } =
+        new HashSet<string>(["tool-approvers"], StringComparer.OrdinalIgnoreCase);
+}
+
+/// <summary>区分补偿输入、权限、资源、冲突、容量和当前部署能力错误。</summary>
+public enum ToolCompensationErrorKind { Validation, Forbidden, NotFound, Conflict, Capacity, Unavailable }
+
+/// <summary>携带不泄漏补偿快照的稳定错误码，供 API 统一映射。</summary>
+public sealed class ToolCompensationException(
+    string code,
+    string message,
+    ToolCompensationErrorKind kind) : Exception(message)
+{
+    public string Code { get; } = code;
+    public ToolCompensationErrorKind Kind { get; } = kind;
+}
+
 /// <summary>在超时、参数、授权、审批和结果预算门禁内执行注册工具。</summary>
 public interface IToolExecutor
 {

@@ -161,6 +161,10 @@ dotnet run --project .\src\AiMentor.Api\AiMentor.Api.csproj --urls http://127.0.
 - `GET /api/v1/tool-executions/outcome-unknown?limit=50`：仅 `tool-reconcilers` 组可查看当前租户的结果不确定执行摘要；不返回工具参数、审批内容或执行结果。
 - `POST /api/v1/tool-executions/{executionKey}/probe`：提交候选工具参数；指纹与原调用完全匹配后，只读核验目标状态并返回 `Applied`、`NotApplied` 或 `Indeterminate`。
 - `POST /api/v1/tool-executions/{executionKey}/reviews`：由两名不同的 `tool-reconcilers` 在五分钟证据窗口内依次复核；请求包含候选参数、`confirmed` 和理由。
+- `GET /api/v1/tool-compensations`：查看当前申请人或当前租户审批人可访问的补偿摘要，不返回加密快照和工具参数。
+- `POST /api/v1/tool-compensations/{compensationId}/approval`：为精确绑定正向执行的反向补偿申请独立审批。
+- `POST /api/v1/tool-compensations/{compensationId}/decision`：由不同主体的 `tool-approvers` 批准或拒绝补偿；批准凭据默认 15 分钟失效。
+- `POST /api/v1/tool-compensations/{compensationId}/execute`：携带补偿审批标识和新的 `Idempotency-Key` 执行反向操作；该键与正向键相互独立。
 - `POST /api/v1/agents/runs`：执行受限 Agent 规划闭环；请求体为 `{"input":"当前知识库有多少文档和分块？"}`，返回最终回答、工具步骤、安全决策与轨迹。
 - `POST /api/v1/agents/runs/{runId}/resume`：原调用者在审批裁决后恢复暂停的 Agent；尚未裁决时仍返回 `202 AwaitingApproval`，批准后继续原生函数调用，拒绝或过期则安全终止。
 - 原 V0 接口默认关闭；只有非 Production 环境显式设置 `Api:EnableLegacyV0=true` 才会挂载兼容入口。
@@ -298,7 +302,11 @@ GROUP BY KeyVersion;
 
 `ICompensableServerTool` 已定义正向执行前的补偿快照采集和反向执行契约，注册表会拒绝只读工具声明补偿，也会拒绝补偿工具名为空或与正向工具相同。能力目录按服务器真实实现返回四种结论：只读工具为 `NotApplicable`；显式实现契约的修改工具为 `Compensable`；没有契约的修改工具为 `NotSupported`；目标可能需要人工处置但缺少安全恢复材料时为 `ManualReconciliation`。系统不根据工具名称猜测可逆性，也不提供通用回滚按钮。
 
-当前 `memory.delete` 会返回 `ManualReconciliation / TOOL_COMPENSATION_SOURCE_NOT_RETAINED`。原因是现有记忆存储永久删除密文，没有保留删除前正文、版本、有效期和恢复令牌；因此只能沿用目标探测和双人对账，不能伪造自动恢复。补偿快照可能含敏感旧值，后续只能写入绑定原执行记录的加密补偿账本，禁止进入 API、普通日志或 Trace。`Compensable` 目前只表示服务器契约已具备，不表示补偿执行入口已经开放；实际反向执行仍待增加独立审批、独立幂等键、正反向执行关联和故障恢复状态机。
+当前 `memory.delete` 会返回 `ManualReconciliation / TOOL_COMPENSATION_SOURCE_NOT_RETAINED`。原因是现有记忆存储永久删除密文，没有保留删除前正文、版本、有效期和恢复令牌；因此只能沿用目标探测和双人对账，不能伪造自动恢复。
+
+`memory.correct` 是首个真正可逆的修改工具。它在正向副作用前读取当前用户拥有的记忆，捕获旧值、正向完成后的预期版本和原到期时间，并立即使用带 `compensationId + forwardToolName` 认证上下文的工作流密钥加密。正向执行完成后，`ToolExecutionResult.compensationId` 才会公开；随后必须由原调用者申请独立补偿审批、由不同 `tool-approvers` 裁决，并使用新的反向 `Idempotency-Key` 执行。恢复仍经过记忆工作流的所有权、内容安全和乐观版本门禁：只有目标仍处于本次正向执行产生的版本时才能恢复，期间被其他操作更改时不会覆盖新值。
+
+补偿服务不会回显快照或反向工具输出，审批决定理由只存不可逆摘要。相同反向幂等键完成后只回放结果，不再次恢复；调用进入反向工具后发生超时、异常或写回中断时冻结为 `OutcomeUnknown`，禁止自动重试。当前完整执行闭环仅在 `Workflow:Provider=InMemory` 单实例开发模式启用；`SqlServer` 多实例模式使用显式不可用实现，在耐久迁移落地前会以 `TOOL_COMPENSATION_DURABLE_STORE_UNAVAILABLE` 在正向副作用前失败关闭，绝不静默回退到进程内状态。
 
 数据库访问使用参数化 `SqlCommand`、异步连接和显式事务，接口依据 [Microsoft.Data.SqlClient 官方包说明](https://github.com/dotnet/SqlClient/blob/main/src/Microsoft.Data.SqlClient/src/PackageReadme.md) 核对；审批与租约的一次性语义属于本项目额外实现，不能仅依赖驱动默认行为。
 
@@ -365,7 +373,7 @@ $env:Authentication__GroupsClaim = 'groups'
 
 ## 下一阶段
 
-1. 在已完成的补偿契约和能力门禁上增加加密补偿账本、独立反向审批、独立幂等键及正反向执行关联；先选择一个真正可逆的测试工具贯通，`memory.delete` 在安全快照方案完成前保持人工对账。
+1. 为当前单实例加密补偿闭环增加 SQL Server 耐久状态表、条件租约、密钥轮换和多实例强杀验收；在该迁移完成前 SQL 模式保持失败关闭。`memory.delete` 在安全快照方案完成前继续人工对账。
 2. 增加跨小时故障验收和人工任务队列；工具 `Executing` 精确窗口强杀、多实例并发裁决和滚动回放已通过真实容器验证。
 3. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率、恶意文档隔离率和引用正确率门禁。
 4. 接入真实身份提供方做两个主体的有效 Token 端到端验收，并覆盖密钥轮换、过期 Token、错误 audience、组变更和审批人离职场景。
@@ -373,7 +381,7 @@ $env:Authentication__GroupsClaim = 'groups'
 
 ## 验证状态
 
-- 2026-07-14 本地自动化测试 91/91 通过；新增补偿能力分类、未知工具失败关闭和非法补偿契约注册测试。InMemory 与真实 SQL Server 均验证只有当前实例、当前令牌、未过期租约可以续期，并覆盖等待审批取消、活动工具取消、跨用户拒绝、重复取消、取消与完成竞争及取消后禁止恢复。活动修改工具在心跳观察取消后收到取消令牌，测试确认尚未发生的副作用不会执行。真实 SQL Server LocalDB 执行 `001` 至 `006`，同时验证加密回放、`OutcomeUnknown`、租户隔离、目标探测和双人裁决。Docker 临时 SQL Server 与最多六个并发 API 实例进一步验证精确强杀、租约过期冻结、并发复核单胜者和 `Reconciled` 滚动回放。150 条离线评测决策匹配率 90%、引用召回率 75%，质量门禁通过；NuGet 直接与传递依赖未发现已知漏洞。
+- 2026-07-14 本地自动化测试 97/97 通过；新增加密补偿快照、正向完成后发布、独立审批、职责分离、批准过期、独立幂等回放、补偿结果不确定冻结、真实记忆版本恢复和 SQL 模式失败关闭测试。InMemory 与真实 SQL Server 均验证只有当前实例、当前令牌、未过期租约可以续期，并覆盖等待审批取消、活动工具取消、跨用户拒绝、重复取消、取消与完成竞争及取消后禁止恢复。活动修改工具在心跳观察取消后收到取消令牌，测试确认尚未发生的副作用不会执行。真实 SQL Server LocalDB 执行 `001` 至 `006`，同时验证加密回放、`OutcomeUnknown`、租户隔离、目标探测和双人裁决。Docker 临时 SQL Server 与最多六个并发 API 实例进一步验证精确强杀、租约过期冻结、并发复核单胜者和 `Reconciled` 滚动回放。150 条离线评测决策匹配率 90%、引用召回率 75%，质量门禁通过；NuGet 直接与传递依赖未发现已知漏洞。
 - OpenSearch 请求契约已由自动化测试验证：索引映射、搜索管线、批量摄取，以及 BM25/k-NN 两个分支中的租户和 ACL 过滤。
 - 2026-07-13 尝试拉取 `opensearchproject/opensearch:3.5.0` 做真实容器验收，但镜像仓库连续两次无下载进度并超时，未创建镜像或容器。因此真实集群验收尚未通过，网络恢复后必须重新执行 `docker compose up -d` 和 HTTP 闭环。
 - 2026-07-13 拉取 `mcr.microsoft.com/mssql/server:2022-latest` 在 120 秒内无下载进度并超时；2026-07-14 改用本机 SQL Server LocalDB 完成真实事务测试并通过。容器部署形态仍需在镜像网络恢复后补做启动、健康检查和进程强杀验收，但数据库事务实现已获得真实 SQL 执行证据。

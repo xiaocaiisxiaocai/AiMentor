@@ -46,6 +46,20 @@ public sealed record DecideToolApprovalRequest(
     bool Approved,
     [property: Required, StringLength(500, MinimumLength = 1)] string Reason);
 
+/// <summary>为已确认生效且具备加密快照的正向执行申请独立补偿审批。</summary>
+public sealed record RequestToolCompensationApprovalRequest(
+    [property: Required, StringLength(500, MinimumLength = 1)] string Justification);
+
+/// <summary>由独立审批人裁决一次精确绑定补偿记录的反向操作。</summary>
+public sealed record DecideToolCompensationRequest(
+    [property: Required, StringLength(128, MinimumLength = 1)] string ApprovalId,
+    bool Approved,
+    [property: Required, StringLength(500, MinimumLength = 1)] string Reason);
+
+/// <summary>提交补偿审批标识；独立幂等键只允许通过请求头提供。</summary>
+public sealed record ExecuteToolCompensationRequest(
+    [property: Required, StringLength(128, MinimumLength = 1)] string ApprovalId);
+
 /// <summary>提交与原调用指纹完全匹配的候选参数，用于只读核验目标系统状态。</summary>
 public sealed record ProbeToolOutcomeRequest(
     [property: Required] Dictionary<string, JsonElement> Arguments);

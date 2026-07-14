@@ -154,11 +154,13 @@ builder.Services.AddSingleton<IQueryNormalizer, RuleBasedQueryNormalizer>();
 builder.Services.AddSingleton<IRetrievedContentSafetyService, RuleBasedRetrievedContentSafetyService>();
 builder.Services.AddSingleton(new ToolSafetyOptions
 {
-    AllowedTools = new HashSet<string>(["knowledge.stats", "memory.delete"], StringComparer.OrdinalIgnoreCase)
+    AllowedTools = new HashSet<string>(["knowledge.stats", "memory.delete", "memory.correct"],
+        StringComparer.OrdinalIgnoreCase)
 });
 builder.Services.AddSingleton<IToolInvocationSafetyService, RuleBasedToolInvocationSafetyService>();
 builder.Services.AddSingleton<IServerTool, KnowledgeStatisticsTool>();
 builder.Services.AddSingleton<IServerTool, MemoryDeleteTool>();
+builder.Services.AddSingleton<IServerTool, MemoryCorrectTool>();
 builder.Services.AddSingleton<IToolRegistry, ServerToolRegistry>();
 builder.Services.AddSingleton<IToolCompensationCatalog, ToolCompensationCatalog>();
 builder.Services.AddSingleton(new ToolApprovalOptions());
@@ -167,6 +169,7 @@ builder.Services.AddSingleton<IToolApprovalService>(services =>
         ? ActivatorUtilities.CreateInstance<SqlServerToolApprovalService>(services)
         : ActivatorUtilities.CreateInstance<InMemoryToolApprovalService>(services));
 builder.Services.AddSingleton(new ToolExecutorOptions());
+builder.Services.AddSingleton(new ToolCompensationOptions());
 var barrierSignalPath = builder.Configuration["Testing:ToolExecutionBarrier:SignalPath"];
 var barrierReleasePath = builder.Configuration["Testing:ToolExecutionBarrier:ReleasePath"];
 if (builder.Environment.IsEnvironment("Testing")
@@ -241,12 +244,15 @@ if (string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreC
     });
     builder.Services.AddSingleton<IAgentRunCheckpointStore, SqlServerAgentRunCheckpointStore>();
     builder.Services.AddSingleton<IToolExecutionLedger, SqlServerToolExecutionLedger>();
+    // SQL Server 多实例模式在耐久迁移落地前明确失败关闭，绝不回退到进程内补偿状态。
+    builder.Services.AddSingleton<IToolCompensationService, UnavailableToolCompensationService>();
 }
 else if (string.Equals(workflowProvider, "InMemory", StringComparison.OrdinalIgnoreCase))
 {
     builder.Services.AddSingleton<IAgentRunCheckpointStore>(services =>
         new InMemoryAgentRunCheckpointStore(services.GetRequiredService<TimeProvider>(), 1_000));
     builder.Services.AddSingleton<IToolExecutionLedger, InMemoryToolExecutionLedger>();
+    builder.Services.AddSingleton<IToolCompensationService, InMemoryToolCompensationService>();
 }
 else
 {
@@ -394,6 +400,42 @@ toolApprovals.MapPost("/{approvalId}/decision", DecideToolApprovalAsync)
     .ProducesProblem(StatusCodes.Status403Forbidden)
     .ProducesProblem(StatusCodes.Status404NotFound)
     .ProducesProblem(StatusCodes.Status409Conflict)
+    .RequireRateLimiting("questions");
+
+var toolCompensations = v1.MapGroup("/tool-compensations").WithTags("AiMentor tool compensations v1");
+toolCompensations.MapGet("/", ListToolCompensationsAsync)
+    .WithName("ListToolCompensationsV1")
+    .WithSummary("查看当前申请人或当前租户审批人可访问的补偿摘要")
+    .Produces<IReadOnlyList<ToolCompensationSummary>>()
+    .ProducesProblem(StatusCodes.Status503ServiceUnavailable)
+    .RequireRateLimiting("questions");
+toolCompensations.MapPost("/{compensationId}/approval", RequestToolCompensationApprovalAsync)
+    .WithName("RequestToolCompensationApprovalV1")
+    .WithSummary("为绑定正向执行的补偿操作申请独立短期审批")
+    .Produces<ToolCompensationSummary>(StatusCodes.Status202Accepted)
+    .ProducesValidationProblem()
+    .ProducesProblem(StatusCodes.Status403Forbidden)
+    .ProducesProblem(StatusCodes.Status404NotFound)
+    .ProducesProblem(StatusCodes.Status409Conflict)
+    .RequireRateLimiting("questions");
+toolCompensations.MapPost("/{compensationId}/decision", DecideToolCompensationAsync)
+    .WithName("DecideToolCompensationV1")
+    .WithSummary("由独立工具审批人批准或拒绝精确补偿记录")
+    .Produces<ToolCompensationSummary>()
+    .ProducesValidationProblem()
+    .ProducesProblem(StatusCodes.Status403Forbidden)
+    .ProducesProblem(StatusCodes.Status404NotFound)
+    .ProducesProblem(StatusCodes.Status409Conflict)
+    .RequireRateLimiting("questions");
+toolCompensations.MapPost("/{compensationId}/execute", ExecuteToolCompensationAsync)
+    .WithName("ExecuteToolCompensationV1")
+    .WithSummary("使用独立审批和独立 Idempotency-Key 执行一次反向补偿")
+    .Produces<ToolCompensationExecutionResult>()
+    .ProducesValidationProblem()
+    .ProducesProblem(StatusCodes.Status403Forbidden)
+    .ProducesProblem(StatusCodes.Status404NotFound)
+    .ProducesProblem(StatusCodes.Status409Conflict)
+    .ProducesProblem(StatusCodes.Status503ServiceUnavailable)
     .RequireRateLimiting("questions");
 
 var toolExecutions = v1.MapGroup("/tool-executions").WithTags("AiMentor tool reconciliation v1");
@@ -663,6 +705,83 @@ static IResult ToolApprovalProblem(ToolApprovalException exception, HttpContext 
         _ => StatusCodes.Status500InternalServerError
     };
     return Results.Problem(statusCode: statusCode, title: "工具审批失败", detail: exception.Message,
+        instance: context.Request.Path,
+        extensions: new Dictionary<string, object?> { ["code"] = exception.Code });
+}
+
+static async Task<IResult> ListToolCompensationsAsync(IToolCompensationService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        return Results.Ok(await service.ListAsync(accessProvider.GetAccessContext(context.User), cancellationToken));
+    }
+    catch (ToolCompensationException exception)
+    {
+        return ToolCompensationProblem(exception, context);
+    }
+}
+
+static async Task<IResult> RequestToolCompensationApprovalAsync(string compensationId,
+    RequestToolCompensationApprovalRequest request, IToolCompensationService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        var result = await service.RequestApprovalAsync(compensationId, request.Justification,
+            accessProvider.GetAccessContext(context.User), cancellationToken);
+        return Results.Accepted($"/api/v1/tool-compensations/{result.Id}", result);
+    }
+    catch (ToolCompensationException exception)
+    {
+        return ToolCompensationProblem(exception, context);
+    }
+}
+
+static async Task<IResult> DecideToolCompensationAsync(string compensationId,
+    DecideToolCompensationRequest request, IToolCompensationService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        return Results.Ok(await service.DecideAsync(compensationId, request.ApprovalId, request.Approved,
+            request.Reason, accessProvider.GetAccessContext(context.User), cancellationToken));
+    }
+    catch (ToolCompensationException exception)
+    {
+        return ToolCompensationProblem(exception, context);
+    }
+}
+
+static async Task<IResult> ExecuteToolCompensationAsync(string compensationId,
+    ExecuteToolCompensationRequest request, IToolCompensationService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        var idempotencyKey = context.Request.Headers["Idempotency-Key"].ToString();
+        return Results.Ok(await service.ExecuteAsync(compensationId, request.ApprovalId, idempotencyKey,
+            accessProvider.GetAccessContext(context.User), cancellationToken));
+    }
+    catch (ToolCompensationException exception)
+    {
+        return ToolCompensationProblem(exception, context);
+    }
+}
+
+static IResult ToolCompensationProblem(ToolCompensationException exception, HttpContext context)
+{
+    var statusCode = exception.Kind switch
+    {
+        ToolCompensationErrorKind.Validation => StatusCodes.Status400BadRequest,
+        ToolCompensationErrorKind.Forbidden => StatusCodes.Status403Forbidden,
+        ToolCompensationErrorKind.NotFound => StatusCodes.Status404NotFound,
+        ToolCompensationErrorKind.Conflict => StatusCodes.Status409Conflict,
+        ToolCompensationErrorKind.Capacity or ToolCompensationErrorKind.Unavailable =>
+            StatusCodes.Status503ServiceUnavailable,
+        _ => StatusCodes.Status500InternalServerError
+    };
+    return Results.Problem(statusCode: statusCode, title: "工具补偿请求失败", detail: exception.Message,
         instance: context.Request.Path,
         extensions: new Dictionary<string, object?> { ["code"] = exception.Code });
 }
