@@ -137,7 +137,7 @@ public sealed class SqlServerWorkflowOptions
 /// </summary>
 public sealed class SqlServerAgentRunCheckpointStore(
     SqlServerWorkflowOptions options,
-    IMemoryCipher cipher,
+    IWorkflowStateCipher cipher,
     TimeProvider timeProvider) : IAgentRunCheckpointStore, IDisposable
 {
     private static readonly JsonSerializerOptions SerializerOptions = CreateSerializerOptions();
@@ -159,7 +159,7 @@ public sealed class SqlServerAgentRunCheckpointStore(
             await using var update = connection.CreateCommand();
             update.CommandText = $"""
                 UPDATE dbo.[{TableName}]
-                SET ApprovalId=@approvalId, ExpiresAt=@expiresAt, PayloadCipher=@payload,
+                SET ApprovalId=@approvalId, ExpiresAt=@expiresAt, KeyVersion=@keyVersion, PayloadCipher=@payload,
                     Status=0, LeaseToken=NULL, LeaseOwner=NULL, LeaseExpiresAt=NULL, UpdatedAt=@now
                 WHERE RunId=@runId AND Status=1 AND LeaseToken=@leaseToken;
                 """;
@@ -187,8 +187,8 @@ public sealed class SqlServerAgentRunCheckpointStore(
             insert.Transaction = transaction;
             insert.CommandText = $"""
                 INSERT INTO dbo.[{TableName}]
-                    (RunId,TenantId,SubjectId,ApprovalId,ExpiresAt,PayloadCipher,Status,CreatedAt,UpdatedAt)
-                VALUES (@runId,@tenantId,@subjectId,@approvalId,@expiresAt,@payload,0,@now,@now);
+                    (RunId,TenantId,SubjectId,ApprovalId,ExpiresAt,KeyVersion,PayloadCipher,Status,CreatedAt,UpdatedAt)
+                VALUES (@runId,@tenantId,@subjectId,@approvalId,@expiresAt,@keyVersion,@payload,0,@now,@now);
                 """;
             AddCheckpointParameters(insert, checkpoint, payload);
             await insert.ExecuteNonQueryAsync(cancellationToken);
@@ -215,7 +215,7 @@ public sealed class SqlServerAgentRunCheckpointStore(
         command.CommandText = $"""
             UPDATE dbo.[{TableName}]
             SET Status=1, LeaseToken=@token, LeaseOwner=@owner, LeaseExpiresAt=@leaseExpiresAt, UpdatedAt=@now
-            OUTPUT inserted.PayloadCipher
+            OUTPUT inserted.PayloadCipher,inserted.KeyVersion
             WHERE RunId=@runId AND TenantId=@tenantId AND SubjectId=@subjectId
               AND (Status=0 OR (Status=1 AND LeaseExpiresAt<=@now));
             """;
@@ -226,12 +226,23 @@ public sealed class SqlServerAgentRunCheckpointStore(
         AddString(command, "@owner", 256, leaseOwner);
         AddDateTimeOffset(command, "@leaseExpiresAt", now.Add(leaseDuration));
         AddDateTimeOffset(command, "@now", now);
-        var encrypted = await command.ExecuteScalarAsync(cancellationToken) as string;
+        string? encrypted = null;
+        string? keyVersion = null;
+        await using (var acquiredReader = await command.ExecuteReaderAsync(cancellationToken))
+        {
+            if (await acquiredReader.ReadAsync(cancellationToken))
+            {
+                encrypted = acquiredReader.GetString(0);
+                keyVersion = acquiredReader.IsDBNull(1) ? null : acquiredReader.GetString(1);
+            }
+        }
         if (encrypted is not null)
         {
-            var json = cipher.Unprotect(encrypted, Context(runId));
+            var json = cipher.Unprotect(keyVersion, encrypted, Context(runId));
             var checkpoint = JsonSerializer.Deserialize<AgentRunCheckpoint>(json, SerializerOptions)
                 ?? throw new InvalidOperationException("SQL Server 中的 Agent 检查点载荷无效。");
+            if (cipher.RequiresReencryption(keyVersion))
+                await ReencryptAsync(connection, runId, token, json, cancellationToken);
             return new AgentRunLeaseResult(AgentRunLeaseStatus.Acquired, token, checkpoint);
         }
 
@@ -302,6 +313,7 @@ public sealed class SqlServerAgentRunCheckpointStore(
                         SubjectId nvarchar(256) NOT NULL,
                         ApprovalId nvarchar(128) NOT NULL,
                         ExpiresAt datetimeoffset(7) NOT NULL,
+                        KeyVersion nvarchar(64) NULL,
                         PayloadCipher nvarchar(max) NOT NULL,
                         Status tinyint NOT NULL,
                         LeaseToken nvarchar(64) NULL,
@@ -314,6 +326,11 @@ public sealed class SqlServerAgentRunCheckpointStore(
                     CREATE INDEX IX_{TableName}_OwnerStatus ON dbo.[{TableName}](TenantId,SubjectId,Status);
                     CREATE INDEX IX_{TableName}_LeaseExpiry ON dbo.[{TableName}](Status,LeaseExpiresAt);
                 END;
+                IF COL_LENGTH(N'dbo.{TableName}', N'KeyVersion') IS NULL
+                    ALTER TABLE dbo.[{TableName}] ADD KeyVersion nvarchar(64) NULL;
+                IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.{TableName}')
+                    AND name=N'IX_{TableName}_KeyVersion')
+                    CREATE INDEX IX_{TableName}_KeyVersion ON dbo.[{TableName}](KeyVersion);
                 COMMIT TRANSACTION;
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken);
@@ -332,14 +349,16 @@ public sealed class SqlServerAgentRunCheckpointStore(
         _ = TableName;
     }
 
-    private void AddCheckpointParameters(SqlCommand command, AgentRunCheckpoint checkpoint, string payload)
+    private void AddCheckpointParameters(SqlCommand command, AgentRunCheckpoint checkpoint,
+        ProtectedWorkflowState payload)
     {
         AddString(command, "@runId", 128, checkpoint.RunId);
         AddString(command, "@tenantId", 128, checkpoint.Access.TenantId);
         AddString(command, "@subjectId", 256, checkpoint.Access.SubjectId);
         AddString(command, "@approvalId", 128, checkpoint.ApprovalId);
         AddDateTimeOffset(command, "@expiresAt", checkpoint.ExpiresAt);
-        AddString(command, "@payload", -1, payload);
+        AddString(command, "@keyVersion", 64, payload.KeyVersion);
+        AddString(command, "@payload", -1, payload.Ciphertext);
         AddDateTimeOffset(command, "@now", timeProvider.GetUtcNow());
     }
 
@@ -355,6 +374,26 @@ public sealed class SqlServerAgentRunCheckpointStore(
             ? value : throw new InvalidOperationException("SQL Server 工作流表名无效。");
 
     private static string Context(string runId) => $"agent-run:{runId}";
+
+    private async Task ReencryptAsync(SqlConnection connection, string runId, string leaseToken, string plaintext,
+        CancellationToken cancellationToken)
+    {
+        var updated = cipher.Protect(plaintext, Context(runId));
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            UPDATE dbo.[{TableName}]
+            SET KeyVersion=@keyVersion,PayloadCipher=@payload,UpdatedAt=@now
+            WHERE RunId=@runId AND Status=1 AND LeaseToken=@leaseToken;
+            """;
+        AddString(command, "@keyVersion", 64, updated.KeyVersion);
+        AddString(command, "@payload", -1, updated.Ciphertext);
+        AddDateTimeOffset(command, "@now", timeProvider.GetUtcNow());
+        AddString(command, "@runId", 128, runId);
+        AddString(command, "@leaseToken", 64, leaseToken);
+        if (await command.ExecuteNonQueryAsync(cancellationToken) != 1)
+            throw new AgentRunWorkflowException("AGENT_LEASE_LOST", "Agent 恢复租约在密钥轮换期间失效。",
+                AgentRunWorkflowErrorKind.Conflict);
+    }
 
     private static JsonSerializerOptions CreateSerializerOptions()
     {

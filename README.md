@@ -218,15 +218,37 @@ Invoke-RestMethod http://127.0.0.1:5080/api/v1/tools/memory.delete/execute `
 ```powershell
 $env:AIMENTOR_SQLSERVER_SA_PASSWORD = '<本地强密码>'
 docker compose --profile workflow up -d sqlserver
+docker exec aimentor-sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa `
+  -P $env:AIMENTOR_SQLSERVER_SA_PASSWORD -C -Q "IF DB_ID(N'AiMentor') IS NULL CREATE DATABASE AiMentor"
 
 $env:Workflow__Provider = 'SqlServer'
-$env:ConnectionStrings__WorkflowSqlServer = 'Server=127.0.0.1,1433;Database=master;User ID=sa;Password=<本地强密码>;Encrypt=True;TrustServerCertificate=True'
+$env:ConnectionStrings__WorkflowSqlServer = 'Server=127.0.0.1,1433;Database=AiMentor;User ID=sa;Password=<本地强密码>;Encrypt=True;TrustServerCertificate=True'
 # 生产环境必须从密钥系统提供固定主密钥；不得依赖本地自动生成的 data\memory.key。
 $env:AIMENTOR_MEMORY_ENCRYPTION_KEY = '<至少32字节的Base64密钥>'
 dotnet run --project src\AiMentor.Api
 ```
 
-开发环境 SQL Server 模式会按需创建 `AiMentorToolApprovals` 和 `AiMentorAgentRuns`，并用数据库应用锁避免多个实例同时建表。Production 强制 `Workflow:Provider=SqlServer`、`Encrypt=True`、`TrustServerCertificate=False`，且默认关闭运行时建表；发布账号应先执行 [`deploy\sql\001_workflow.sql`](deploy/sql/001_workflow.sql)，应用账号只授予表级读写权限。
+开发环境 SQL Server 模式会按需创建 `AiMentorToolApprovals` 和 `AiMentorAgentRuns`，并用数据库应用锁避免多个实例同时建表。Production 强制 `Workflow:Provider=SqlServer`、`Encrypt=True`、`TrustServerCertificate=False`，且默认关闭运行时建表；发布账号应依次执行 [`001_workflow.sql`](deploy/sql/001_workflow.sql) 和 [`002_workflow_key_version.sql`](deploy/sql/002_workflow_key_version.sql)，应用账号只授予表级读写权限。
+
+### 工作流密钥轮换
+
+Production 必须配置独立于记忆密钥的工作流密钥环。配置值只能来自密钥管理系统或环境变量，不能提交到仓库：
+
+```powershell
+$env:Workflow__Encryption__ActiveKeyVersion = '2026_07'
+$env:Workflow__Encryption__Keys__2026_01 = '<旧32字节主密钥的Base64>'
+$env:Workflow__Encryption__Keys__2026_07 = '<新32字节主密钥的Base64>'
+```
+
+轮换按“先加、再切、后删”执行：先同时部署旧密钥和新密钥，并把活动版本切到新版本；新检查点立即使用新密钥，旧检查点在获得合法恢复租约并成功解密后在线重加密。确认下列查询中旧版本计数为零，并经过至少一个审批最长有效期后，才能从密钥环删除旧密钥：
+
+```sql
+SELECT KeyVersion, COUNT_BIG(*) AS CheckpointCount
+FROM dbo.AiMentorAgentRuns
+GROUP BY KeyVersion;
+```
+
+`KeyVersion IS NULL` 表示升级前由记忆主密钥加密的兼容记录。迁移期间必须保留 `AIMENTOR_MEMORY_ENCRYPTION_KEY`；这类记录恢复时会转换为活动工作流密钥。未知版本、错误 `runId`、被篡改密文或过早删除旧密钥都会失败关闭。健康检查只公开活动版本名称，不公开任何密钥材料。
 
 数据库访问使用参数化 `SqlCommand`、异步连接和显式事务，接口依据 [Microsoft.Data.SqlClient 官方包说明](https://github.com/dotnet/SqlClient/blob/main/src/Microsoft.Data.SqlClient/src/PackageReadme.md) 核对；审批与租约的一次性语义属于本项目额外实现，不能仅依赖驱动默认行为。
 
@@ -288,7 +310,7 @@ $env:Authentication__GroupsClaim = 'groups'
 
 ## 下一阶段
 
-1. 为 SQL Server 密文增加 `KeyVersion`、密钥轮换和在线重加密，并将自动建表迁移到受版本控制的数据库发布流程。
+1. 在 SQL Server 容器环境完成 API 实例真实强杀、连接中断和滚动部署验收；LocalDB 已验证租约过期接管与在线重加密的数据层语义。
 2. 为跨小时 Workflow 增加取消、补偿、续租和人工任务队列；当前短租约只覆盖短时 Agent 工具审批恢复。
 3. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率、恶意文档隔离率和引用正确率门禁。
 4. 接入真实身份提供方做两个主体的有效 Token 端到端验收，并覆盖密钥轮换、过期 Token、错误 audience、组变更和审批人离职场景。
@@ -296,7 +318,7 @@ $env:Authentication__GroupsClaim = 'groups'
 
 ## 验证状态
 
-- 2026-07-14 本地自动化测试 67/67 通过；Agent 审批覆盖暂停、待决恢复、批准、拒绝、过期、跨用户、容量、并发恢复、跨运行器会话重建、租约接管和重放。真实 SQL Server LocalDB 测试验证了并发审批只消费一次、并发恢复只产生一个租约，以及检查点参数不以明文落库。150 条离线评测决策匹配率 90%、引用召回率 75%，质量门禁通过；NuGet 直接与传递依赖未发现已知漏洞。
+- 2026-07-14 本地自动化测试 69/69 通过；Agent 审批覆盖暂停、待决恢复、批准、拒绝、过期、跨用户、容量、并发恢复、跨运行器会话重建、租约接管和重放。真实 SQL Server LocalDB 测试验证了并发审批只消费一次、崩溃租约到期后由新实例接管、旧密钥检查点在线重加密、仅保留新密钥仍可恢复，以及检查点参数不以明文落库。150 条离线评测决策匹配率 90%、引用召回率 75%，质量门禁通过；NuGet 直接与传递依赖未发现已知漏洞。
 - OpenSearch 请求契约已由自动化测试验证：索引映射、搜索管线、批量摄取，以及 BM25/k-NN 两个分支中的租户和 ACL 过滤。
 - 2026-07-13 尝试拉取 `opensearchproject/opensearch:3.5.0` 做真实容器验收，但镜像仓库连续两次无下载进度并超时，未创建镜像或容器。因此真实集群验收尚未通过，网络恢复后必须重新执行 `docker compose up -d` 和 HTTP 闭环。
 - 2026-07-13 拉取 `mcr.microsoft.com/mssql/server:2022-latest` 在 120 秒内无下载进度并超时；2026-07-14 改用本机 SQL Server LocalDB 完成真实事务测试并通过。容器部署形态仍需在镜像网络恢复后补做启动、健康检查和进程强杀验收，但数据库事务实现已获得真实 SQL 执行证据。

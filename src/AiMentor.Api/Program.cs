@@ -185,7 +185,13 @@ var memoryStorePath = builder.Configuration["Memory:StorePath"]
 var memoryKey = ResolveMemoryMasterKey(
     builder.Configuration["Memory:EncryptionKey"] ?? Environment.GetEnvironmentVariable("AIMENTOR_MEMORY_ENCRYPTION_KEY"),
     Path.Combine(memoryDataDirectory, "memory.key"), builder.Environment.IsProduction());
-builder.Services.AddSingleton<IMemoryCipher>(new AesGcmMemoryCipher(memoryKey));
+var memoryCipher = new AesGcmMemoryCipher(memoryKey);
+builder.Services.AddSingleton<IMemoryCipher>(memoryCipher);
+var workflowKeyVersion = builder.Configuration["Workflow:Encryption:ActiveKeyVersion"] ?? "v1";
+var workflowKeys = ResolveWorkflowKeys(builder.Configuration, workflowKeyVersion, memoryKey,
+    builder.Environment.IsProduction() && string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase));
+builder.Services.AddSingleton<IWorkflowStateCipher>(
+    new AesGcmWorkflowStateCipher(workflowKeyVersion, workflowKeys, memoryCipher));
 if (string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase))
 {
     var connectionString = builder.Configuration.GetConnectionString("WorkflowSqlServer")
@@ -231,7 +237,15 @@ app.MapOpenApi();
 var repository = app.Services.GetRequiredService<IKnowledgeRepository>();
 await repository.InitializeAsync();
 
-app.MapGet("/health", () => Results.Ok(new { status = "healthy", ragProvider, workflowProvider, authenticationMode = authenticationOptions.Mode, knowledge = repository.Statistics }))
+app.MapGet("/health", () => Results.Ok(new
+{
+    status = "healthy",
+    ragProvider,
+    workflowProvider,
+    workflowKeyVersion,
+    authenticationMode = authenticationOptions.Mode,
+    knowledge = repository.Statistics
+}))
     .WithName("Health").WithTags("System").DisableRateLimiting();
 
 var v1 = app.MapGroup("/api/v1").WithTags("AiMentor v1");
@@ -677,4 +691,32 @@ static byte[] ResolveMemoryMasterKey(string? configuredKey, string developmentKe
     var generated = RandomNumberGenerator.GetBytes(32);
     File.WriteAllText(developmentKeyPath, Convert.ToBase64String(generated));
     return generated;
+}
+
+static IReadOnlyDictionary<string, byte[]> ResolveWorkflowKeys(IConfiguration configuration, string activeVersion,
+    byte[] developmentFallback, bool requireConfiguredKeys)
+{
+    var keys = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+    foreach (var child in configuration.GetSection("Workflow:Encryption:Keys").GetChildren())
+    {
+        try
+        {
+            var decoded = Convert.FromBase64String(child.Value?.Trim() ?? string.Empty);
+            if (decoded.Length != 32) throw new FormatException();
+            keys.Add(child.Key, decoded);
+        }
+        catch (FormatException)
+        {
+            throw new InvalidOperationException($"Workflow:Encryption:Keys:{child.Key} 必须是 Base64 编码的 32 字节密钥。");
+        }
+    }
+    if (keys.Count == 0)
+    {
+        if (requireConfiguredKeys)
+            throw new InvalidOperationException("Production SQL Server 模式必须配置独立的 Workflow:Encryption:Keys 密钥环。");
+        keys.Add(activeVersion, developmentFallback);
+    }
+    if (!keys.ContainsKey(activeVersion))
+        throw new InvalidOperationException("Workflow:Encryption:ActiveKeyVersion 必须存在于密钥环中。");
+    return keys;
 }
