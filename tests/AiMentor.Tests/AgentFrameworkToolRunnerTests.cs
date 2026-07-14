@@ -220,6 +220,59 @@ public sealed class AgentFrameworkToolRunnerTests
     }
 
     [Fact]
+    public async Task PersistentCancellationShouldStopActiveMutationAndRemainIdempotent()
+    {
+        var options = new AgentExecutionOptions
+        {
+            MaximumModelIterations = 4,
+            MaximumToolCalls = 3,
+            MaximumCumulativeToolResultBytes = 4_096,
+            MaximumRunTime = TimeSpan.FromSeconds(2),
+            ResumeLeaseDuration = TimeSpan.FromMilliseconds(180),
+            ResumeLeaseRenewalInterval = TimeSpan.FromMilliseconds(40)
+        };
+        var fixture = CreateApprovalRunner(options: options, mutationDelay: TimeSpan.FromMilliseconds(500));
+        var initial = await fixture.Runner.RunAsync(
+            "请删除记忆 memoryId=memory-cancel expectedVersion=1", Access, "agent-active-cancel");
+        await fixture.Approvals.DecideAsync(initial.Approval!.ApprovalId, true, "批准主动取消测试", fixture.Approver);
+        var resumeTask = fixture.Runner.ResumeAsync(initial.RunId, Access);
+        await fixture.Tool.ExecutionStarted.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var cancellation = await fixture.Runner.CancelAsync(initial.RunId, Access, "用户不再需要执行该操作");
+        var repeated = await fixture.Runner.CancelAsync(initial.RunId, Access, "再次确认取消");
+        var result = await resumeTask;
+
+        Assert.Equal(AgentRunCancellationStatus.Requested, cancellation.Status);
+        Assert.Equal(AgentRunCancellationStatus.AlreadyRequested, repeated.Status);
+        Assert.Equal(AgentRunStatus.Cancelled, result.Status);
+        Assert.Equal("AGENT_RUN_CANCELLED", result.Safety.Code);
+        Assert.Equal(0, fixture.Tool.ExecutionCount);
+        var resume = await Assert.ThrowsAsync<AgentRunWorkflowException>(() =>
+            fixture.Runner.ResumeAsync(initial.RunId, Access));
+        Assert.Equal("AGENT_RUN_CANCELLED", resume.Code);
+    }
+
+    [Fact]
+    public async Task PendingCancellationShouldRejectOtherUserAndPreventResume()
+    {
+        var fixture = CreateApprovalRunner();
+        var initial = await fixture.Runner.RunAsync(
+            "请删除记忆 memoryId=memory-pending-cancel expectedVersion=1", Access, "agent-pending-cancel");
+        var other = AccessContext.Create("tenant-a", "user-b", ["readers"]);
+
+        var forbidden = await Assert.ThrowsAsync<AgentRunWorkflowException>(() =>
+            fixture.Runner.CancelAsync(initial.RunId, other, "越权取消"));
+        var cancelled = await fixture.Runner.CancelAsync(initial.RunId, Access, "原调用者取消等待审批");
+        var resume = await Assert.ThrowsAsync<AgentRunWorkflowException>(() =>
+            fixture.Runner.ResumeAsync(initial.RunId, Access));
+
+        Assert.Equal("AGENT_RUN_CANCEL_FORBIDDEN", forbidden.Code);
+        Assert.Equal(AgentRunCancellationStatus.Requested, cancelled.Status);
+        Assert.Equal("AGENT_RUN_CANCELLED", resume.Code);
+        Assert.Equal(0, fixture.Tool.ExecutionCount);
+    }
+
+    [Fact]
     public async Task PendingApprovalCapacityShouldFailClosedBeforeCreatingAnotherPause()
     {
         var fixture = CreateApprovalRunner(maximumPendingRuns: 1);
@@ -322,6 +375,8 @@ public sealed class AgentFrameworkToolRunnerTests
     {
         private int _executionCount;
         public int ExecutionCount => _executionCount;
+        private readonly TaskCompletionSource _executionStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public Task ExecutionStarted => _executionStarted.Task;
         public ToolDescriptor Descriptor { get; } = new("memory.delete", "删除测试记忆。", ToolOperationRisk.Mutation,
             TimeSpan.FromSeconds(1), 2_048, true);
         public SafetyDecision ValidateArguments(JsonElement arguments) =>
@@ -333,6 +388,7 @@ public sealed class AgentFrameworkToolRunnerTests
         {
             _ = context;
             _ = arguments;
+            _executionStarted.TrySetResult();
             if (executionDelay is not null)
                 await Task.Delay(executionDelay.Value, cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
@@ -362,19 +418,26 @@ public sealed class AgentFrameworkToolRunnerTests
             TimeSpan leaseDuration, CancellationToken cancellationToken = default) =>
             inner.TryAcquireAsync(runId, access, leaseOwner, leaseDuration, cancellationToken);
 
-        public async Task<bool> RenewAsync(string runId, string leaseToken, string leaseOwner,
+        public async Task<AgentRunLeaseRenewalStatus> RenewAsync(string runId, string leaseToken, string leaseOwner,
             TimeSpan leaseDuration, CancellationToken cancellationToken = default)
         {
             Interlocked.Increment(ref _renewalCount);
-            return allowRenewal && await inner.RenewAsync(runId, leaseToken, leaseOwner, leaseDuration,
-                cancellationToken);
+            return allowRenewal
+                ? await inner.RenewAsync(runId, leaseToken, leaseOwner, leaseDuration, cancellationToken)
+                : AgentRunLeaseRenewalStatus.LeaseLost;
         }
 
-        public Task ReleaseAsync(string runId, string leaseToken, CancellationToken cancellationToken = default) =>
+        public Task<AgentRunLeaseTransitionStatus> ReleaseAsync(string runId, string leaseToken,
+            CancellationToken cancellationToken = default) =>
             inner.ReleaseAsync(runId, leaseToken, cancellationToken);
 
-        public Task CompleteAsync(string runId, string leaseToken, CancellationToken cancellationToken = default) =>
+        public Task<AgentRunLeaseTransitionStatus> CompleteAsync(string runId, string leaseToken,
+            CancellationToken cancellationToken = default) =>
             inner.CompleteAsync(runId, leaseToken, cancellationToken);
+
+        public Task<AgentRunCancellationResult> RequestCancellationAsync(string runId, AccessContext access,
+            string reasonHash, CancellationToken cancellationToken = default) =>
+            inner.RequestCancellationAsync(runId, access, reasonHash, cancellationToken);
     }
 
 

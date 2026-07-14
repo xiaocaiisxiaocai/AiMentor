@@ -152,7 +152,12 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
             var approval = await _approvalService.GetAsync(checkpoint.ApprovalId, access, cancellationToken);
             if (approval.Status == ToolApprovalStatus.Pending)
             {
-                await _checkpointStore.ReleaseAsync(normalizedRunId, leaseToken, cancellationToken);
+                var release = await _checkpointStore.ReleaseAsync(normalizedRunId, leaseToken, cancellationToken);
+                if (release == AgentRunLeaseTransitionStatus.CancellationRequested)
+                    return await CreateCancelledAsync(normalizedRunId, guard.Steps, trace, cancellationToken);
+                if (release == AgentRunLeaseTransitionStatus.LeaseLost)
+                    throw WorkflowFailure("AGENT_RESUME_LEASE_LOST", "Agent 恢复租约已失效，旧实例停止继续执行。",
+                        AgentRunWorkflowErrorKind.Conflict);
                 return CreateAwaitingResult(checkpoint, approval);
             }
 
@@ -189,27 +194,56 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
                     approval.Status == ToolApprovalStatus.Expired ? "工具审批已过期，Agent 运行终止。" : "工具审批被拒绝，Agent 运行终止。");
                 var result = await CompleteAsync(normalizedRunId, AgentRunStatus.Refused, decision.Message, decision,
                     guard.Steps, trace, cancellationToken);
-                await _checkpointStore.CompleteAsync(normalizedRunId, leaseToken, cancellationToken);
+                var transition = await _checkpointStore.CompleteAsync(normalizedRunId, leaseToken, cancellationToken);
+                if (transition == AgentRunLeaseTransitionStatus.CancellationRequested)
+                    return await CreateCancelledAsync(normalizedRunId, guard.Steps, trace, cancellationToken);
+                if (transition == AgentRunLeaseTransitionStatus.LeaseLost)
+                    throw WorkflowFailure("AGENT_RESUME_LEASE_LOST", "Agent 恢复租约已失效，旧实例停止继续执行。",
+                        AgentRunWorkflowErrorKind.Conflict);
                 return result;
             }
 
             var resumed = await ProcessResponseAsync(normalizedRunId, response, session, runOptions,
                 guard, access, trace, cancellationToken, leaseToken);
             if (resumed.Status != AgentRunStatus.AwaitingApproval)
-                await _checkpointStore.CompleteAsync(normalizedRunId, leaseToken, cancellationToken);
+            {
+                var transition = await _checkpointStore.CompleteAsync(normalizedRunId, leaseToken, cancellationToken);
+                if (transition == AgentRunLeaseTransitionStatus.CancellationRequested)
+                    return await CreateCancelledAsync(normalizedRunId, guard.Steps, trace, cancellationToken);
+                if (transition == AgentRunLeaseTransitionStatus.LeaseLost)
+                    throw WorkflowFailure("AGENT_RESUME_LEASE_LOST", "Agent 恢复租约已失效，旧实例停止继续执行。",
+                        AgentRunWorkflowErrorKind.Conflict);
+            }
             return resumed;
+        }
+        catch (AgentRunCancellationObservedException)
+        {
+            await _checkpointStore.CompleteAsync(normalizedRunId, leaseToken, CancellationToken.None);
+            return await CreateCancelledAsync(normalizedRunId, guard.Steps, trace, CancellationToken.None);
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
         {
             var decision = new SafetyDecision(SafetyAction.Refuse, "AGENT_RESUME_TIMEOUT", "Agent 恢复执行超过服务器总时限。");
             var result = await CompleteAsync(normalizedRunId, AgentRunStatus.LimitExceeded, decision.Message, decision,
                 guard.Steps, trace, CancellationToken.None);
-            await _checkpointStore.CompleteAsync(normalizedRunId, leaseToken, CancellationToken.None);
+            var transition = await _checkpointStore.CompleteAsync(normalizedRunId, leaseToken, CancellationToken.None);
+            if (transition == AgentRunLeaseTransitionStatus.CancellationRequested)
+                return await CreateCancelledAsync(normalizedRunId, guard.Steps, trace, CancellationToken.None);
+            if (transition == AgentRunLeaseTransitionStatus.LeaseLost)
+                throw WorkflowFailure("AGENT_RESUME_LEASE_LOST", "Agent 恢复租约已失效，旧实例停止继续执行。",
+                    AgentRunWorkflowErrorKind.Conflict);
             return result;
+        }
+        catch (AgentRunWorkflowException exception) when (exception.Code == "AGENT_RUN_CANCELLED")
+        {
+            await _checkpointStore.CompleteAsync(normalizedRunId, leaseToken, CancellationToken.None);
+            return await CreateCancelledAsync(normalizedRunId, guard.Steps, trace, CancellationToken.None);
         }
         catch (AgentRunWorkflowException)
         {
-            await _checkpointStore.ReleaseAsync(normalizedRunId, leaseToken, CancellationToken.None);
+            var transition = await _checkpointStore.ReleaseAsync(normalizedRunId, leaseToken, CancellationToken.None);
+            if (transition == AgentRunLeaseTransitionStatus.CancellationRequested)
+                return await CreateCancelledAsync(normalizedRunId, guard.Steps, trace, CancellationToken.None);
             throw;
         }
         catch (Exception exception)
@@ -222,9 +256,40 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
             }));
             var result = await CompleteAsync(normalizedRunId, AgentRunStatus.Failed, decision.Message, decision,
                 guard.Steps, trace, cancellationToken);
-            await _checkpointStore.CompleteAsync(normalizedRunId, leaseToken, CancellationToken.None);
+            var transition = await _checkpointStore.CompleteAsync(normalizedRunId, leaseToken, CancellationToken.None);
+            if (transition == AgentRunLeaseTransitionStatus.CancellationRequested)
+                return await CreateCancelledAsync(normalizedRunId, guard.Steps, trace, CancellationToken.None);
+            if (transition == AgentRunLeaseTransitionStatus.LeaseLost)
+                throw WorkflowFailure("AGENT_RESUME_LEASE_LOST", "Agent 恢复租约已失效，旧实例停止继续执行。",
+                    AgentRunWorkflowErrorKind.Conflict);
             return result;
         }
+    }
+
+    public async Task<AgentRunCancellationResult> CancelAsync(string runId, AccessContext access, string reason,
+        CancellationToken cancellationToken = default)
+    {
+        var normalizedRunId = RequireRunId(runId);
+        var normalizedReason = reason?.Trim() ?? string.Empty;
+        if (normalizedReason.Length is < 1 or > 500)
+            throw WorkflowFailure("AGENT_CANCELLATION_REASON_INVALID", "取消理由长度必须为 1 至 500 个字符。",
+                AgentRunWorkflowErrorKind.Validation);
+        var reasonHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalizedReason)));
+        var result = await _checkpointStore.RequestCancellationAsync(normalizedRunId, access, reasonHash,
+            cancellationToken);
+        if (result.Status == AgentRunCancellationStatus.Forbidden)
+            throw WorkflowFailure("AGENT_RUN_CANCEL_FORBIDDEN", "只有原始调用者可以取消 Agent 运行。",
+                AgentRunWorkflowErrorKind.Forbidden);
+        if (result.Status == AgentRunCancellationStatus.NotFound)
+            throw WorkflowFailure("AGENT_RUN_NOT_FOUND", "没有找到可取消的 Agent 运行。",
+                AgentRunWorkflowErrorKind.NotFound);
+
+        await _traceSink.WriteAsync(normalizedRunId,
+            [Step("agent.cancellation.requested", result.Status.ToString(), new Dictionary<string, object?>
+            {
+                ["status"] = result.Status.ToString()
+            })], cancellationToken);
+        return result;
     }
 
     /// <summary>
@@ -235,22 +300,34 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
     {
         using var heartbeatStop = new CancellationTokenSource();
         using var leaseLost = new CancellationTokenSource();
-        using var operationToken = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, leaseLost.Token);
-        var heartbeat = MaintainLeaseAsync(runId, leaseToken, leaseLost, heartbeatStop.Token);
+        using var cancellationRequested = new CancellationTokenSource();
+        using var operationToken = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken, leaseLost.Token, cancellationRequested.Token);
+        var heartbeat = MaintainLeaseAsync(runId, leaseToken, leaseLost, cancellationRequested,
+            heartbeatStop.Token);
         try
         {
             var result = await operation(operationToken.Token);
+            if (cancellationRequested.IsCancellationRequested)
+                throw new AgentRunCancellationObservedException();
             if (leaseLost.IsCancellationRequested)
                 throw WorkflowFailure("AGENT_RESUME_LEASE_LOST", "Agent 恢复租约已失效，旧实例停止继续执行。",
                     AgentRunWorkflowErrorKind.Conflict);
 
             // 停止心跳前再延长一个完整租期，为保存新暂停点或删除终态预留确定的持久化窗口。
-            var handoffRenewed = await _checkpointStore.RenewAsync(runId, leaseToken, _leaseOwner,
+            var handoff = await _checkpointStore.RenewAsync(runId, leaseToken, _leaseOwner,
                 _options.ResumeLeaseDuration, cancellationToken);
-            if (!handoffRenewed)
+            if (handoff == AgentRunLeaseRenewalStatus.CancellationRequested)
+                throw new AgentRunCancellationObservedException();
+            if (handoff == AgentRunLeaseRenewalStatus.LeaseLost)
                 throw WorkflowFailure("AGENT_RESUME_LEASE_LOST", "Agent 恢复租约已失效，旧实例停止继续执行。",
                     AgentRunWorkflowErrorKind.Conflict);
             return result;
+        }
+        catch (OperationCanceledException) when (cancellationRequested.IsCancellationRequested
+                                                 && !cancellationToken.IsCancellationRequested)
+        {
+            throw new AgentRunCancellationObservedException();
         }
         catch (OperationCanceledException) when (leaseLost.IsCancellationRequested
                                                  && !cancellationToken.IsCancellationRequested)
@@ -267,16 +344,21 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
 
     /// <summary>按配置周期续租；存储拒绝或异常均按租约丢失处理，禁止带病继续运行。</summary>
     private async Task MaintainLeaseAsync(string runId, string leaseToken, CancellationTokenSource leaseLost,
-        CancellationToken stopToken)
+        CancellationTokenSource cancellationRequested, CancellationToken stopToken)
     {
         try
         {
             while (true)
             {
                 await Task.Delay(_options.ResumeLeaseRenewalInterval, stopToken);
-                var renewed = await _checkpointStore.RenewAsync(runId, leaseToken, _leaseOwner,
+                var renewal = await _checkpointStore.RenewAsync(runId, leaseToken, _leaseOwner,
                     _options.ResumeLeaseDuration, stopToken);
-                if (renewed) continue;
+                if (renewal == AgentRunLeaseRenewalStatus.Renewed) continue;
+                if (renewal == AgentRunLeaseRenewalStatus.CancellationRequested)
+                {
+                    await cancellationRequested.CancelAsync();
+                    return;
+                }
                 await leaseLost.CancelAsync();
                 return;
             }
@@ -290,6 +372,15 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
             // 无法确认续租成功时失败关闭；旧实例必须停止，交由租约过期后的新实例接管。
             await leaseLost.CancelAsync();
         }
+    }
+
+    private Task<AgentRunResult> CreateCancelledAsync(string runId, IReadOnlyList<AgentToolStep> toolSteps,
+        List<TraceStep> trace, CancellationToken cancellationToken)
+    {
+        var decision = new SafetyDecision(SafetyAction.Refuse, "AGENT_RUN_CANCELLED", "Agent 运行已按原始调用者请求取消。");
+        trace.Add(Step("agent.cancelled", "cancelled", new Dictionary<string, object?> { ["code"] = decision.Code }));
+        return CompleteAsync(runId, AgentRunStatus.Cancelled, decision.Message, decision, toolSteps.ToList(), trace,
+            cancellationToken);
     }
 
     private async Task<AgentRunResult> ProcessResponseAsync(string runId, AgentResponse response, AgentSession session,
@@ -563,7 +654,11 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
             AgentRunWorkflowErrorKind.Conflict),
         AgentRunLeaseStatus.Expired => WorkflowFailure("AGENT_RUN_EXPIRED", "Agent 运行暂停点已经过期。",
             AgentRunWorkflowErrorKind.Conflict),
+        AgentRunLeaseStatus.Cancelled => WorkflowFailure("AGENT_RUN_CANCELLED", "Agent 运行已经被取消。",
+            AgentRunWorkflowErrorKind.Conflict),
         _ => WorkflowFailure("AGENT_RUN_NOT_FOUND", "没有找到可恢复的 Agent 运行。",
             AgentRunWorkflowErrorKind.NotFound)
     };
+
+    private sealed class AgentRunCancellationObservedException : Exception { }
 }

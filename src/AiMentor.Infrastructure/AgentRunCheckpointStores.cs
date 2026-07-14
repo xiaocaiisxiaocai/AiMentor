@@ -27,6 +27,9 @@ public sealed class InMemoryAgentRunCheckpointStore(TimeProvider timeProvider, i
             Prune(checkpoint.CreatedAt);
             if (_entries.TryGetValue(checkpoint.RunId, out var existing))
             {
+                if (existing.CancelRequestedAt is not null)
+                    throw new AgentRunWorkflowException("AGENT_RUN_CANCELLED", "Agent 运行已经被取消。",
+                        AgentRunWorkflowErrorKind.Conflict);
                 // 二次暂停只能由持有当前租约的恢复者覆盖，防止旧实例篡改新检查点。
                 if (existing.Status != StoredStatus.Leased
                     || string.IsNullOrWhiteSpace(leaseToken)
@@ -59,6 +62,8 @@ public sealed class InMemoryAgentRunCheckpointStore(TimeProvider timeProvider, i
                 return Task.FromResult(new AgentRunLeaseResult(AgentRunLeaseStatus.NotFound));
             if (!SameOwner(entry.Checkpoint.Access, access))
                 return Task.FromResult(new AgentRunLeaseResult(AgentRunLeaseStatus.Forbidden));
+            if (entry.CancelRequestedAt is not null || entry.Status == StoredStatus.Cancelled)
+                return Task.FromResult(new AgentRunLeaseResult(AgentRunLeaseStatus.Cancelled));
             // 审批过期仍需恢复一次，让上层形成明确拒绝并写入终态审计；不能在存储层静默删除。
             if (entry.Status == StoredStatus.Leased && entry.LeaseExpiresAt > now)
                 return Task.FromResult(new AgentRunLeaseResult(AgentRunLeaseStatus.Busy));
@@ -76,7 +81,8 @@ public sealed class InMemoryAgentRunCheckpointStore(TimeProvider timeProvider, i
     }
 
     /// <inheritdoc />
-    public Task<bool> RenewAsync(string runId, string leaseToken, string leaseOwner, TimeSpan leaseDuration,
+    public Task<AgentRunLeaseRenewalStatus> RenewAsync(string runId, string leaseToken, string leaseOwner,
+        TimeSpan leaseDuration,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -86,37 +92,91 @@ public sealed class InMemoryAgentRunCheckpointStore(TimeProvider timeProvider, i
             if (leaseDuration <= TimeSpan.Zero || !_entries.TryGetValue(runId, out var entry)
                 || entry.Status != StoredStatus.Leased || entry.LeaseExpiresAt <= now
                 || !FixedEquals(entry.LeaseToken, leaseToken) || !FixedEquals(entry.LeaseOwner, leaseOwner))
-                return Task.FromResult(false);
+                return Task.FromResult(AgentRunLeaseRenewalStatus.LeaseLost);
+            if (entry.CancelRequestedAt is not null)
+                return Task.FromResult(AgentRunLeaseRenewalStatus.CancellationRequested);
 
             _entries[runId] = entry with { LeaseExpiresAt = now.Add(leaseDuration) };
-            return Task.FromResult(true);
+            return Task.FromResult(AgentRunLeaseRenewalStatus.Renewed);
         }
     }
 
     /// <inheritdoc />
-    public Task ReleaseAsync(string runId, string leaseToken, CancellationToken cancellationToken = default)
+    public Task<AgentRunLeaseTransitionStatus> ReleaseAsync(string runId, string leaseToken,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
-            if (_entries.TryGetValue(runId, out var entry) && entry.Status == StoredStatus.Leased
-                && FixedEquals(entry.LeaseToken, leaseToken))
-                _entries[runId] = new Entry(entry.Checkpoint, StoredStatus.Pending);
+            if (!_entries.TryGetValue(runId, out var entry) || entry.Status != StoredStatus.Leased
+                || !FixedEquals(entry.LeaseToken, leaseToken))
+                return Task.FromResult(AgentRunLeaseTransitionStatus.LeaseLost);
+            if (entry.CancelRequestedAt is not null)
+            {
+                _entries[runId] = entry with
+                {
+                    Status = StoredStatus.Cancelled,
+                    LeaseToken = null,
+                    LeaseOwner = null,
+                    LeaseExpiresAt = null
+                };
+                return Task.FromResult(AgentRunLeaseTransitionStatus.CancellationRequested);
+            }
+            _entries[runId] = new Entry(entry.Checkpoint, StoredStatus.Pending);
+            return Task.FromResult(AgentRunLeaseTransitionStatus.Succeeded);
         }
-        return Task.CompletedTask;
     }
 
     /// <inheritdoc />
-    public Task CompleteAsync(string runId, string leaseToken, CancellationToken cancellationToken = default)
+    public Task<AgentRunLeaseTransitionStatus> CompleteAsync(string runId, string leaseToken,
+        CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
-            if (_entries.TryGetValue(runId, out var entry) && entry.Status == StoredStatus.Leased
-                && FixedEquals(entry.LeaseToken, leaseToken))
-                _entries.Remove(runId);
+            if (!_entries.TryGetValue(runId, out var entry) || entry.Status != StoredStatus.Leased
+                || !FixedEquals(entry.LeaseToken, leaseToken))
+                return Task.FromResult(AgentRunLeaseTransitionStatus.LeaseLost);
+            if (entry.CancelRequestedAt is not null)
+            {
+                _entries[runId] = entry with
+                {
+                    Status = StoredStatus.Cancelled,
+                    LeaseToken = null,
+                    LeaseOwner = null,
+                    LeaseExpiresAt = null
+                };
+                return Task.FromResult(AgentRunLeaseTransitionStatus.CancellationRequested);
+            }
+            _entries.Remove(runId);
+            return Task.FromResult(AgentRunLeaseTransitionStatus.Succeeded);
         }
-        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    public Task<AgentRunCancellationResult> RequestCancellationAsync(string runId, AccessContext access,
+        string reasonHash, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_gate)
+        {
+            if (!_entries.TryGetValue(runId, out var entry))
+                return Task.FromResult(new AgentRunCancellationResult(runId, AgentRunCancellationStatus.NotFound, null));
+            if (!SameOwner(entry.Checkpoint.Access, access))
+                return Task.FromResult(new AgentRunCancellationResult(runId, AgentRunCancellationStatus.Forbidden, null));
+            if (entry.CancelRequestedAt is not null)
+                return Task.FromResult(new AgentRunCancellationResult(runId,
+                    AgentRunCancellationStatus.AlreadyRequested, entry.CancelRequestedAt));
+
+            var now = timeProvider.GetUtcNow();
+            _entries[runId] = entry with
+            {
+                Status = entry.Status == StoredStatus.Pending ? StoredStatus.Cancelled : entry.Status,
+                CancelRequestedAt = now,
+                CancellationReasonHash = reasonHash
+            };
+            return Task.FromResult(new AgentRunCancellationResult(runId, AgentRunCancellationStatus.Requested, now));
+        }
     }
 
     private void Prune(DateTimeOffset now)
@@ -134,10 +194,11 @@ public sealed class InMemoryAgentRunCheckpointStore(TimeProvider timeProvider, i
         && System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
             System.Text.Encoding.UTF8.GetBytes(left), System.Text.Encoding.UTF8.GetBytes(right));
 
-    private enum StoredStatus { Pending, Leased }
+    private enum StoredStatus { Pending, Leased, Cancelled }
 
     private sealed record Entry(AgentRunCheckpoint Checkpoint, StoredStatus Status,
-        string? LeaseToken = null, string? LeaseOwner = null, DateTimeOffset? LeaseExpiresAt = null);
+        string? LeaseToken = null, string? LeaseOwner = null, DateTimeOffset? LeaseExpiresAt = null,
+        DateTimeOffset? CancelRequestedAt = null, string? CancellationReasonHash = null);
 }
 
 /// <summary>配置 SQL Server 工作流连接、表名和检查点容量。</summary>
@@ -179,13 +240,25 @@ public sealed class SqlServerAgentRunCheckpointStore(
                 UPDATE dbo.[{TableName}]
                 SET ApprovalId=@approvalId, ExpiresAt=@expiresAt, KeyVersion=@keyVersion, PayloadCipher=@payload,
                     Status=0, LeaseToken=NULL, LeaseOwner=NULL, LeaseExpiresAt=NULL, UpdatedAt=@now
-                WHERE RunId=@runId AND Status=1 AND LeaseToken=@leaseToken;
+                WHERE RunId=@runId AND Status=1 AND LeaseToken=@leaseToken AND CancelRequestedAt IS NULL;
                 """;
             AddCheckpointParameters(update, checkpoint, payload);
             AddString(update, "@leaseToken", 64, leaseToken);
             if (await update.ExecuteNonQueryAsync(cancellationToken) != 1)
+            {
+                await using var inspectCancellation = connection.CreateCommand();
+                inspectCancellation.CommandText = $"""
+                    SELECT CancelRequestedAt FROM dbo.[{TableName}]
+                    WHERE RunId=@runId AND Status=1 AND LeaseToken=@leaseToken;
+                    """;
+                AddString(inspectCancellation, "@runId", 128, checkpoint.RunId);
+                AddString(inspectCancellation, "@leaseToken", 64, leaseToken);
+                if (await inspectCancellation.ExecuteScalarAsync(cancellationToken) is DateTimeOffset)
+                    throw new AgentRunWorkflowException("AGENT_RUN_CANCELLED", "Agent 运行已经被取消。",
+                        AgentRunWorkflowErrorKind.Conflict);
                 throw new AgentRunWorkflowException("AGENT_CHECKPOINT_CONFLICT", "Agent 暂停点租约不匹配。",
                     AgentRunWorkflowErrorKind.Conflict);
+            }
             return;
         }
 
@@ -193,6 +266,13 @@ public sealed class SqlServerAgentRunCheckpointStore(
             cancellationToken);
         try
         {
+            // 已取消运行保留到原检查点过期，之后在容量事务内清理，避免取消墓碑永久占用配额。
+            await using var prune = connection.CreateCommand();
+            prune.Transaction = transaction;
+            prune.CommandText = $"DELETE FROM dbo.[{TableName}] WHERE Status=2 AND ExpiresAt<=@now;";
+            AddDateTimeOffset(prune, "@now", timeProvider.GetUtcNow());
+            await prune.ExecuteNonQueryAsync(cancellationToken);
+
             await using var count = connection.CreateCommand();
             count.Transaction = transaction;
             count.CommandText = $"SELECT COUNT_BIG(1) FROM dbo.[{TableName}] WITH (UPDLOCK,HOLDLOCK);";
@@ -235,6 +315,7 @@ public sealed class SqlServerAgentRunCheckpointStore(
             SET Status=1, LeaseToken=@token, LeaseOwner=@owner, LeaseExpiresAt=@leaseExpiresAt, UpdatedAt=@now
             OUTPUT inserted.PayloadCipher,inserted.KeyVersion
             WHERE RunId=@runId AND TenantId=@tenantId AND SubjectId=@subjectId
+              AND CancelRequestedAt IS NULL
               AND (Status=0 OR (Status=1 AND LeaseExpiresAt<=@now));
             """;
         AddString(command, "@runId", 128, runId);
@@ -265,7 +346,7 @@ public sealed class SqlServerAgentRunCheckpointStore(
         }
 
         await using var inspect = connection.CreateCommand();
-        inspect.CommandText = $"SELECT TenantId,SubjectId,Status FROM dbo.[{TableName}] WHERE RunId=@runId;";
+        inspect.CommandText = $"SELECT TenantId,SubjectId,Status,CancelRequestedAt FROM dbo.[{TableName}] WHERE RunId=@runId;";
         AddString(inspect, "@runId", 128, runId);
         await using var reader = await inspect.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken))
@@ -273,14 +354,17 @@ public sealed class SqlServerAgentRunCheckpointStore(
         if (!string.Equals(reader.GetString(0), access.TenantId, StringComparison.Ordinal)
             || !string.Equals(reader.GetString(1), access.SubjectId, StringComparison.Ordinal))
             return new AgentRunLeaseResult(AgentRunLeaseStatus.Forbidden);
+        if (!reader.IsDBNull(3) || reader.GetByte(2) == 2)
+            return new AgentRunLeaseResult(AgentRunLeaseStatus.Cancelled);
         return new AgentRunLeaseResult(AgentRunLeaseStatus.Busy);
     }
 
     /// <inheritdoc />
-    public async Task<bool> RenewAsync(string runId, string leaseToken, string leaseOwner, TimeSpan leaseDuration,
+    public async Task<AgentRunLeaseRenewalStatus> RenewAsync(string runId, string leaseToken, string leaseOwner,
+        TimeSpan leaseDuration,
         CancellationToken cancellationToken = default)
     {
-        if (leaseDuration <= TimeSpan.Zero) return false;
+        if (leaseDuration <= TimeSpan.Zero) return AgentRunLeaseRenewalStatus.LeaseLost;
         await EnsureInitializedAsync(cancellationToken);
         var now = timeProvider.GetUtcNow();
         await using var connection = new SqlConnection(options.ConnectionString);
@@ -290,25 +374,41 @@ public sealed class SqlServerAgentRunCheckpointStore(
             UPDATE dbo.[{TableName}]
             SET LeaseExpiresAt=@leaseExpiresAt,UpdatedAt=@now
             WHERE RunId=@runId AND Status=1 AND LeaseToken=@leaseToken AND LeaseOwner=@leaseOwner
-              AND LeaseExpiresAt>@now;
+              AND LeaseExpiresAt>@now AND CancelRequestedAt IS NULL;
             """;
         AddString(command, "@runId", 128, runId);
         AddString(command, "@leaseToken", 64, leaseToken);
         AddString(command, "@leaseOwner", 256, leaseOwner);
         AddDateTimeOffset(command, "@leaseExpiresAt", now.Add(leaseDuration));
         AddDateTimeOffset(command, "@now", now);
-        return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
+        if (await command.ExecuteNonQueryAsync(cancellationToken) == 1)
+            return AgentRunLeaseRenewalStatus.Renewed;
+
+        await using var inspect = connection.CreateCommand();
+        inspect.CommandText = $"""
+            SELECT CancelRequestedAt FROM dbo.[{TableName}]
+            WHERE RunId=@runId AND Status=1 AND LeaseToken=@leaseToken AND LeaseOwner=@leaseOwner;
+            """;
+        AddString(inspect, "@runId", 128, runId);
+        AddString(inspect, "@leaseToken", 64, leaseToken);
+        AddString(inspect, "@leaseOwner", 256, leaseOwner);
+        var cancellation = await inspect.ExecuteScalarAsync(cancellationToken);
+        return cancellation is DateTimeOffset
+            ? AgentRunLeaseRenewalStatus.CancellationRequested
+            : AgentRunLeaseRenewalStatus.LeaseLost;
     }
 
     /// <inheritdoc />
-    public Task ReleaseAsync(string runId, string leaseToken, CancellationToken cancellationToken = default) =>
+    public Task<AgentRunLeaseTransitionStatus> ReleaseAsync(string runId, string leaseToken,
+        CancellationToken cancellationToken = default) =>
         ChangeLeaseAsync(runId, leaseToken, false, cancellationToken);
 
     /// <inheritdoc />
-    public Task CompleteAsync(string runId, string leaseToken, CancellationToken cancellationToken = default) =>
+    public Task<AgentRunLeaseTransitionStatus> CompleteAsync(string runId, string leaseToken,
+        CancellationToken cancellationToken = default) =>
         ChangeLeaseAsync(runId, leaseToken, true, cancellationToken);
 
-    private async Task ChangeLeaseAsync(string runId, string leaseToken, bool delete,
+    private async Task<AgentRunLeaseTransitionStatus> ChangeLeaseAsync(string runId, string leaseToken, bool delete,
         CancellationToken cancellationToken)
     {
         await EnsureInitializedAsync(cancellationToken);
@@ -316,12 +416,94 @@ public sealed class SqlServerAgentRunCheckpointStore(
         await connection.OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
         command.CommandText = delete
-            ? $"DELETE FROM dbo.[{TableName}] WHERE RunId=@runId AND Status=1 AND LeaseToken=@leaseToken;"
-            : $"UPDATE dbo.[{TableName}] SET Status=0,LeaseToken=NULL,LeaseOwner=NULL,LeaseExpiresAt=NULL,UpdatedAt=@now WHERE RunId=@runId AND Status=1 AND LeaseToken=@leaseToken;";
+            ? $"DELETE FROM dbo.[{TableName}] WHERE RunId=@runId AND Status=1 AND LeaseToken=@leaseToken AND CancelRequestedAt IS NULL;"
+            : $"UPDATE dbo.[{TableName}] SET Status=0,LeaseToken=NULL,LeaseOwner=NULL,LeaseExpiresAt=NULL,UpdatedAt=@now WHERE RunId=@runId AND Status=1 AND LeaseToken=@leaseToken AND CancelRequestedAt IS NULL;";
         AddString(command, "@runId", 128, runId);
         AddString(command, "@leaseToken", 64, leaseToken);
         if (!delete) AddDateTimeOffset(command, "@now", timeProvider.GetUtcNow());
-        await command.ExecuteNonQueryAsync(cancellationToken);
+        if (await command.ExecuteNonQueryAsync(cancellationToken) == 1)
+            return AgentRunLeaseTransitionStatus.Succeeded;
+
+        await using var cancel = connection.CreateCommand();
+        cancel.CommandText = $"""
+            UPDATE dbo.[{TableName}]
+            SET Status=2,LeaseToken=NULL,LeaseOwner=NULL,LeaseExpiresAt=NULL,UpdatedAt=@now
+            WHERE RunId=@runId AND Status=1 AND LeaseToken=@leaseToken AND CancelRequestedAt IS NOT NULL;
+            """;
+        AddString(cancel, "@runId", 128, runId);
+        AddString(cancel, "@leaseToken", 64, leaseToken);
+        AddDateTimeOffset(cancel, "@now", timeProvider.GetUtcNow());
+        return await cancel.ExecuteNonQueryAsync(cancellationToken) == 1
+            ? AgentRunLeaseTransitionStatus.CancellationRequested
+            : AgentRunLeaseTransitionStatus.LeaseLost;
+    }
+
+    /// <inheritdoc />
+    public async Task<AgentRunCancellationResult> RequestCancellationAsync(string runId, AccessContext access,
+        string reasonHash, CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken);
+        var now = timeProvider.GetUtcNow();
+        await using var connection = new SqlConnection(options.ConnectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.Serializable,
+            cancellationToken);
+        await using var inspect = connection.CreateCommand();
+        inspect.Transaction = transaction;
+        inspect.CommandText = $"""
+            SELECT TenantId,SubjectId,Status,CancelRequestedAt
+            FROM dbo.[{TableName}] WITH (UPDLOCK,HOLDLOCK) WHERE RunId=@runId;
+            """;
+        AddString(inspect, "@runId", 128, runId);
+        string? tenantId = null;
+        string? subjectId = null;
+        byte status = 0;
+        DateTimeOffset? requestedAt = null;
+        await using (var reader = await inspect.ExecuteReaderAsync(cancellationToken))
+        {
+            if (await reader.ReadAsync(cancellationToken))
+            {
+                tenantId = reader.GetString(0);
+                subjectId = reader.GetString(1);
+                status = reader.GetByte(2);
+                requestedAt = reader.IsDBNull(3) ? null : reader.GetDateTimeOffset(3);
+            }
+        }
+        if (tenantId is null)
+        {
+            await transaction.CommitAsync(cancellationToken);
+            return new AgentRunCancellationResult(runId, AgentRunCancellationStatus.NotFound, null);
+        }
+        if (!string.Equals(tenantId, access.TenantId, StringComparison.Ordinal)
+            || !string.Equals(subjectId, access.SubjectId, StringComparison.Ordinal))
+        {
+            await transaction.CommitAsync(cancellationToken);
+            return new AgentRunCancellationResult(runId, AgentRunCancellationStatus.Forbidden, null);
+        }
+        if (requestedAt is not null || status == 2)
+        {
+            await transaction.CommitAsync(cancellationToken);
+            return new AgentRunCancellationResult(runId, AgentRunCancellationStatus.AlreadyRequested, requestedAt);
+        }
+
+        await using var update = connection.CreateCommand();
+        update.Transaction = transaction;
+        update.CommandText = $"""
+            UPDATE dbo.[{TableName}]
+            SET CancelRequestedAt=@now,CancellationReasonHash=@reasonHash,
+                Status=CASE WHEN Status=0 THEN 2 ELSE Status END,
+                LeaseToken=CASE WHEN Status=0 THEN NULL ELSE LeaseToken END,
+                LeaseOwner=CASE WHEN Status=0 THEN NULL ELSE LeaseOwner END,
+                LeaseExpiresAt=CASE WHEN Status=0 THEN NULL ELSE LeaseExpiresAt END,
+                UpdatedAt=@now
+            WHERE RunId=@runId AND CancelRequestedAt IS NULL;
+            """;
+        AddString(update, "@runId", 128, runId);
+        AddAnsiString(update, "@reasonHash", 64, reasonHash);
+        AddDateTimeOffset(update, "@now", now);
+        await update.ExecuteNonQueryAsync(cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+        return new AgentRunCancellationResult(runId, AgentRunCancellationStatus.Requested, now);
     }
 
     private async Task EnsureInitializedAsync(CancellationToken cancellationToken)
@@ -361,6 +543,8 @@ public sealed class SqlServerAgentRunCheckpointStore(
                         LeaseToken nvarchar(64) NULL,
                         LeaseOwner nvarchar(256) NULL,
                         LeaseExpiresAt datetimeoffset(7) NULL,
+                        CancelRequestedAt datetimeoffset(7) NULL,
+                        CancellationReasonHash char(64) NULL,
                         CreatedAt datetimeoffset(7) NOT NULL,
                         UpdatedAt datetimeoffset(7) NOT NULL,
                         RowVersion rowversion NOT NULL
@@ -370,9 +554,17 @@ public sealed class SqlServerAgentRunCheckpointStore(
                 END;
                 IF COL_LENGTH(N'dbo.{TableName}', N'KeyVersion') IS NULL
                     ALTER TABLE dbo.[{TableName}] ADD KeyVersion nvarchar(64) NULL;
+                IF COL_LENGTH(N'dbo.{TableName}', N'CancelRequestedAt') IS NULL
+                    ALTER TABLE dbo.[{TableName}] ADD CancelRequestedAt datetimeoffset(7) NULL;
+                IF COL_LENGTH(N'dbo.{TableName}', N'CancellationReasonHash') IS NULL
+                    ALTER TABLE dbo.[{TableName}] ADD CancellationReasonHash char(64) NULL;
                 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.{TableName}')
                     AND name=N'IX_{TableName}_KeyVersion')
                     CREATE INDEX IX_{TableName}_KeyVersion ON dbo.[{TableName}](KeyVersion);
+                IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.{TableName}')
+                    AND name=N'IX_{TableName}_Cancellation')
+                    CREATE INDEX IX_{TableName}_Cancellation ON dbo.[{TableName}](Status,CancelRequestedAt)
+                        INCLUDE (TenantId,SubjectId);
                 COMMIT TRANSACTION;
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken);
@@ -406,6 +598,9 @@ public sealed class SqlServerAgentRunCheckpointStore(
 
     private static void AddString(SqlCommand command, string name, int size, string value) =>
         command.Parameters.Add(name, SqlDbType.NVarChar, size).Value = value;
+
+    private static void AddAnsiString(SqlCommand command, string name, int size, string value) =>
+        command.Parameters.Add(name, SqlDbType.Char, size).Value = value;
 
     private static void AddDateTimeOffset(SqlCommand command, string name, DateTimeOffset value) =>
         command.Parameters.Add(name, SqlDbType.DateTimeOffset).Value = value;

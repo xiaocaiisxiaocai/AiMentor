@@ -30,7 +30,7 @@ public sealed record ToolExecutionResult(
     IReadOnlyList<TraceStep> Trace);
 
 /// <summary>区分正常完成、等待人工审批、安全拒绝、预算终止和系统失败。</summary>
-public enum AgentRunStatus { Completed, AwaitingApproval, Refused, LimitExceeded, Failed }
+public enum AgentRunStatus { Completed, AwaitingApproval, Refused, LimitExceeded, Failed, Cancelled }
 
 /// <summary>记录一次真实工具执行的序号、结果大小和独立运行标识。</summary>
 public sealed record AgentToolStep(

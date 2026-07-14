@@ -36,6 +36,7 @@ public sealed class SqlServerWorkflowIntegrationTests
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "003_tool_execution_ledger.sql"));
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "004_tool_execution_reconciliation.sql"));
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "005_tool_reconciliation_reviews.sql"));
+            await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "006_agent_run_cancellation.sql"));
             var clock = new MutableTimeProvider(new DateTimeOffset(2026, 7, 14, 1, 0, 0, TimeSpan.Zero));
             var trace = new InMemoryTraceSink();
             var tool = new MutationTool();
@@ -152,13 +153,31 @@ public sealed class SqlServerWorkflowIntegrationTests
                 TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
             var rawExecutionResult = await ReadExecutionResultAsync(testConnection, completedKey);
 
+            var cancellationCheckpoint = CreateCheckpoint(requester, arguments, clock.GetUtcNow()) with
+            {
+                RunId = "sql-run-cancel"
+            };
+            await checkpoints.SavePendingAsync(cancellationCheckpoint);
+            var cancellationLease = await checkpoints.TryAcquireAsync(cancellationCheckpoint.RunId, requester,
+                "node-cancel", TimeSpan.FromSeconds(30));
+            var forbiddenCancellation = await checkpoints.RequestCancellationAsync(cancellationCheckpoint.RunId,
+                AccessContext.Create("tenant-a", "other-user", ["readers"]), new string('E', 64));
+            var requestedCancellation = await checkpoints.RequestCancellationAsync(cancellationCheckpoint.RunId,
+                requester, new string('F', 64));
+            var cancellationRenewal = await checkpoints.RenewAsync(cancellationCheckpoint.RunId,
+                cancellationLease.LeaseToken!, "node-cancel", TimeSpan.FromSeconds(30));
+            var cancellationCompletion = await checkpoints.CompleteAsync(cancellationCheckpoint.RunId,
+                cancellationLease.LeaseToken!);
+            var cancelledResume = await checkpoints.TryAcquireAsync(cancellationCheckpoint.RunId, requester,
+                "node-after-cancel", TimeSpan.FromSeconds(30));
+
             Assert.Single(consumptions, result => result.Allowed);
             Assert.Single(consumptions, result => result.Decision.Code == "TOOL_APPROVAL_ALREADY_CONSUMED");
             Assert.Single(leases, result => result.Status == AgentRunLeaseStatus.Acquired);
             Assert.Single(leases, result => result.Status == AgentRunLeaseStatus.Busy);
             Assert.NotNull(crashedLease.LeaseToken);
-            Assert.False(wrongRenewal);
-            Assert.True(renewed);
+            Assert.Equal(AgentRunLeaseRenewalStatus.LeaseLost, wrongRenewal);
+            Assert.Equal(AgentRunLeaseRenewalStatus.Renewed, renewed);
             Assert.Equal(AgentRunLeaseStatus.Busy, protectedByRenewal.Status);
             Assert.Equal("v1", beforeRotation.KeyVersion);
             Assert.Equal(AgentRunLeaseStatus.Acquired, takeover.Status);
@@ -179,6 +198,11 @@ public sealed class SqlServerWorkflowIntegrationTests
             Assert.Equal("tool-run-3", replay.ReplayResult!.RunId);
             Assert.Single(replay.ReplayResult.Trace);
             Assert.DoesNotContain("sensitive-result", rawExecutionResult, StringComparison.Ordinal);
+            Assert.Equal(AgentRunCancellationStatus.Forbidden, forbiddenCancellation.Status);
+            Assert.Equal(AgentRunCancellationStatus.Requested, requestedCancellation.Status);
+            Assert.Equal(AgentRunLeaseRenewalStatus.CancellationRequested, cancellationRenewal);
+            Assert.Equal(AgentRunLeaseTransitionStatus.CancellationRequested, cancellationCompletion);
+            Assert.Equal(AgentRunLeaseStatus.Cancelled, cancelledResume.Status);
         }
         finally
         {

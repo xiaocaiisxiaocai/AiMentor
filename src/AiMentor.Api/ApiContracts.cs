@@ -59,3 +59,7 @@ public sealed record ReviewToolOutcomeRequest(
 /// <summary>提交给受限 Agent 的自然语言目标。</summary>
 public sealed record RunAgentRequest(
     [property: Required, StringLength(4_000, MinimumLength = 1)] string Input);
+
+/// <summary>请求取消等待审批或正在恢复的 Agent 运行；理由只以摘要形式持久化。</summary>
+public sealed record CancelAgentRunRequest(
+    [property: Required, StringLength(500, MinimumLength = 1)] string Reason);

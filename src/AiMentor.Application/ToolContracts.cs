@@ -179,6 +179,8 @@ public interface IAgentRunner
         CancellationToken cancellationToken = default);
     Task<AgentRunResult> ResumeAsync(string runId, AccessContext access,
         CancellationToken cancellationToken = default);
+    Task<AgentRunCancellationResult> CancelAsync(string runId, AccessContext access, string reason,
+        CancellationToken cancellationToken = default);
 }
 
 /// <summary>配置模型迭代、工具次数、结果大小和总运行时预算。</summary>
@@ -219,7 +221,22 @@ public sealed record AgentRunLeaseResult(
     AgentRunCheckpoint? Checkpoint = null);
 
 /// <summary>区分恢复租约成功、越权、忙碌、过期和不存在。</summary>
-public enum AgentRunLeaseStatus { Acquired, Forbidden, Busy, Expired, NotFound }
+public enum AgentRunLeaseStatus { Acquired, Forbidden, Busy, Expired, Cancelled, NotFound }
+
+/// <summary>区分租约成功续期、持久化取消已经生效和租约已被其他实例接管。</summary>
+public enum AgentRunLeaseRenewalStatus { Renewed, CancellationRequested, LeaseLost }
+
+/// <summary>区分释放或完成成功、取消抢先落库和当前实例已经丢失租约。</summary>
+public enum AgentRunLeaseTransitionStatus { Succeeded, CancellationRequested, LeaseLost }
+
+/// <summary>区分首次取消、幂等重复取消、越权取消和运行不存在。</summary>
+public enum AgentRunCancellationStatus { Requested, AlreadyRequested, Forbidden, NotFound }
+
+/// <summary>返回不含取消理由原文的持久化取消状态和请求时间。</summary>
+public sealed record AgentRunCancellationResult(
+    string RunId,
+    AgentRunCancellationStatus Status,
+    DateTimeOffset? RequestedAt);
 
 /// <summary>为暂停运行提供可替换的持久化存储，并通过短租约阻止多实例重复恢复。</summary>
 public interface IAgentRunCheckpointStore
@@ -228,10 +245,15 @@ public interface IAgentRunCheckpointStore
         CancellationToken cancellationToken = default);
     Task<AgentRunLeaseResult> TryAcquireAsync(string runId, AccessContext access, string leaseOwner,
         TimeSpan leaseDuration, CancellationToken cancellationToken = default);
-    Task<bool> RenewAsync(string runId, string leaseToken, string leaseOwner, TimeSpan leaseDuration,
+    Task<AgentRunLeaseRenewalStatus> RenewAsync(string runId, string leaseToken, string leaseOwner,
+        TimeSpan leaseDuration,
         CancellationToken cancellationToken = default);
-    Task ReleaseAsync(string runId, string leaseToken, CancellationToken cancellationToken = default);
-    Task CompleteAsync(string runId, string leaseToken, CancellationToken cancellationToken = default);
+    Task<AgentRunLeaseTransitionStatus> ReleaseAsync(string runId, string leaseToken,
+        CancellationToken cancellationToken = default);
+    Task<AgentRunLeaseTransitionStatus> CompleteAsync(string runId, string leaseToken,
+        CancellationToken cancellationToken = default);
+    Task<AgentRunCancellationResult> RequestCancellationAsync(string runId, AccessContext access,
+        string reasonHash, CancellationToken cancellationToken = default);
 }
 
 /// <summary>区分 Agent 暂停运行恢复时的输入、权限、资源和状态错误。</summary>

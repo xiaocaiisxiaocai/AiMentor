@@ -429,6 +429,14 @@ agents.MapPost("/runs/{runId}/resume", ResumeAgentAsync)
     .ProducesProblem(StatusCodes.Status404NotFound)
     .ProducesProblem(StatusCodes.Status409Conflict)
     .RequireRateLimiting("questions");
+agents.MapPost("/runs/{runId}/cancel", CancelAgentRunAsync)
+    .WithName("CancelAgentRunV1")
+    .WithSummary("由原始调用者持久化取消等待审批或正在恢复的 Agent 运行")
+    .Produces<AgentRunCancellationResult>(StatusCodes.Status202Accepted)
+    .ProducesValidationProblem()
+    .ProducesProblem(StatusCodes.Status403Forbidden)
+    .ProducesProblem(StatusCodes.Status404NotFound)
+    .RequireRateLimiting("questions");
 
 // V0 仅用于短期迁移，默认关闭，Production 环境禁止启用。
 if (enableLegacyV0)
@@ -745,12 +753,29 @@ static async Task<IResult> ResumeAgentAsync(string runId, IAgentRunner runner,
     }
 }
 
+static async Task<IResult> CancelAgentRunAsync(string runId, CancelAgentRunRequest request, IAgentRunner runner,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        var result = await runner.CancelAsync(runId, accessProvider.GetAccessContext(context.User), request.Reason,
+            cancellationToken);
+        return Results.Json(result, statusCode: result.Status == AgentRunCancellationStatus.Requested
+            ? StatusCodes.Status202Accepted : StatusCodes.Status200OK);
+    }
+    catch (AgentRunWorkflowException exception)
+    {
+        return AgentRunProblem(exception, context);
+    }
+}
+
 static IResult AgentRunResultResponse(AgentRunResult result)
 {
     var statusCode = result.Status switch
     {
         AgentRunStatus.Completed => StatusCodes.Status200OK,
         AgentRunStatus.AwaitingApproval => StatusCodes.Status202Accepted,
+        AgentRunStatus.Cancelled => StatusCodes.Status200OK,
         AgentRunStatus.Refused => StatusCodes.Status403Forbidden,
         AgentRunStatus.LimitExceeded => StatusCodes.Status422UnprocessableEntity,
         _ => StatusCodes.Status503ServiceUnavailable

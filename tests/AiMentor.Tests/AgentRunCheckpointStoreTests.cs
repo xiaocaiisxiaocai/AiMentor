@@ -35,9 +35,9 @@ public sealed class AgentRunCheckpointStoreTests
         Assert.Equal(AgentRunLeaseStatus.Acquired, first.Status);
         Assert.Equal(AgentRunLeaseStatus.Busy, busy.Status);
         Assert.Equal(AgentRunLeaseStatus.Busy, stillBusy.Status);
-        Assert.False(wrongToken);
-        Assert.False(wrongOwner);
-        Assert.True(renewed);
+        Assert.Equal(AgentRunLeaseRenewalStatus.LeaseLost, wrongToken);
+        Assert.Equal(AgentRunLeaseRenewalStatus.LeaseLost, wrongOwner);
+        Assert.Equal(AgentRunLeaseRenewalStatus.Renewed, renewed);
         Assert.Equal(AgentRunLeaseStatus.Busy, protectedByRenewal.Status);
         Assert.Equal(AgentRunLeaseStatus.Acquired, takeover.Status);
         Assert.NotEqual(first.LeaseToken, takeover.LeaseToken);
@@ -61,6 +61,34 @@ public sealed class AgentRunCheckpointStoreTests
         Assert.Equal("AGENT_CHECKPOINT_CONFLICT", conflict.Code);
         Assert.Equal(AgentRunLeaseStatus.Acquired, reacquired.Status);
         Assert.Equal("approval-2", reacquired.Checkpoint!.ApprovalId);
+    }
+
+    [Fact]
+    public async Task CancellationShouldBeOwnerOnlyIdempotentAndWinAgainstLeaseCompletion()
+    {
+        var clock = new MutableTimeProvider(DateTimeOffset.UtcNow);
+        var store = new InMemoryAgentRunCheckpointStore(clock);
+        var owner = AccessContext.Create("tenant-a", "user-a", ["readers"]);
+        var other = AccessContext.Create("tenant-a", "user-b", ["readers"]);
+        var checkpoint = CreateCheckpoint(owner, clock.GetUtcNow()) with { RunId = "run-cancel" };
+        await store.SavePendingAsync(checkpoint);
+        var lease = await store.TryAcquireAsync(checkpoint.RunId, owner, "node-a", TimeSpan.FromSeconds(30));
+
+        var forbidden = await store.RequestCancellationAsync(checkpoint.RunId, other, new string('A', 64));
+        var requested = await store.RequestCancellationAsync(checkpoint.RunId, owner, new string('B', 64));
+        var repeated = await store.RequestCancellationAsync(checkpoint.RunId, owner, new string('C', 64));
+        var renewal = await store.RenewAsync(checkpoint.RunId, lease.LeaseToken!, "node-a",
+            TimeSpan.FromSeconds(30));
+        var completion = await store.CompleteAsync(checkpoint.RunId, lease.LeaseToken!);
+        var resume = await store.TryAcquireAsync(checkpoint.RunId, owner, "node-b", TimeSpan.FromSeconds(30));
+
+        Assert.Equal(AgentRunCancellationStatus.Forbidden, forbidden.Status);
+        Assert.Equal(AgentRunCancellationStatus.Requested, requested.Status);
+        Assert.Equal(AgentRunCancellationStatus.AlreadyRequested, repeated.Status);
+        Assert.Equal(requested.RequestedAt, repeated.RequestedAt);
+        Assert.Equal(AgentRunLeaseRenewalStatus.CancellationRequested, renewal);
+        Assert.Equal(AgentRunLeaseTransitionStatus.CancellationRequested, completion);
+        Assert.Equal(AgentRunLeaseStatus.Cancelled, resume.Status);
     }
 
     private static AgentRunCheckpoint CreateCheckpoint(AccessContext access, DateTimeOffset now) => new(
