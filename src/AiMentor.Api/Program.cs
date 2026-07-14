@@ -372,6 +372,14 @@ toolExecutions.MapPost("/{executionKey}/probe", ProbeOutcomeUnknownToolExecution
     .ProducesProblem(StatusCodes.Status403Forbidden)
     .ProducesProblem(StatusCodes.Status404NotFound)
     .RequireRateLimiting("questions");
+toolExecutions.MapPost("/{executionKey}/reviews", ReviewOutcomeUnknownToolExecutionAsync)
+    .WithName("ReviewOutcomeUnknownToolExecutionV1")
+    .WithSummary("由两名不同对账人员在证据有效期内依次复核结果不确定操作")
+    .Produces<ToolReconciliationReviewResult>()
+    .ProducesValidationProblem()
+    .ProducesProblem(StatusCodes.Status403Forbidden)
+    .ProducesProblem(StatusCodes.Status404NotFound)
+    .RequireRateLimiting("questions");
 
 var agents = v1.MapGroup("/agents").WithTags("AiMentor agents v1");
 agents.MapPost("/runs", RunAgentAsync)
@@ -537,6 +545,7 @@ static async Task<IResult> ExecuteToolAsync(string toolName, ExecuteToolRequest 
     var statusCode = result.Status switch
     {
         ToolExecutionStatus.Completed => StatusCodes.Status200OK,
+        ToolExecutionStatus.Reconciled => StatusCodes.Status200OK,
         ToolExecutionStatus.RequiresApproval => StatusCodes.Status409Conflict,
         ToolExecutionStatus.TimedOut => StatusCodes.Status504GatewayTimeout,
         ToolExecutionStatus.ResultTooLarge => StatusCodes.Status502BadGateway,
@@ -640,6 +649,23 @@ static async Task<IResult> ProbeOutcomeUnknownToolExecutionAsync(string executio
         var arguments = JsonSerializer.SerializeToElement(request.Arguments);
         return Results.Ok(await service.ProbeOutcomeAsync(accessProvider.GetAccessContext(context.User),
             executionKey, arguments, cancellationToken));
+    }
+    catch (ToolExecutionReconciliationException exception)
+    {
+        return ToolReconciliationProblem(exception, context);
+    }
+}
+
+static async Task<IResult> ReviewOutcomeUnknownToolExecutionAsync(string executionKey,
+    ReviewToolOutcomeRequest request, IToolExecutionReconciliationService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        var arguments = JsonSerializer.SerializeToElement(request.Arguments);
+        var result = await service.ReviewOutcomeAsync(accessProvider.GetAccessContext(context.User), executionKey,
+            arguments, request.Confirmed, request.Reason, cancellationToken);
+        return Results.Ok(result);
     }
     catch (ToolExecutionReconciliationException exception)
     {

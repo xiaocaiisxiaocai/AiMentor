@@ -91,6 +91,8 @@ public sealed class SafeToolExecutor(
                 "相同幂等请求正在执行，请稍后查询或重试。", cancellationToken);
         if (acquired.Status == IdempotencyAcquireStatus.OutcomeUnknown)
             return await OutcomeUnknownAsync(runId, tool.Descriptor.Name, cancellationToken);
+        if (acquired.Status == IdempotencyAcquireStatus.ReconciledApplied)
+            return await ReconciledAsync(runId, tool.Descriptor.Name, cancellationToken);
         if (acquired.Status == IdempotencyAcquireStatus.Capacity)
             return await RejectAsync(runId, tool.Descriptor.Name, "IDEMPOTENCY_CAPACITY_EXCEEDED",
                 "服务器幂等执行账本已达到容量上限，请稍后重试。", cancellationToken);
@@ -254,6 +256,16 @@ public sealed class SafeToolExecutor(
             Step("tool.idempotency", "outcome_unknown", new Dictionary<string, object?> { ["code"] = decision.Code })
         };
         return CompleteAsync(runId, toolName, ToolExecutionStatus.OutcomeUnknown, null, decision, false, trace,
+            cancellationToken);
+    }
+
+    private Task<ToolExecutionResult> ReconciledAsync(string runId, string toolName,
+        CancellationToken cancellationToken)
+    {
+        var decision = new SafetyDecision(SafetyAction.Allow, "TOOL_OUTCOME_RECONCILED_APPLIED",
+            "两名独立对账人员已根据目标状态证据确认操作生效。");
+        return CompleteAsync(runId, toolName, ToolExecutionStatus.Reconciled, null, decision, true,
+            [Step("tool.idempotency", "reconciled", new Dictionary<string, object?> { ["code"] = decision.Code })],
             cancellationToken);
     }
 

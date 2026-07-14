@@ -30,7 +30,10 @@ public interface IToolExecutor
 }
 
 /// <summary>表示幂等执行账本的占位、回放、冲突、忙碌或结果不确定结论。</summary>
-public enum IdempotencyAcquireStatus { Acquired, Replay, InProgress, OutcomeUnknown, FingerprintMismatch, Capacity }
+public enum IdempotencyAcquireStatus
+{
+    Acquired, Replay, InProgress, OutcomeUnknown, ReconciledApplied, FingerprintMismatch, Capacity
+}
 
 /// <summary>返回幂等账本原子占位结果、租约令牌或已完成的加密回放结果。</summary>
 public sealed record IdempotencyAcquireResult(
@@ -74,6 +77,32 @@ public sealed record ToolOutcomeProbeResult(
     string Explanation,
     DateTimeOffset ObservedAt);
 
+/// <summary>区分第一人复核、拒绝、已确认生效和已授权重新执行等裁决结果。</summary>
+public enum ToolReconciliationReviewStatus
+{
+    AwaitingSecondReviewer, Rejected, ResolvedApplied, RetryAuthorized,
+    ReviewerMustDiffer, EvidenceChanged, EvidenceExpired, NotFound
+}
+
+/// <summary>携带一次原子复核所需的证据摘要和不可逆理由摘要，不保存候选参数或理由原文。</summary>
+public sealed record ToolReconciliationReview(
+    string ExecutionKey,
+    string TenantId,
+    string ReviewerSubjectId,
+    ToolOutcomeProbeState EvidenceState,
+    string EvidenceCode,
+    DateTimeOffset EvidenceObservedAt,
+    DateTimeOffset EvidenceExpiresAt,
+    bool Confirmed,
+    string ReasonHash);
+
+/// <summary>返回双人裁决状态以及当前证据有效期，供调用方决定是否等待第二人复核。</summary>
+public sealed record ToolReconciliationReviewResult(
+    string ExecutionKey,
+    ToolReconciliationReviewStatus Status,
+    ToolOutcomeProbeState EvidenceState,
+    DateTimeOffset EvidenceExpiresAt);
+
 /// <summary>在副作用执行前建立持久化占位，并区分可安全重试和结果不确定状态。</summary>
 public interface IToolExecutionLedger
 {
@@ -90,6 +119,8 @@ public interface IToolExecutionLedger
         CancellationToken cancellationToken = default);
     Task<OutcomeUnknownToolExecutionDetail?> GetOutcomeUnknownAsync(string tenantId, string executionKey,
         CancellationToken cancellationToken = default);
+    Task<ToolReconciliationReviewResult> SubmitReconciliationReviewAsync(ToolReconciliationReview review,
+        CancellationToken cancellationToken = default);
 }
 
 /// <summary>按当前访问者租户查询需要外部核验的工具执行，不提供自动重放或清除能力。</summary>
@@ -99,6 +130,8 @@ public interface IToolExecutionReconciliationService
         CancellationToken cancellationToken = default);
     Task<ToolOutcomeProbeResult> ProbeOutcomeAsync(AccessContext access, string executionKey, JsonElement arguments,
         CancellationToken cancellationToken = default);
+    Task<ToolReconciliationReviewResult> ReviewOutcomeAsync(AccessContext access, string executionKey,
+        JsonElement arguments, bool confirmed, string reason, CancellationToken cancellationToken = default);
 }
 
 /// <summary>由具体工具实现只读目标状态核验，禁止在探测过程中产生补偿副作用。</summary>
@@ -115,6 +148,7 @@ public sealed class ToolExecutionReconciliationOptions
     public IReadOnlySet<string> ReconcilerGroups { get; init; } =
         new HashSet<string>(["tool-reconcilers"], StringComparer.OrdinalIgnoreCase);
     public int MaximumPageSize { get; init; } = 100;
+    public TimeSpan EvidenceLifetime { get; init; } = TimeSpan.FromMinutes(5);
 }
 
 /// <summary>区分工具执行对账请求的输入错误和授权失败。</summary>

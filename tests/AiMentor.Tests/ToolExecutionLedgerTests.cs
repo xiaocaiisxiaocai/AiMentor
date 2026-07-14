@@ -73,10 +73,62 @@ public sealed class ToolExecutionLedgerTests
         Assert.Equal(Key('D'), record.ExecutionKey);
     }
 
+    [Fact]
+    public async Task TwoDifferentReviewersShouldResolveAppliedOutcome()
+    {
+        var clock = new MutableTimeProvider(DateTimeOffset.UtcNow);
+        var ledger = new InMemoryToolExecutionLedger(clock);
+        var acquired = await ledger.TryAcquireAsync(Request('F', 'F', "run-f", "tenant-a"),
+            TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
+        await ledger.MarkExecutingAsync(Key('F'), acquired.LeaseToken!);
+        await ledger.MarkOutcomeUnknownAsync(Key('F'), acquired.LeaseToken!);
+        var first = await ledger.SubmitReconciliationReviewAsync(Review('F', "reviewer-1",
+            ToolOutcomeProbeState.Applied, clock.GetUtcNow()));
+        var sameReviewer = await ledger.SubmitReconciliationReviewAsync(Review('F', "reviewer-1",
+            ToolOutcomeProbeState.Applied, clock.GetUtcNow()));
+        var second = await ledger.SubmitReconciliationReviewAsync(Review('F', "reviewer-2",
+            ToolOutcomeProbeState.Applied, clock.GetUtcNow()));
+        var retry = await ledger.TryAcquireAsync(Request('F', 'F', "run-retry", "tenant-a"),
+            TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
+
+        Assert.Equal(ToolReconciliationReviewStatus.AwaitingSecondReviewer, first.Status);
+        Assert.Equal(ToolReconciliationReviewStatus.ReviewerMustDiffer, sameReviewer.Status);
+        Assert.Equal(ToolReconciliationReviewStatus.ResolvedApplied, second.Status);
+        Assert.Equal(IdempotencyAcquireStatus.ReconciledApplied, retry.Status);
+    }
+
+    [Fact]
+    public async Task NotAppliedResolutionShouldPreserveSingleRetryAuthorizationWhenAbandoned()
+    {
+        var clock = new MutableTimeProvider(DateTimeOffset.UtcNow);
+        var ledger = new InMemoryToolExecutionLedger(clock);
+        var acquired = await ledger.TryAcquireAsync(Request('G', 'G', "run-g", "tenant-a"),
+            TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
+        await ledger.MarkExecutingAsync(Key('G'), acquired.LeaseToken!);
+        await ledger.MarkOutcomeUnknownAsync(Key('G'), acquired.LeaseToken!);
+        await ledger.SubmitReconciliationReviewAsync(Review('G', "reviewer-1",
+            ToolOutcomeProbeState.NotApplied, clock.GetUtcNow()));
+        var resolved = await ledger.SubmitReconciliationReviewAsync(Review('G', "reviewer-2",
+            ToolOutcomeProbeState.NotApplied, clock.GetUtcNow()));
+        var firstRetry = await ledger.TryAcquireAsync(Request('G', 'G', "retry-1", "tenant-a"),
+            TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
+        await ledger.AbandonAsync(Key('G'), firstRetry.LeaseToken!);
+        var secondRetry = await ledger.TryAcquireAsync(Request('G', 'G', "retry-2", "tenant-a"),
+            TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
+
+        Assert.Equal(ToolReconciliationReviewStatus.RetryAuthorized, resolved.Status);
+        Assert.Equal(IdempotencyAcquireStatus.Acquired, firstRetry.Status);
+        Assert.Equal(IdempotencyAcquireStatus.Acquired, secondRetry.Status);
+    }
+
     private static string Key(char value) => new(value, 64);
     private static string Fingerprint(char value) => new(value, 64);
     private static ToolExecutionLedgerRequest Request(char key, char fingerprint, string runId, string tenantId) =>
         new(Key(key), Fingerprint(fingerprint), runId, tenantId, "subject-a", "memory.delete");
+    private static ToolReconciliationReview Review(char key, string reviewer,
+        ToolOutcomeProbeState state, DateTimeOffset now) => new(Key(key), "tenant-a", reviewer, state,
+            state == ToolOutcomeProbeState.Applied ? "APPLIED" : "NOT_APPLIED", now, now.AddMinutes(5), true,
+            new string('A', 64));
     private static ToolExecutionResult Result(string runId) => new(runId, "memory.delete",
         ToolExecutionStatus.Completed, JsonSerializer.SerializeToElement(new { deleted = true }),
         SafetyDecision.Allowed, false, []);

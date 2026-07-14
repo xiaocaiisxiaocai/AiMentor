@@ -50,6 +50,12 @@ public sealed record DecideToolApprovalRequest(
 public sealed record ProbeToolOutcomeRequest(
     [property: Required] Dictionary<string, JsonElement> Arguments);
 
+/// <summary>提交当前目标证据、确认意见和理由；理由只以不可逆摘要进入裁决账本。</summary>
+public sealed record ReviewToolOutcomeRequest(
+    [property: Required] Dictionary<string, JsonElement> Arguments,
+    bool Confirmed,
+    [property: Required, StringLength(500, MinimumLength = 1)] string Reason);
+
 /// <summary>提交给受限 Agent 的自然语言目标。</summary>
 public sealed record RunAgentRequest(
     [property: Required, StringLength(4_000, MinimumLength = 1)] string Input);

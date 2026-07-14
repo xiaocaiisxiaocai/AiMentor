@@ -78,6 +78,33 @@ public sealed class ToolExecutionReconciliationService : IToolExecutionReconcili
         return result;
     }
 
+    /// <inheritdoc />
+    public async Task<ToolReconciliationReviewResult> ReviewOutcomeAsync(AccessContext access, string executionKey,
+        JsonElement arguments, bool confirmed, string reason, CancellationToken cancellationToken = default)
+    {
+        EnsureAuthorized(access);
+        if (string.IsNullOrWhiteSpace(reason) || reason.Trim().Length > 500)
+            throw Failure("TOOL_RECONCILIATION_REASON_INVALID", "裁决理由必须为 1 到 500 个字符。",
+                ToolExecutionReconciliationErrorKind.Validation);
+        var evidence = await ProbeOutcomeAsync(access, executionKey, arguments, cancellationToken);
+        if (confirmed && evidence.State == ToolOutcomeProbeState.Indeterminate)
+            throw Failure("TOOL_RECONCILIATION_EVIDENCE_INDETERMINATE",
+                "不确定证据不能用于结案或授权重试。", ToolExecutionReconciliationErrorKind.Validation);
+        var review = new ToolReconciliationReview(evidence.ExecutionKey, access.TenantId, access.SubjectId,
+            evidence.State, evidence.Code, evidence.ObservedAt,
+            evidence.ObservedAt.Add(_options.EvidenceLifetime), confirmed,
+            Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(reason.Trim()))));
+        var result = await _ledger.SubmitReconciliationReviewAsync(review, cancellationToken);
+        await TraceAsync(access, "tool.execution.reconciliation.review", result.Status.ToString(),
+            new Dictionary<string, object?>
+            {
+                ["executionKey"] = executionKey,
+                ["evidenceState"] = evidence.State.ToString(),
+                ["confirmed"] = confirmed
+            }, cancellationToken);
+        return result;
+    }
+
     private void EnsureAuthorized(AccessContext access)
     {
         if (string.IsNullOrWhiteSpace(access.TenantId) || string.IsNullOrWhiteSpace(access.SubjectId))

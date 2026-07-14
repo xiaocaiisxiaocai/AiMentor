@@ -134,6 +134,50 @@ public sealed class ToolExecutorTests
     }
 
     [Fact]
+    public async Task RetryAuthorizedByTwoReviewersShouldStillRequireFreshBusinessApproval()
+    {
+        var ledger = new InMemoryToolExecutionLedger(TimeProvider.System);
+        var tool = new FakeTool("memory.delete", ToolOperationRisk.Mutation, requiresIdempotencyKey: true,
+            execute: _ => throw new InvalidOperationException("模拟副作用后连接中断"));
+        var registry = new ServerToolRegistry([tool]);
+        var safety = new RuleBasedToolInvocationSafetyService(new ToolSafetyOptions
+        {
+            AllowedTools = new HashSet<string>([tool.Descriptor.Name], StringComparer.OrdinalIgnoreCase)
+        });
+        var trace = new InMemoryTraceSink();
+        var approvals = new InMemoryToolApprovalService(registry, safety, trace, new ToolApprovalOptions(),
+            TimeProvider.System);
+        var executor = new SafeToolExecutor(registry, safety, trace, new ToolExecutorOptions(), TimeProvider.System,
+            approvals, ledger);
+        var arguments = JsonSerializer.SerializeToElement(new { memoryId = "memory-a", expectedVersion = 1 });
+        var approval = await approvals.RequestAsync(tool.Descriptor.Name, arguments, "验证副作用后连接中断", Access);
+        await approvals.DecideAsync(approval.Id, true, "独立批准首次执行",
+            AccessContext.Create(Access.TenantId, "approver-a", ["tool-approvers"]));
+
+        var uncertain = await executor.ExecuteAsync(tool.Descriptor.Name, arguments, Access,
+            idempotencyKey: "retry-after-reconciliation", approvalId: approval.Id);
+        var execution = Assert.Single(await ledger.ListOutcomeUnknownAsync(Access.TenantId, 10));
+        var now = DateTimeOffset.UtcNow;
+        await ledger.SubmitReconciliationReviewAsync(new ToolReconciliationReview(execution.ExecutionKey,
+            Access.TenantId, "reviewer-1", ToolOutcomeProbeState.NotApplied, "NOT_APPLIED", now,
+            now.AddMinutes(5), true, new string('A', 64)));
+        var resolution = await ledger.SubmitReconciliationReviewAsync(new ToolReconciliationReview(
+            execution.ExecutionKey, Access.TenantId, "reviewer-2", ToolOutcomeProbeState.NotApplied,
+            "NOT_APPLIED", now, now.AddMinutes(5), true, new string('B', 64)));
+
+        var withoutApproval = await executor.ExecuteAsync(tool.Descriptor.Name, arguments, Access,
+            idempotencyKey: "retry-after-reconciliation");
+        var repeatedWithoutApproval = await executor.ExecuteAsync(tool.Descriptor.Name, arguments, Access,
+            idempotencyKey: "retry-after-reconciliation");
+
+        Assert.Equal(ToolExecutionStatus.OutcomeUnknown, uncertain.Status);
+        Assert.Equal(ToolReconciliationReviewStatus.RetryAuthorized, resolution.Status);
+        Assert.Equal(ToolExecutionStatus.RequiresApproval, withoutApproval.Status);
+        Assert.Equal(ToolExecutionStatus.RequiresApproval, repeatedWithoutApproval.Status);
+        Assert.Equal(1, tool.ExecutionCount);
+    }
+
+    [Fact]
     public void MutationToolWithoutIdempotencyRequirementShouldFailRegistration()
     {
         var tool = new FakeTool("unsafe.mutate", ToolOperationRisk.Mutation);
@@ -178,6 +222,9 @@ public sealed class ToolExecutorTests
             CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<OutcomeUnknownToolExecutionDetail?> GetOutcomeUnknownAsync(string tenantId, string executionKey,
             CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<ToolReconciliationReviewResult> SubmitReconciliationReviewAsync(
+            ToolReconciliationReview review, CancellationToken cancellationToken = default) =>
+            throw new NotSupportedException();
     }
 
     private sealed class FakeTool(

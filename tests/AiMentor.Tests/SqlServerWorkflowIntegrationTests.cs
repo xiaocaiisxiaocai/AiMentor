@@ -35,6 +35,7 @@ public sealed class SqlServerWorkflowIntegrationTests
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "002_workflow_key_version.sql"));
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "003_tool_execution_ledger.sql"));
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "004_tool_execution_reconciliation.sql"));
+            await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "005_tool_reconciliation_reviews.sql"));
             var clock = new MutableTimeProvider(new DateTimeOffset(2026, 7, 14, 1, 0, 0, TimeSpan.Zero));
             var trace = new InMemoryTraceSink();
             var tool = new MutationTool();
@@ -107,6 +108,15 @@ public sealed class SqlServerWorkflowIntegrationTests
                 [new MemoryDeleteOutcomeProbe(new InMemoryMemoryStore(), clock)]);
             var sqlProbe = await reconciliation.ProbeOutcomeAsync(
                 AccessContext.Create("tenant-a", "reconciler-a", ["tool-reconcilers"]), executionKey, arguments);
+            var firstReview = await reconciliation.ReviewOutcomeAsync(
+                AccessContext.Create("tenant-a", "reconciler-a", ["tool-reconcilers"]), executionKey,
+                arguments, true, "已核对目标状态");
+            var secondReview = await reconciliation.ReviewOutcomeAsync(
+                AccessContext.Create("tenant-a", "reconciler-b", ["tool-reconcilers"]), executionKey,
+                arguments, true, "独立复核目标状态");
+            var reconciledRetry = await executionLedger.TryAcquireAsync(new ToolExecutionLedgerRequest(executionKey,
+                    fingerprint, "tool-run-reconciled", "tenant-a", "requester-a", "memory.delete"),
+                TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
 
             var completedKey = new string('C', 64);
             using var oldExecutionLedger = new SqlServerToolExecutionLedger(sqlOptions, workflowCipher, clock);
@@ -147,6 +157,9 @@ public sealed class SqlServerWorkflowIntegrationTests
             Assert.Equal("tenant-a", Assert.Single(tenantUnknown).TenantId);
             Assert.Empty(otherTenantUnknown);
             Assert.Equal(ToolOutcomeProbeState.Applied, sqlProbe.State);
+            Assert.Equal(ToolReconciliationReviewStatus.AwaitingSecondReviewer, firstReview.Status);
+            Assert.Equal(ToolReconciliationReviewStatus.ResolvedApplied, secondReview.Status);
+            Assert.Equal(IdempotencyAcquireStatus.ReconciledApplied, reconciledRetry.Status);
             Assert.Equal(IdempotencyAcquireStatus.Replay, rotatingReplay.Status);
             Assert.Equal(IdempotencyAcquireStatus.Replay, replay.Status);
             Assert.Equal("tool-run-3", replay.ReplayResult!.RunId);

@@ -12,6 +12,7 @@ public sealed class InMemoryToolExecutionLedger(TimeProvider timeProvider) : ITo
 {
     private readonly object _gate = new();
     private readonly Dictionary<string, Entry> _entries = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, ReviewCase> _reviews = new(StringComparer.Ordinal);
 
     /// <inheritdoc />
     public Task<IdempotencyAcquireResult> TryAcquireAsync(ToolExecutionLedgerRequest request,
@@ -43,6 +44,21 @@ public sealed class InMemoryToolExecutionLedger(TimeProvider timeProvider) : ITo
                     ReplayResult: entry.Result));
             if (entry.Status == LedgerStatus.OutcomeUnknown)
                 return Task.FromResult(new IdempotencyAcquireResult(IdempotencyAcquireStatus.OutcomeUnknown));
+            if (entry.Status == LedgerStatus.ReconciledApplied)
+                return Task.FromResult(new IdempotencyAcquireResult(IdempotencyAcquireStatus.ReconciledApplied));
+            if (entry.Status == LedgerStatus.RetryAuthorized)
+            {
+                var retryToken = Guid.NewGuid().ToString("N");
+                _entries[request.ExecutionKey] = entry with
+                {
+                    Status = LedgerStatus.RetryReserved,
+                    RunId = request.RunId,
+                    LeaseToken = retryToken,
+                    LeaseExpiresAt = now.Add(leaseDuration),
+                    UpdatedAt = now
+                };
+                return Task.FromResult(new IdempotencyAcquireResult(IdempotencyAcquireStatus.Acquired, retryToken));
+            }
             if (entry.LeaseExpiresAt > now)
                 return Task.FromResult(new IdempotencyAcquireResult(IdempotencyAcquireStatus.InProgress));
             if (entry.Status == LedgerStatus.Executing)
@@ -64,8 +80,8 @@ public sealed class InMemoryToolExecutionLedger(TimeProvider timeProvider) : ITo
 
     /// <inheritdoc />
     public Task MarkExecutingAsync(string executionKey, string leaseToken,
-        CancellationToken cancellationToken = default) =>
-        TransitionAsync(executionKey, leaseToken, LedgerStatus.Reserved, LedgerStatus.Executing, null, cancellationToken);
+        CancellationToken cancellationToken = default) => MarkExecutingCoreAsync(executionKey, leaseToken,
+            cancellationToken);
 
     /// <inheritdoc />
     public Task CompleteAsync(string executionKey, string leaseToken, ToolExecutionResult result,
@@ -84,9 +100,16 @@ public sealed class InMemoryToolExecutionLedger(TimeProvider timeProvider) : ITo
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
-            if (_entries.TryGetValue(executionKey, out var entry) && entry.Status == LedgerStatus.Reserved
-                && FixedEquals(entry.LeaseToken, leaseToken))
-                _entries.Remove(executionKey);
+            if (_entries.TryGetValue(executionKey, out var entry) && FixedEquals(entry.LeaseToken, leaseToken))
+            {
+                if (entry.Status == LedgerStatus.Reserved) _entries.Remove(executionKey);
+                else if (entry.Status == LedgerStatus.RetryReserved)
+                    _entries[executionKey] = entry with
+                    {
+                        Status = LedgerStatus.RetryAuthorized,
+                        UpdatedAt = timeProvider.GetUtcNow()
+                    };
+            }
         }
         return Task.CompletedTask;
     }
@@ -133,6 +156,78 @@ public sealed class InMemoryToolExecutionLedger(TimeProvider timeProvider) : ITo
         }
     }
 
+    /// <inheritdoc />
+    public Task<ToolReconciliationReviewResult> SubmitReconciliationReviewAsync(ToolReconciliationReview review,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_gate)
+        {
+            var now = timeProvider.GetUtcNow();
+            if (!_entries.TryGetValue(review.ExecutionKey, out var entry)
+                || entry.Status != LedgerStatus.OutcomeUnknown
+                || !string.Equals(entry.TenantId, review.TenantId, StringComparison.Ordinal))
+                return Task.FromResult(ReviewResult(review, ToolReconciliationReviewStatus.NotFound));
+            _reviews.TryGetValue(review.ExecutionKey, out var current);
+            if (current is null || current.Status != ReviewCaseStatus.AwaitingSecond || current.EvidenceExpiresAt <= now)
+            {
+                if (review.EvidenceExpiresAt <= now)
+                    return Task.FromResult(ReviewResult(review, ToolReconciliationReviewStatus.EvidenceExpired));
+                if (!review.Confirmed)
+                {
+                    _reviews[review.ExecutionKey] = ReviewCase.FromFirst(review, ReviewCaseStatus.Rejected, now);
+                    return Task.FromResult(ReviewResult(review, ToolReconciliationReviewStatus.Rejected));
+                }
+                _reviews[review.ExecutionKey] = ReviewCase.FromFirst(review, ReviewCaseStatus.AwaitingSecond, now);
+                return Task.FromResult(ReviewResult(review,
+                    ToolReconciliationReviewStatus.AwaitingSecondReviewer));
+            }
+            if (string.Equals(current.FirstReviewerSubjectId, review.ReviewerSubjectId, StringComparison.Ordinal))
+                return Task.FromResult(ReviewResult(review, ToolReconciliationReviewStatus.ReviewerMustDiffer));
+            if (current.EvidenceExpiresAt <= now || review.EvidenceObservedAt > current.EvidenceExpiresAt)
+                return Task.FromResult(ReviewResult(review, ToolReconciliationReviewStatus.EvidenceExpired));
+            if (current.EvidenceState != review.EvidenceState
+                || !string.Equals(current.EvidenceCode, review.EvidenceCode, StringComparison.Ordinal))
+                return Task.FromResult(ReviewResult(review, ToolReconciliationReviewStatus.EvidenceChanged));
+            if (!review.Confirmed)
+            {
+                _reviews[review.ExecutionKey] = current.Complete(review, ReviewCaseStatus.Rejected, now);
+                return Task.FromResult(ReviewResult(review, ToolReconciliationReviewStatus.Rejected));
+            }
+            var status = review.EvidenceState == ToolOutcomeProbeState.Applied
+                ? ToolReconciliationReviewStatus.ResolvedApplied
+                : ToolReconciliationReviewStatus.RetryAuthorized;
+            var nextLedger = review.EvidenceState == ToolOutcomeProbeState.Applied
+                ? LedgerStatus.ReconciledApplied
+                : LedgerStatus.RetryAuthorized;
+            _entries[review.ExecutionKey] = entry with { Status = nextLedger, UpdatedAt = now };
+            _reviews[review.ExecutionKey] = current.Complete(review, ReviewCaseStatus.Resolved, now);
+            return Task.FromResult(ReviewResult(review, status));
+        }
+    }
+
+    private Task MarkExecutingCoreAsync(string executionKey, string leaseToken, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_gate)
+        {
+            if (!_entries.TryGetValue(executionKey, out var entry)
+                || entry.Status is not (LedgerStatus.Reserved or LedgerStatus.RetryReserved)
+                || !FixedEquals(entry.LeaseToken, leaseToken))
+                throw new InvalidOperationException("幂等执行账本状态或租约不匹配。");
+            _entries[executionKey] = entry with
+            {
+                Status = LedgerStatus.Executing,
+                UpdatedAt = timeProvider.GetUtcNow()
+            };
+        }
+        return Task.CompletedTask;
+    }
+
+    private static ToolReconciliationReviewResult ReviewResult(ToolReconciliationReview review,
+        ToolReconciliationReviewStatus status) => new(review.ExecutionKey, status, review.EvidenceState,
+            review.EvidenceExpiresAt);
+
     private Task TransitionAsync(string executionKey, string leaseToken, LedgerStatus expected, LedgerStatus next,
         ToolExecutionResult? result, CancellationToken cancellationToken)
     {
@@ -161,7 +256,30 @@ public sealed class InMemoryToolExecutionLedger(TimeProvider timeProvider) : ITo
         ArgumentException.ThrowIfNullOrWhiteSpace(request.ToolName);
     }
 
-    private enum LedgerStatus { Reserved, Executing, Completed, OutcomeUnknown }
+    private enum LedgerStatus
+    {
+        Reserved, Executing, Completed, OutcomeUnknown, RetryAuthorized, RetryReserved, ReconciledApplied
+    }
+
+    private enum ReviewCaseStatus { AwaitingSecond, Rejected, Resolved }
+
+    private sealed record ReviewCase(ToolOutcomeProbeState EvidenceState, string EvidenceCode,
+        DateTimeOffset EvidenceExpiresAt, string FirstReviewerSubjectId, string FirstReasonHash,
+        ReviewCaseStatus Status, string? SecondReviewerSubjectId, string? SecondReasonHash,
+        DateTimeOffset UpdatedAt)
+    {
+        public static ReviewCase FromFirst(ToolReconciliationReview review, ReviewCaseStatus status,
+            DateTimeOffset now) => new(review.EvidenceState, review.EvidenceCode, review.EvidenceExpiresAt,
+                review.ReviewerSubjectId, review.ReasonHash, status, null, null, now);
+        public ReviewCase Complete(ToolReconciliationReview review, ReviewCaseStatus status, DateTimeOffset now) =>
+            this with
+            {
+                Status = status,
+                SecondReviewerSubjectId = review.ReviewerSubjectId,
+                SecondReasonHash = review.ReasonHash,
+                UpdatedAt = now
+            };
+    }
 
     private sealed record Entry(string RequestFingerprint, string RunId, string TenantId, string SubjectId,
         string ToolName, LedgerStatus Status, string LeaseToken, DateTimeOffset LeaseExpiresAt,
@@ -253,6 +371,24 @@ public sealed class SqlServerToolExecutionLedger(
         if (entry.Status == 3)
             return await CommitAsync(transaction,
                 new IdempotencyAcquireResult(IdempotencyAcquireStatus.OutcomeUnknown), cancellationToken);
+        if (entry.Status == 6)
+            return await CommitAsync(transaction,
+                new IdempotencyAcquireResult(IdempotencyAcquireStatus.ReconciledApplied), cancellationToken);
+        if (entry.Status == 4)
+        {
+            var retryToken = Guid.NewGuid().ToString("N");
+            await using var retry = connection.CreateCommand();
+            retry.Transaction = transaction;
+            retry.CommandText = $"""
+                UPDATE dbo.{TableName} SET Status=5,RunId=@runId,LeaseToken=@token,
+                    LeaseExpiresAt=@expires,UpdatedAt=@now WHERE ExecutionKey=@key AND Status=4;
+                """;
+            AddString(retry, "@runId", 128, request.RunId); AddString(retry, "@token", 64, retryToken);
+            AddDateTimeOffset(retry, "@expires", now.Add(leaseDuration)); AddDateTimeOffset(retry, "@now", now);
+            AddAnsiString(retry, "@key", 64, request.ExecutionKey); await retry.ExecuteNonQueryAsync(cancellationToken);
+            return await CommitAsync(transaction,
+                new IdempotencyAcquireResult(IdempotencyAcquireStatus.Acquired, retryToken), cancellationToken);
+        }
         if (entry.LeaseExpiresAt > now)
             return await CommitAsync(transaction,
                 new IdempotencyAcquireResult(IdempotencyAcquireStatus.InProgress), cancellationToken);
@@ -267,7 +403,7 @@ public sealed class SqlServerToolExecutionLedger(
         await using (var update = connection.CreateCommand())
         {
             update.Transaction = transaction;
-            update.CommandText = $"UPDATE dbo.{TableName} SET RunId=@runId,LeaseToken=@token,LeaseExpiresAt=@expires,UpdatedAt=@now WHERE ExecutionKey=@key AND Status=0;";
+            update.CommandText = $"UPDATE dbo.{TableName} SET RunId=@runId,LeaseToken=@token,LeaseExpiresAt=@expires,UpdatedAt=@now WHERE ExecutionKey=@key AND Status IN (0,5);";
             AddString(update, "@runId", 128, request.RunId); AddString(update, "@token", 64, renewed);
             AddDateTimeOffset(update, "@expires", now.Add(leaseDuration)); AddDateTimeOffset(update, "@now", now);
             AddAnsiString(update, "@key", 64, request.ExecutionKey); await update.ExecuteNonQueryAsync(cancellationToken);
@@ -278,8 +414,8 @@ public sealed class SqlServerToolExecutionLedger(
 
     /// <inheritdoc />
     public Task MarkExecutingAsync(string executionKey, string leaseToken,
-        CancellationToken cancellationToken = default) =>
-        TransitionAsync(executionKey, leaseToken, 0, 1, null, cancellationToken);
+        CancellationToken cancellationToken = default) => MarkExecutingCoreAsync(executionKey, leaseToken,
+            cancellationToken);
 
     /// <inheritdoc />
     public Task CompleteAsync(string executionKey, string leaseToken, ToolExecutionResult result,
@@ -298,9 +434,30 @@ public sealed class SqlServerToolExecutionLedger(
         await EnsureInitializedAsync(cancellationToken);
         await using var connection = await OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"DELETE FROM dbo.{TableName} WHERE ExecutionKey=@key AND Status=0 AND LeaseToken=@token;";
+        command.CommandText = $"""
+            DELETE FROM dbo.{TableName} WHERE ExecutionKey=@key AND Status=0 AND LeaseToken=@token;
+            UPDATE dbo.{TableName} SET Status=4,UpdatedAt=@now
+              WHERE ExecutionKey=@key AND Status=5 AND LeaseToken=@token;
+            """;
         AddAnsiString(command, "@key", 64, executionKey); AddString(command, "@token", 64, leaseToken);
+        AddDateTimeOffset(command, "@now", timeProvider.GetUtcNow());
         await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    private async Task MarkExecutingCoreAsync(string executionKey, string leaseToken,
+        CancellationToken cancellationToken)
+    {
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            UPDATE dbo.{TableName} SET Status=1,UpdatedAt=@now
+            WHERE ExecutionKey=@key AND Status IN (0,5) AND LeaseToken=@token;
+            """;
+        AddDateTimeOffset(command, "@now", timeProvider.GetUtcNow());
+        AddAnsiString(command, "@key", 64, executionKey); AddString(command, "@token", 64, leaseToken);
+        if (await command.ExecuteNonQueryAsync(cancellationToken) != 1)
+            throw new InvalidOperationException("幂等执行账本状态或租约不匹配。");
     }
 
     /// <inheritdoc />
@@ -351,6 +508,117 @@ public sealed class SqlServerToolExecutionLedger(
             reader.GetString(3), reader.GetString(4), reader.GetFieldValue<DateTimeOffset>(5),
             reader.GetFieldValue<DateTimeOffset>(6));
         return new OutcomeUnknownToolExecutionDetail(summary, reader.GetString(7));
+    }
+
+    /// <inheritdoc />
+    public async Task<ToolReconciliationReviewResult> SubmitReconciliationReviewAsync(
+        ToolReconciliationReview review, CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken);
+        var now = timeProvider.GetUtcNow();
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.Serializable,
+            cancellationToken);
+        await using (var ledger = connection.CreateCommand())
+        {
+            ledger.Transaction = transaction;
+            ledger.CommandText = $"SELECT Status FROM dbo.{TableName} WITH (UPDLOCK,HOLDLOCK) WHERE ExecutionKey=@key AND TenantId=@tenant;";
+            AddAnsiString(ledger, "@key", 64, review.ExecutionKey); AddString(ledger, "@tenant", 128, review.TenantId);
+            var statusValue = await ledger.ExecuteScalarAsync(cancellationToken);
+            if (statusValue is null || Convert.ToByte(statusValue, CultureInfo.InvariantCulture) != 3)
+                return await CommitReviewAsync(transaction, review, ToolReconciliationReviewStatus.NotFound,
+                    cancellationToken);
+        }
+
+        ReviewRow? current;
+        await using (var read = connection.CreateCommand())
+        {
+            read.Transaction = transaction;
+            read.CommandText = """
+                SELECT EvidenceState,EvidenceCode,EvidenceExpiresAt,FirstReviewerSubjectId,Status
+                FROM dbo.AiMentorToolReconciliations WITH (UPDLOCK,HOLDLOCK) WHERE ExecutionKey=@key;
+                """;
+            AddAnsiString(read, "@key", 64, review.ExecutionKey);
+            await using var reader = await read.ExecuteReaderAsync(cancellationToken);
+            current = await reader.ReadAsync(cancellationToken)
+                ? new ReviewRow((ToolOutcomeProbeState)reader.GetByte(0), reader.GetString(1),
+                    reader.GetFieldValue<DateTimeOffset>(2), reader.GetString(3), reader.GetByte(4))
+                : null;
+        }
+
+        if (current is null || current.Status != 0 || current.EvidenceExpiresAt <= now)
+        {
+            if (review.EvidenceExpiresAt <= now)
+                return await CommitReviewAsync(transaction, review, ToolReconciliationReviewStatus.EvidenceExpired,
+                    cancellationToken);
+            await using var replace = connection.CreateCommand();
+            replace.Transaction = transaction;
+            replace.CommandText = """
+                DELETE dbo.AiMentorToolReconciliations WHERE ExecutionKey=@key;
+                INSERT dbo.AiMentorToolReconciliations
+                  (ExecutionKey,TenantId,EvidenceState,EvidenceCode,EvidenceObservedAt,EvidenceExpiresAt,
+                   FirstReviewerSubjectId,FirstConfirmed,FirstReasonHash,FirstReviewedAt,Status,UpdatedAt)
+                VALUES(@key,@tenant,@state,@code,@observed,@expires,@reviewer,@confirmed,@reason,@now,@status,@now);
+                """;
+            AddAnsiString(replace, "@key", 64, review.ExecutionKey);
+            AddString(replace, "@tenant", 128, review.TenantId); AddInt(replace, "@state", (int)review.EvidenceState);
+            AddString(replace, "@code", 128, review.EvidenceCode);
+            AddDateTimeOffset(replace, "@observed", review.EvidenceObservedAt);
+            AddDateTimeOffset(replace, "@expires", review.EvidenceExpiresAt);
+            AddString(replace, "@reviewer", 256, review.ReviewerSubjectId);
+            AddBool(replace, "@confirmed", review.Confirmed); AddAnsiString(replace, "@reason", 64, review.ReasonHash);
+            AddDateTimeOffset(replace, "@now", now); AddInt(replace, "@status", review.Confirmed ? 0 : 1);
+            await replace.ExecuteNonQueryAsync(cancellationToken);
+            return await CommitReviewAsync(transaction, review, review.Confirmed
+                ? ToolReconciliationReviewStatus.AwaitingSecondReviewer
+                : ToolReconciliationReviewStatus.Rejected, cancellationToken);
+        }
+        if (string.Equals(current.FirstReviewerSubjectId, review.ReviewerSubjectId, StringComparison.Ordinal))
+            return await CommitReviewAsync(transaction, review, ToolReconciliationReviewStatus.ReviewerMustDiffer,
+                cancellationToken);
+        if (current.EvidenceExpiresAt <= now || review.EvidenceObservedAt > current.EvidenceExpiresAt)
+            return await CommitReviewAsync(transaction, review, ToolReconciliationReviewStatus.EvidenceExpired,
+                cancellationToken);
+        if (current.EvidenceState != review.EvidenceState
+            || !string.Equals(current.EvidenceCode, review.EvidenceCode, StringComparison.Ordinal))
+            return await CommitReviewAsync(transaction, review, ToolReconciliationReviewStatus.EvidenceChanged,
+                cancellationToken);
+
+        var resultStatus = !review.Confirmed ? ToolReconciliationReviewStatus.Rejected
+            : review.EvidenceState == ToolOutcomeProbeState.Applied
+                ? ToolReconciliationReviewStatus.ResolvedApplied
+                : ToolReconciliationReviewStatus.RetryAuthorized;
+        await using (var finish = connection.CreateCommand())
+        {
+            finish.Transaction = transaction;
+            finish.CommandText = """
+                UPDATE dbo.AiMentorToolReconciliations SET SecondReviewerSubjectId=@reviewer,
+                  SecondConfirmed=@confirmed,SecondReasonHash=@reason,SecondReviewedAt=@now,
+                  Status=@status,UpdatedAt=@now WHERE ExecutionKey=@key AND Status=0;
+                """;
+            AddString(finish, "@reviewer", 256, review.ReviewerSubjectId);
+            AddBool(finish, "@confirmed", review.Confirmed); AddAnsiString(finish, "@reason", 64, review.ReasonHash);
+            AddDateTimeOffset(finish, "@now", now); AddInt(finish, "@status", review.Confirmed ? 2 : 1);
+            AddAnsiString(finish, "@key", 64, review.ExecutionKey); await finish.ExecuteNonQueryAsync(cancellationToken);
+        }
+        if (review.Confirmed)
+        {
+            await using var resolve = connection.CreateCommand(); resolve.Transaction = transaction;
+            resolve.CommandText = $"UPDATE dbo.{TableName} SET Status=@status,UpdatedAt=@now WHERE ExecutionKey=@key AND Status=3;";
+            AddInt(resolve, "@status", review.EvidenceState == ToolOutcomeProbeState.Applied ? 6 : 4);
+            AddDateTimeOffset(resolve, "@now", now); AddAnsiString(resolve, "@key", 64, review.ExecutionKey);
+            if (await resolve.ExecuteNonQueryAsync(cancellationToken) != 1)
+                throw new InvalidOperationException("工具执行账本裁决状态发生并发变化。");
+        }
+        return await CommitReviewAsync(transaction, review, resultStatus, cancellationToken);
+    }
+
+    private static async Task<ToolReconciliationReviewResult> CommitReviewAsync(SqlTransaction transaction,
+        ToolReconciliationReview review, ToolReconciliationReviewStatus status, CancellationToken cancellationToken)
+    {
+        await transaction.CommitAsync(cancellationToken);
+        return new ToolReconciliationReviewResult(review.ExecutionKey, status, review.EvidenceState,
+            review.EvidenceExpiresAt);
     }
 
     private async Task TransitionAsync(string executionKey, string leaseToken, int expected, int next,
@@ -404,6 +672,22 @@ public sealed class SqlServerToolExecutionLedger(
                     AND name=N'IX_{TableName}_TenantStatusUpdated')
                     CREATE INDEX IX_{TableName}_TenantStatusUpdated
                         ON dbo.{TableName}(TenantId,Status,UpdatedAt DESC);
+                IF OBJECT_ID(N'dbo.AiMentorToolReconciliations',N'U') IS NULL
+                BEGIN
+                  CREATE TABLE dbo.AiMentorToolReconciliations(
+                    ExecutionKey char(64) NOT NULL CONSTRAINT PK_AiMentorToolReconciliations PRIMARY KEY,
+                    TenantId nvarchar(128) NOT NULL,EvidenceState tinyint NOT NULL,
+                    EvidenceCode nvarchar(128) NOT NULL,EvidenceObservedAt datetimeoffset(7) NOT NULL,
+                    EvidenceExpiresAt datetimeoffset(7) NOT NULL,FirstReviewerSubjectId nvarchar(256) NOT NULL,
+                    FirstConfirmed bit NOT NULL,FirstReasonHash char(64) NOT NULL,
+                    FirstReviewedAt datetimeoffset(7) NOT NULL,SecondReviewerSubjectId nvarchar(256) NULL,
+                    SecondConfirmed bit NULL,SecondReasonHash char(64) NULL,SecondReviewedAt datetimeoffset(7) NULL,
+                    Status tinyint NOT NULL,UpdatedAt datetimeoffset(7) NOT NULL,RowVersion rowversion NOT NULL,
+                    CONSTRAINT FK_AiMentorToolReconciliations_Execution FOREIGN KEY(ExecutionKey)
+                      REFERENCES dbo.{TableName}(ExecutionKey) ON DELETE CASCADE);
+                  CREATE INDEX IX_AiMentorToolReconciliations_TenantStatusExpiry
+                    ON dbo.AiMentorToolReconciliations(TenantId,Status,EvidenceExpiresAt);
+                END;
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken); _initialized = true;
         }
@@ -452,9 +736,12 @@ public sealed class SqlServerToolExecutionLedger(
     private static void AddNullableString(SqlCommand command, string name, int size, string? value) => command.Parameters.Add(name, SqlDbType.NVarChar, size).Value = value is null ? DBNull.Value : value;
     private static void AddAnsiString(SqlCommand command, string name, int size, string value) => command.Parameters.Add(name, SqlDbType.Char, size).Value = value;
     private static void AddInt(SqlCommand command, string name, int value) => command.Parameters.Add(name, SqlDbType.Int).Value = value;
+    private static void AddBool(SqlCommand command, string name, bool value) => command.Parameters.Add(name, SqlDbType.Bit).Value = value;
     private static void AddDateTimeOffset(SqlCommand command, string name, DateTimeOffset value) => command.Parameters.Add(name, SqlDbType.DateTimeOffset).Value = value;
     private sealed record Entry(string RequestFingerprint, byte Status, string LeaseToken,
         DateTimeOffset LeaseExpiresAt, string? KeyVersion, string? ResultCipher);
+    private sealed record ReviewRow(ToolOutcomeProbeState EvidenceState, string EvidenceCode,
+        DateTimeOffset EvidenceExpiresAt, string FirstReviewerSubjectId, byte Status);
 
     /// <summary>释放架构初始化同步资源。</summary>
     public void Dispose() => _initializationGate.Dispose();
