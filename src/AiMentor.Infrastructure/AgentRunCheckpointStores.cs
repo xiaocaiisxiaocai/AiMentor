@@ -76,6 +76,24 @@ public sealed class InMemoryAgentRunCheckpointStore(TimeProvider timeProvider, i
     }
 
     /// <inheritdoc />
+    public Task<bool> RenewAsync(string runId, string leaseToken, string leaseOwner, TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_gate)
+        {
+            var now = timeProvider.GetUtcNow();
+            if (leaseDuration <= TimeSpan.Zero || !_entries.TryGetValue(runId, out var entry)
+                || entry.Status != StoredStatus.Leased || entry.LeaseExpiresAt <= now
+                || !FixedEquals(entry.LeaseToken, leaseToken) || !FixedEquals(entry.LeaseOwner, leaseOwner))
+                return Task.FromResult(false);
+
+            _entries[runId] = entry with { LeaseExpiresAt = now.Add(leaseDuration) };
+            return Task.FromResult(true);
+        }
+    }
+
+    /// <inheritdoc />
     public Task ReleaseAsync(string runId, string leaseToken, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -256,6 +274,30 @@ public sealed class SqlServerAgentRunCheckpointStore(
             || !string.Equals(reader.GetString(1), access.SubjectId, StringComparison.Ordinal))
             return new AgentRunLeaseResult(AgentRunLeaseStatus.Forbidden);
         return new AgentRunLeaseResult(AgentRunLeaseStatus.Busy);
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> RenewAsync(string runId, string leaseToken, string leaseOwner, TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default)
+    {
+        if (leaseDuration <= TimeSpan.Zero) return false;
+        await EnsureInitializedAsync(cancellationToken);
+        var now = timeProvider.GetUtcNow();
+        await using var connection = new SqlConnection(options.ConnectionString);
+        await connection.OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            UPDATE dbo.[{TableName}]
+            SET LeaseExpiresAt=@leaseExpiresAt,UpdatedAt=@now
+            WHERE RunId=@runId AND Status=1 AND LeaseToken=@leaseToken AND LeaseOwner=@leaseOwner
+              AND LeaseExpiresAt>@now;
+            """;
+        AddString(command, "@runId", 128, runId);
+        AddString(command, "@leaseToken", 64, leaseToken);
+        AddString(command, "@leaseOwner", 256, leaseOwner);
+        AddDateTimeOffset(command, "@leaseExpiresAt", now.Add(leaseDuration));
+        AddDateTimeOffset(command, "@now", now);
+        return await command.ExecuteNonQueryAsync(cancellationToken) == 1;
     }
 
     /// <inheritdoc />

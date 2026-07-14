@@ -22,13 +22,23 @@ public sealed class AgentRunCheckpointStoreTests
         var busy = await store.TryAcquireAsync("run-1", owner, "node-b", TimeSpan.FromSeconds(30));
         await store.ReleaseAsync("run-1", "wrong-token");
         var stillBusy = await store.TryAcquireAsync("run-1", owner, "node-b", TimeSpan.FromSeconds(30));
-        clock.Advance(TimeSpan.FromSeconds(31));
+        clock.Advance(TimeSpan.FromSeconds(20));
+        var wrongToken = await store.RenewAsync("run-1", "wrong-token", "node-a", TimeSpan.FromSeconds(30));
+        var wrongOwner = await store.RenewAsync("run-1", first.LeaseToken!, "node-b", TimeSpan.FromSeconds(30));
+        var renewed = await store.RenewAsync("run-1", first.LeaseToken!, "node-a", TimeSpan.FromSeconds(30));
+        clock.Advance(TimeSpan.FromSeconds(11));
+        var protectedByRenewal = await store.TryAcquireAsync("run-1", owner, "node-b", TimeSpan.FromSeconds(30));
+        clock.Advance(TimeSpan.FromSeconds(20));
         var takeover = await store.TryAcquireAsync("run-1", owner, "node-b", TimeSpan.FromSeconds(30));
 
         Assert.Equal(AgentRunLeaseStatus.Forbidden, forbidden.Status);
         Assert.Equal(AgentRunLeaseStatus.Acquired, first.Status);
         Assert.Equal(AgentRunLeaseStatus.Busy, busy.Status);
         Assert.Equal(AgentRunLeaseStatus.Busy, stillBusy.Status);
+        Assert.False(wrongToken);
+        Assert.False(wrongOwner);
+        Assert.True(renewed);
+        Assert.Equal(AgentRunLeaseStatus.Busy, protectedByRenewal.Status);
         Assert.Equal(AgentRunLeaseStatus.Acquired, takeover.Status);
         Assert.NotEqual(first.LeaseToken, takeover.LeaseToken);
     }

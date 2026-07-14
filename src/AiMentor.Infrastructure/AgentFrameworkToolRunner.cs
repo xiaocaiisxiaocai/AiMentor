@@ -177,9 +177,9 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
             var session = await _agent.DeserializeSessionAsync(checkpoint.SessionState,
                 cancellationToken: timeoutSource.Token);
             var runOptions = CreateRunOptions(guard);
-            var response = await _agent.RunAsync(
-                [new ChatMessage(ChatRole.User, [frameworkResponse])], session, runOptions,
-                timeoutSource.Token);
+            var response = await RunWithLeaseRenewalAsync(normalizedRunId, leaseToken,
+                token => _agent.RunAsync([new ChatMessage(ChatRole.User, [frameworkResponse])], session,
+                    runOptions, token), timeoutSource.Token);
 
             if (!approved)
             {
@@ -224,6 +224,71 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
                 guard.Steps, trace, cancellationToken);
             await _checkpointStore.CompleteAsync(normalizedRunId, leaseToken, CancellationToken.None);
             return result;
+        }
+    }
+
+    /// <summary>
+    /// 在可能长时间运行的模型与工具循环期间维持短租约；续租失败会取消旧实例，避免租约接管后双实例继续推进。
+    /// </summary>
+    private async Task<T> RunWithLeaseRenewalAsync<T>(string runId, string leaseToken,
+        Func<CancellationToken, Task<T>> operation, CancellationToken cancellationToken)
+    {
+        using var heartbeatStop = new CancellationTokenSource();
+        using var leaseLost = new CancellationTokenSource();
+        using var operationToken = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, leaseLost.Token);
+        var heartbeat = MaintainLeaseAsync(runId, leaseToken, leaseLost, heartbeatStop.Token);
+        try
+        {
+            var result = await operation(operationToken.Token);
+            if (leaseLost.IsCancellationRequested)
+                throw WorkflowFailure("AGENT_RESUME_LEASE_LOST", "Agent 恢复租约已失效，旧实例停止继续执行。",
+                    AgentRunWorkflowErrorKind.Conflict);
+
+            // 停止心跳前再延长一个完整租期，为保存新暂停点或删除终态预留确定的持久化窗口。
+            var handoffRenewed = await _checkpointStore.RenewAsync(runId, leaseToken, _leaseOwner,
+                _options.ResumeLeaseDuration, cancellationToken);
+            if (!handoffRenewed)
+                throw WorkflowFailure("AGENT_RESUME_LEASE_LOST", "Agent 恢复租约已失效，旧实例停止继续执行。",
+                    AgentRunWorkflowErrorKind.Conflict);
+            return result;
+        }
+        catch (OperationCanceledException) when (leaseLost.IsCancellationRequested
+                                                 && !cancellationToken.IsCancellationRequested)
+        {
+            throw WorkflowFailure("AGENT_RESUME_LEASE_LOST", "Agent 恢复租约已失效，旧实例停止继续执行。",
+                AgentRunWorkflowErrorKind.Conflict);
+        }
+        finally
+        {
+            await heartbeatStop.CancelAsync();
+            await heartbeat;
+        }
+    }
+
+    /// <summary>按配置周期续租；存储拒绝或异常均按租约丢失处理，禁止带病继续运行。</summary>
+    private async Task MaintainLeaseAsync(string runId, string leaseToken, CancellationTokenSource leaseLost,
+        CancellationToken stopToken)
+    {
+        try
+        {
+            while (true)
+            {
+                await Task.Delay(_options.ResumeLeaseRenewalInterval, stopToken);
+                var renewed = await _checkpointStore.RenewAsync(runId, leaseToken, _leaseOwner,
+                    _options.ResumeLeaseDuration, stopToken);
+                if (renewed) continue;
+                await leaseLost.CancelAsync();
+                return;
+            }
+        }
+        catch (OperationCanceledException) when (stopToken.IsCancellationRequested)
+        {
+            // 正常完成时停止心跳，不应把主动停止误报为租约丢失。
+        }
+        catch
+        {
+            // 无法确认续租成功时失败关闭；旧实例必须停止，交由租约过期后的新实例接管。
+            await leaseLost.CancelAsync();
         }
     }
 
@@ -366,7 +431,9 @@ public sealed class AgentFrameworkToolRunner : IAgentRunner
         if (options.MaximumModelIterations < 2 || options.MaximumToolCalls <= 0
             || options.MaximumCumulativeToolResultBytes <= 0 || options.MaximumAnswerCharacters <= 0
             || options.MaximumPendingApprovalRuns <= 0 || options.MaximumRunTime <= TimeSpan.Zero
-            || options.ResumeLeaseDuration <= options.MaximumRunTime)
+            || options.ResumeLeaseDuration <= TimeSpan.Zero
+            || options.ResumeLeaseRenewalInterval <= TimeSpan.Zero
+            || options.ResumeLeaseRenewalInterval > options.ResumeLeaseDuration / 2)
             throw new InvalidOperationException("Agent 执行预算配置无效。");
     }
 

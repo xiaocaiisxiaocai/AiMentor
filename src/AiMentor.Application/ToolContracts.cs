@@ -191,6 +191,7 @@ public sealed class AgentExecutionOptions
     public int MaximumPendingApprovalRuns { get; init; } = 1_000;
     public TimeSpan MaximumRunTime { get; init; } = TimeSpan.FromSeconds(10);
     public TimeSpan ResumeLeaseDuration { get; init; } = TimeSpan.FromSeconds(30);
+    public TimeSpan ResumeLeaseRenewalInterval { get; init; } = TimeSpan.FromSeconds(10);
 }
 
 /// <summary>持久化 Agent 原生会话、审批请求和执行预算，供其他实例安全恢复。</summary>
@@ -227,6 +228,8 @@ public interface IAgentRunCheckpointStore
         CancellationToken cancellationToken = default);
     Task<AgentRunLeaseResult> TryAcquireAsync(string runId, AccessContext access, string leaseOwner,
         TimeSpan leaseDuration, CancellationToken cancellationToken = default);
+    Task<bool> RenewAsync(string runId, string leaseToken, string leaseOwner, TimeSpan leaseDuration,
+        CancellationToken cancellationToken = default);
     Task ReleaseAsync(string runId, string leaseToken, CancellationToken cancellationToken = default);
     Task CompleteAsync(string runId, string leaseToken, CancellationToken cancellationToken = default);
 }

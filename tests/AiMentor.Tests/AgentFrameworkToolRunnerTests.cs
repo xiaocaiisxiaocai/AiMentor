@@ -169,7 +169,8 @@ public sealed class AgentFrameworkToolRunnerTests
 
         Assert.Equal("AGENT_RUN_RESUME_FORBIDDEN", forbidden.Code);
         Assert.Single(attempts, attempt => attempt.Result?.Status == AgentRunStatus.Completed);
-        Assert.Single(attempts, attempt => attempt.Error is "AGENT_RUN_ALREADY_RESUMED" or "AGENT_RUN_NOT_FOUND");
+        Assert.Single(attempts, attempt => attempt.Error is "AGENT_RUN_ALREADY_RESUMED"
+            or "AGENT_RUN_ALREADY_RESUMING" or "AGENT_RUN_NOT_FOUND");
         Assert.Equal(1, fixture.Tool.ExecutionCount);
     }
 
@@ -190,6 +191,32 @@ public sealed class AgentFrameworkToolRunnerTests
         Assert.Equal(AgentRunStatus.Completed, completed.Status);
         Assert.Equal(1, fixture.Tool.ExecutionCount);
         Assert.Single(completed.ToolSteps);
+    }
+
+    [Fact]
+    public async Task LostRenewalShouldCancelResumedRunBeforeMutationExecutes()
+    {
+        var options = new AgentExecutionOptions
+        {
+            MaximumModelIterations = 4,
+            MaximumToolCalls = 3,
+            MaximumCumulativeToolResultBytes = 4_096,
+            MaximumRunTime = TimeSpan.FromSeconds(1),
+            ResumeLeaseDuration = TimeSpan.FromMilliseconds(120),
+            ResumeLeaseRenewalInterval = TimeSpan.FromMilliseconds(30)
+        };
+        var fixture = CreateApprovalRunner(options: options, recordRenewals: true, allowRenewal: false,
+            mutationDelay: TimeSpan.FromMilliseconds(200));
+        var initial = await fixture.Runner.RunAsync(
+            "请删除记忆 memoryId=memory-lease-loss expectedVersion=1", Access, "agent-lease-loss");
+        await fixture.Approvals.DecideAsync(initial.Approval!.ApprovalId, true, "批准租约丢失测试", fixture.Approver);
+
+        var exception = await Assert.ThrowsAsync<AgentRunWorkflowException>(() =>
+            fixture.Runner.ResumeAsync(initial.RunId, Access));
+
+        Assert.Equal("AGENT_RESUME_LEASE_LOST", exception.Code);
+        Assert.True(fixture.RenewalStore!.RenewalCount >= 1);
+        Assert.Equal(0, fixture.Tool.ExecutionCount);
     }
 
     [Fact]
@@ -222,9 +249,10 @@ public sealed class AgentFrameworkToolRunnerTests
     }
 
     private static ApprovalRunnerFixture CreateApprovalRunner(TimeSpan? approvalLifetime = null,
-        int maximumPendingRuns = 1_000)
+        int maximumPendingRuns = 1_000, IChatClient? chatClient = null, AgentExecutionOptions? options = null,
+        bool recordRenewals = false, bool allowRenewal = true, TimeSpan? mutationDelay = null)
     {
-        var tool = new MutationTool();
+        var tool = new MutationTool(mutationDelay);
         var registry = new ServerToolRegistry([tool]);
         var safety = new RuleBasedToolInvocationSafetyService(new ToolSafetyOptions
         {
@@ -237,7 +265,7 @@ public sealed class AgentFrameworkToolRunnerTests
             ApprovalLifetime = approvalLifetime ?? TimeSpan.FromMinutes(15)
         }, clock);
         var executor = new SafeToolExecutor(registry, safety, trace, new ToolExecutorOptions(), clock, approvals);
-        var agentOptions = new AgentExecutionOptions
+        var agentOptions = options ?? new AgentExecutionOptions
         {
             MaximumModelIterations = 4,
             MaximumToolCalls = 3,
@@ -245,12 +273,16 @@ public sealed class AgentFrameworkToolRunnerTests
             MaximumPendingApprovalRuns = maximumPendingRuns,
             MaximumRunTime = TimeSpan.FromSeconds(2)
         };
-        var checkpoints = new InMemoryAgentRunCheckpointStore(clock, maximumPendingRuns);
-        var runner = new AgentFrameworkToolRunner(new DeterministicGroundedChatClient(), registry, executor,
+        var inMemoryCheckpoints = new InMemoryAgentRunCheckpointStore(clock, maximumPendingRuns);
+        var renewalStore = recordRenewals
+            ? new RecordingCheckpointStore(inMemoryCheckpoints, allowRenewal)
+            : null;
+        IAgentRunCheckpointStore checkpoints = renewalStore is null ? inMemoryCheckpoints : renewalStore;
+        var runner = new AgentFrameworkToolRunner(chatClient ?? new DeterministicGroundedChatClient(), registry, executor,
             new RuleBasedInputSafetyService(), trace, agentOptions, clock, approvals, checkpoints);
         return new ApprovalRunnerFixture(runner, approvals, tool, clock,
             AccessContext.Create("tenant-a", "approver", ["tool-approvers"]), registry, executor, trace,
-            agentOptions, checkpoints);
+            agentOptions, checkpoints, renewalStore);
     }
 
     private sealed class RecordingExecutor(string? padding = null) : IToolExecutor
@@ -286,7 +318,7 @@ public sealed class AgentFrameworkToolRunnerTests
             throw new InvalidOperationException("Agent 不得绕过 IToolExecutor 直接调用工具实现。");
     }
 
-    private sealed class MutationTool : IServerTool
+    private sealed class MutationTool(TimeSpan? executionDelay = null) : IServerTool
     {
         private int _executionCount;
         public int ExecutionCount => _executionCount;
@@ -296,21 +328,55 @@ public sealed class AgentFrameworkToolRunnerTests
             arguments.TryGetProperty("memoryId", out _) && arguments.TryGetProperty("expectedVersion", out _)
                 ? SafetyDecision.Allowed
                 : new SafetyDecision(SafetyAction.Refuse, "ARGUMENTS_INVALID", "参数无效。");
-        public Task<JsonElement> ExecuteAsync(ToolExecutionContext context, JsonElement arguments,
+        public async Task<JsonElement> ExecuteAsync(ToolExecutionContext context, JsonElement arguments,
             CancellationToken cancellationToken = default)
         {
             _ = context;
             _ = arguments;
+            if (executionDelay is not null)
+                await Task.Delay(executionDelay.Value, cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             Interlocked.Increment(ref _executionCount);
-            return Task.FromResult(JsonSerializer.SerializeToElement(new { deleted = true }));
+            return JsonSerializer.SerializeToElement(new { deleted = true });
         }
     }
 
     private sealed record ApprovalRunnerFixture(AgentFrameworkToolRunner Runner,
         InMemoryToolApprovalService Approvals, MutationTool Tool, ManualTimeProvider Clock, AccessContext Approver,
         ServerToolRegistry Registry, SafeToolExecutor Executor, InMemoryTraceSink Trace,
-        AgentExecutionOptions Options, InMemoryAgentRunCheckpointStore Checkpoints);
+        AgentExecutionOptions Options, IAgentRunCheckpointStore Checkpoints,
+        RecordingCheckpointStore? RenewalStore);
+
+    /// <summary>记录续租调用并可模拟共享存储拒绝续租，用于验证旧实例失败关闭。</summary>
+    private sealed class RecordingCheckpointStore(IAgentRunCheckpointStore inner, bool allowRenewal)
+        : IAgentRunCheckpointStore
+    {
+        private int _renewalCount;
+        public int RenewalCount => _renewalCount;
+
+        public Task SavePendingAsync(AgentRunCheckpoint checkpoint, string? leaseToken = null,
+            CancellationToken cancellationToken = default) =>
+            inner.SavePendingAsync(checkpoint, leaseToken, cancellationToken);
+
+        public Task<AgentRunLeaseResult> TryAcquireAsync(string runId, AccessContext access, string leaseOwner,
+            TimeSpan leaseDuration, CancellationToken cancellationToken = default) =>
+            inner.TryAcquireAsync(runId, access, leaseOwner, leaseDuration, cancellationToken);
+
+        public async Task<bool> RenewAsync(string runId, string leaseToken, string leaseOwner,
+            TimeSpan leaseDuration, CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref _renewalCount);
+            return allowRenewal && await inner.RenewAsync(runId, leaseToken, leaseOwner, leaseDuration,
+                cancellationToken);
+        }
+
+        public Task ReleaseAsync(string runId, string leaseToken, CancellationToken cancellationToken = default) =>
+            inner.ReleaseAsync(runId, leaseToken, cancellationToken);
+
+        public Task CompleteAsync(string runId, string leaseToken, CancellationToken cancellationToken = default) =>
+            inner.CompleteAsync(runId, leaseToken, cancellationToken);
+    }
+
 
     private sealed class ManualTimeProvider(DateTimeOffset utcNow) : TimeProvider
     {

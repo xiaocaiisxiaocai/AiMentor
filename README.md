@@ -225,7 +225,9 @@ Invoke-RestMethod http://127.0.0.1:5080/api/v1/tools/memory.delete/execute `
   }) -Body (@{ arguments = $arguments; approvalId = $approval.id } | ConvertTo-Json)
 ```
 
-默认 `Workflow:Provider=InMemory` 适合本地开发；切换为 `SqlServer` 后，审批状态与 Agent Framework 序列化会话会共同持久化。审批裁决和“Approved → Consumed”使用可串行化事务，暂停运行通过短租约执行“Pending → Leased”，租约到期后才允许其他实例接管。参数值不会写入审批表，Agent 会话、参数和轨迹则整体加密后进入检查点表；加密认证上下文绑定 `runId`，复制或篡改密文会恢复失败。相同 `Idempotency-Key` 绑定不同参数会返回 `IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST`，不会错误回放旧结果。
+默认 `Workflow:Provider=InMemory` 适合本地开发；切换为 `SqlServer` 后，审批状态与 Agent Framework 序列化会话会共同持久化。审批裁决和“Approved → Consumed”使用可串行化事务，暂停运行通过短租约执行“Pending → Leased”，租约到期后才允许其他实例接管。恢复中的模型与工具循环按 `Agent:ResumeLeaseRenewalIntervalSeconds` 周期续租；只有当前 `LeaseToken + LeaseOwner` 且尚未过期时才能延长。续租被拒绝或存储异常会取消旧实例的执行令牌并返回 `AGENT_RESUME_LEASE_LOST`，防止接管后双实例并行推进。参数值不会写入审批表，Agent 会话、参数和轨迹则整体加密后进入检查点表；加密认证上下文绑定 `runId`，复制或篡改密文会恢复失败。相同 `Idempotency-Key` 绑定不同参数会返回 `IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST`，不会错误回放旧结果。
+
+`Agent:MaximumRunTimeSeconds` 可以大于租约时长；默认运行上限、租约长度、续租周期分别为 10、30、10 秒。续租周期必须不大于租约长度的一半，为网络抖动和最终检查点持久化保留安全余量。
 
 本地 SQL Server 启动与配置：
 
@@ -311,7 +313,7 @@ Invoke-RestMethod "http://127.0.0.1:5080/api/v1/agents/runs/$($run.runId)/resume
   -Method Post -Headers @{ Authorization = 'Bearer <requester-token>' }
 ```
 
-恢复接口只接受原始租户和原始用户，同一运行的并发恢复只有一个请求能成功。框架批准响应只恢复原始函数调用，随后 `IToolExecutor` 还会消费绑定精确参数的一次性服务端凭据；因此伪造框架响应、重放恢复请求或替换参数均不能执行工具。本项目没有启用 Agent Framework 1.13.0 `ToolApprovalAgent` 的“永远批准此工具”规则，因为它会把一次审批扩大成长期授权。
+恢复接口只接受原始租户和原始用户，同一运行的并发恢复只有一个请求能成功。短租约会在长任务运行时持续续期，错误令牌、错误实例或已过期租约不能被续活；模型/工具循环结束后还会执行一次交接续租，为保存下一检查点或终态提供完整租期。框架批准响应只恢复原始函数调用，随后 `IToolExecutor` 还会消费绑定精确参数的一次性服务端凭据；因此伪造框架响应、重放恢复请求或替换参数均不能执行工具。本项目没有启用 Agent Framework 1.13.0 `ToolApprovalAgent` 的“永远批准此工具”规则，因为它会把一次审批扩大成长期授权。
 
 ### API 成熟度与安全边界
 
@@ -351,15 +353,15 @@ $env:Authentication__GroupsClaim = 'groups'
 
 ## 下一阶段
 
-1. 为长时间运行的 Agent Workflow 增加续租、主动取消、补偿策略和跨小时故障验收；工具 `Executing` 精确窗口强杀、多实例并发裁决和滚动回放已通过真实容器验证。
-2. 为跨小时 Workflow 增加取消、补偿、续租和人工任务队列；当前短租约只覆盖短时 Agent 工具审批恢复。
+1. 为长时间运行的 Agent Workflow 增加持久化主动取消，并处理“取消、续租、接管、工具副作用”四方竞争；短租约自动续租已完成。
+2. 增加补偿策略、跨小时故障验收和人工任务队列；工具 `Executing` 精确窗口强杀、多实例并发裁决和滚动回放已通过真实容器验证。
 3. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率、恶意文档隔离率和引用正确率门禁。
 4. 接入真实身份提供方做两个主体的有效 Token 端到端验收，并覆盖密钥轮换、过期 Token、错误 audience、组变更和审批人离职场景。
 5. 接入真实模型、嵌入与语义重排供应商，比较当前确定性重排、归一化加权和 RRF 等策略，并运行同一套契约测试和 150 条回归，确认沙箱与生产适配器行为边界。
 
 ## 验证状态
 
-- 2026-07-14 本地自动化测试 82/82 通过；真实 SQL Server LocalDB 测试执行 `001` 至 `005`，验证执行结果加密回放、`OutcomeUnknown` 冻结、租户隔离、目标探测、两名不同人员的原子裁决和已生效结案。Docker 临时 SQL Server 与最多六个并发 API 实例进一步验证：不同身份跨实例审批、SQL 进入 `Executing` 后且工具调用前精确强杀、租约过期冻结、调用实例与第一复核实例强杀、两个第二复核实例并发时恰好一个胜出，以及滚动替代实例返回 `Reconciled`。故障屏障仅能在 `Testing` 环境显式配置，普通开发与生产路径均为空实现。150 条离线评测决策匹配率 90%、引用召回率 75%，质量门禁通过；NuGet 直接与传递依赖未发现已知漏洞。
+- 2026-07-14 本地自动化测试 83/83 通过；InMemory 与真实 SQL Server 均验证只有当前实例、当前令牌、未过期租约可以续期，续租后的原到期点不能被其他实例接管，续租最终停止后才允许接管。Agent 运行器回归测试确认续租丢失会取消正在等待的修改工具且不产生副作用。真实 SQL Server LocalDB 还执行 `001` 至 `005`，验证执行结果加密回放、`OutcomeUnknown` 冻结、租户隔离、目标探测、双人原子裁决和已生效结案。Docker 临时 SQL Server 与最多六个并发 API 实例进一步验证精确强杀、租约过期冻结、并发复核单胜者和 `Reconciled` 滚动回放。150 条离线评测决策匹配率 90%、引用召回率 75%，质量门禁通过；NuGet 直接与传递依赖未发现已知漏洞。
 - OpenSearch 请求契约已由自动化测试验证：索引映射、搜索管线、批量摄取，以及 BM25/k-NN 两个分支中的租户和 ACL 过滤。
 - 2026-07-13 尝试拉取 `opensearchproject/opensearch:3.5.0` 做真实容器验收，但镜像仓库连续两次无下载进度并超时，未创建镜像或容器。因此真实集群验收尚未通过，网络恢复后必须重新执行 `docker compose up -d` 和 HTTP 闭环。
 - 2026-07-13 拉取 `mcr.microsoft.com/mssql/server:2022-latest` 在 120 秒内无下载进度并超时；2026-07-14 改用本机 SQL Server LocalDB 完成真实事务测试并通过。容器部署形态仍需在镜像网络恢复后补做启动、健康检查和进程强杀验收，但数据库事务实现已获得真实 SQL 执行证据。

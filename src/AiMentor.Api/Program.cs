@@ -191,7 +191,14 @@ builder.Services.AddSingleton<IToolExecutor, SafeToolExecutor>();
 builder.Services.AddSingleton(new ToolExecutionReconciliationOptions());
 builder.Services.AddSingleton<IToolOutcomeProbe, MemoryDeleteOutcomeProbe>();
 builder.Services.AddSingleton<IToolExecutionReconciliationService, ToolExecutionReconciliationService>();
-builder.Services.AddSingleton(new AgentExecutionOptions());
+builder.Services.AddSingleton(new AgentExecutionOptions
+{
+    // 最大运行时间可长于租约；活动恢复实例通过短租约心跳维持独占权。
+    MaximumRunTime = TimeSpan.FromSeconds(builder.Configuration.GetValue("Agent:MaximumRunTimeSeconds", 10)),
+    ResumeLeaseDuration = TimeSpan.FromSeconds(builder.Configuration.GetValue("Agent:ResumeLeaseDurationSeconds", 30)),
+    ResumeLeaseRenewalInterval = TimeSpan.FromSeconds(
+        builder.Configuration.GetValue("Agent:ResumeLeaseRenewalIntervalSeconds", 10))
+});
 builder.Services.AddSingleton<IAgentRunner, AgentFrameworkToolRunner>();
 builder.Services.AddSingleton<IOutputSafetyService, RuleBasedOutputSafetyService>();
 builder.Services.AddSingleton<IEvidenceReranker, LexicalEvidenceReranker>();

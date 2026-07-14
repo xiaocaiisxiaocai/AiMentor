@@ -69,9 +69,20 @@ public sealed class SqlServerWorkflowIntegrationTests
                 checkpoints.TryAcquireAsync(checkpoint.RunId, requester, "node-b", TimeSpan.FromSeconds(30)));
             var beforeRotation = await ReadPayloadAsync(testConnection, checkpoint.RunId);
             var crashedLease = Assert.Single(leases, result => result.Status == AgentRunLeaseStatus.Acquired);
+            var crashedOwner = leases[0].Status == AgentRunLeaseStatus.Acquired ? "node-a" : "node-b";
 
-            // 不释放实例 A 的租约来模拟进程强杀；只有租约过期后实例 B 才能用新活动密钥接管。
-            clock.Advance(TimeSpan.FromSeconds(31));
+            // 当前租约持有者可以延长租约，错误实例和错误令牌均不能阻止或冒充续租。
+            clock.Advance(TimeSpan.FromSeconds(20));
+            var wrongRenewal = await checkpoints.RenewAsync(checkpoint.RunId, "wrong-token", crashedOwner,
+                TimeSpan.FromSeconds(30));
+            var renewed = await checkpoints.RenewAsync(checkpoint.RunId, crashedLease.LeaseToken!, crashedOwner,
+                TimeSpan.FromSeconds(30));
+            clock.Advance(TimeSpan.FromSeconds(11));
+            var protectedByRenewal = await checkpoints.TryAcquireAsync(checkpoint.RunId, requester, "node-c",
+                TimeSpan.FromSeconds(30));
+
+            // 续租后的实例再失联，只有新租约也过期后其他实例才能用新活动密钥接管。
+            clock.Advance(TimeSpan.FromSeconds(20));
             var nextKey = System.Security.Cryptography.RandomNumberGenerator.GetBytes(32);
             var rotatedCipher = new AesGcmWorkflowStateCipher("v2", new Dictionary<string, byte[]>
             {
@@ -146,6 +157,9 @@ public sealed class SqlServerWorkflowIntegrationTests
             Assert.Single(leases, result => result.Status == AgentRunLeaseStatus.Acquired);
             Assert.Single(leases, result => result.Status == AgentRunLeaseStatus.Busy);
             Assert.NotNull(crashedLease.LeaseToken);
+            Assert.False(wrongRenewal);
+            Assert.True(renewed);
+            Assert.Equal(AgentRunLeaseStatus.Busy, protectedByRenewal.Status);
             Assert.Equal("v1", beforeRotation.KeyVersion);
             Assert.Equal(AgentRunLeaseStatus.Acquired, takeover.Status);
             Assert.Equal("v2", afterRotation.KeyVersion);
