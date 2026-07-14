@@ -208,11 +208,13 @@ if (string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreC
         InitializeSchema = builder.Configuration.GetValue("Workflow:InitializeSchema", !builder.Environment.IsProduction())
     });
     builder.Services.AddSingleton<IAgentRunCheckpointStore, SqlServerAgentRunCheckpointStore>();
+    builder.Services.AddSingleton<IToolExecutionLedger, SqlServerToolExecutionLedger>();
 }
 else if (string.Equals(workflowProvider, "InMemory", StringComparison.OrdinalIgnoreCase))
 {
     builder.Services.AddSingleton<IAgentRunCheckpointStore>(services =>
         new InMemoryAgentRunCheckpointStore(services.GetRequiredService<TimeProvider>(), 1_000));
+    builder.Services.AddSingleton<IToolExecutionLedger, InMemoryToolExecutionLedger>();
 }
 else
 {

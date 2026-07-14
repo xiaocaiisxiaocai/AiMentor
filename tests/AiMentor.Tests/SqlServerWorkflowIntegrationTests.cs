@@ -33,6 +33,7 @@ public sealed class SqlServerWorkflowIntegrationTests
             var repositoryRoot = FindRepositoryRoot();
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "001_workflow.sql"));
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "002_workflow_key_version.sql"));
+            await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "003_tool_execution_ledger.sql"));
             var clock = new MutableTimeProvider(new DateTimeOffset(2026, 7, 14, 1, 0, 0, TimeSpan.Zero));
             var trace = new InMemoryTraceSink();
             var tool = new MutationTool();
@@ -87,6 +88,36 @@ public sealed class SqlServerWorkflowIntegrationTests
                 TimeSpan.FromSeconds(30));
             await newKeyOnlyStore.CompleteAsync(checkpoint.RunId, newKeyOnly.LeaseToken!);
 
+            using var executionLedger = new SqlServerToolExecutionLedger(sqlOptions, rotatedCipher, clock);
+            var executionKey = new string('A', 64);
+            var fingerprint = new string('B', 64);
+            var executing = await executionLedger.TryAcquireAsync(executionKey, fingerprint, "tool-run-1",
+                TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
+            await executionLedger.MarkExecutingAsync(executionKey, executing.LeaseToken!);
+            clock.Advance(TimeSpan.FromSeconds(31));
+            var outcomeUnknown = await executionLedger.TryAcquireAsync(executionKey, fingerprint, "tool-run-2",
+                TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
+
+            var completedKey = new string('C', 64);
+            using var oldExecutionLedger = new SqlServerToolExecutionLedger(sqlOptions, workflowCipher, clock);
+            var completed = await oldExecutionLedger.TryAcquireAsync(completedKey, new string('D', 64), "tool-run-3",
+                TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
+            await oldExecutionLedger.MarkExecutingAsync(completedKey, completed.LeaseToken!);
+            await oldExecutionLedger.CompleteAsync(completedKey, completed.LeaseToken!, new ToolExecutionResult(
+                "tool-run-3", "memory.delete", ToolExecutionStatus.Completed,
+                JsonSerializer.SerializeToElement(new { deleted = true, secret = "sensitive-result" }),
+                SafetyDecision.Allowed, false,
+                [new TraceStep("tool.completed", "ok", clock.GetUtcNow(),
+                    new Dictionary<string, object?> { ["code"] = "TOOL_EXECUTION_SAFE" })]));
+            using var rotatingReplayLedger = new SqlServerToolExecutionLedger(sqlOptions, rotatedCipher, clock);
+            var rotatingReplay = await rotatingReplayLedger.TryAcquireAsync(completedKey, new string('D', 64), "tool-run-4",
+                TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
+            using var replayLedger = new SqlServerToolExecutionLedger(sqlOptions,
+                new AesGcmWorkflowStateCipher("v2", new Dictionary<string, byte[]> { ["v2"] = nextKey }), clock);
+            var replay = await replayLedger.TryAcquireAsync(completedKey, new string('D', 64), "tool-run-5",
+                TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
+            var rawExecutionResult = await ReadExecutionResultAsync(testConnection, completedKey);
+
             Assert.Single(consumptions, result => result.Allowed);
             Assert.Single(consumptions, result => result.Decision.Code == "TOOL_APPROVAL_ALREADY_CONSUMED");
             Assert.Single(leases, result => result.Status == AgentRunLeaseStatus.Acquired);
@@ -99,6 +130,12 @@ public sealed class SqlServerWorkflowIntegrationTests
             Assert.Equal(AgentRunLeaseStatus.Acquired, newKeyOnly.Status);
             Assert.DoesNotContain("secret-memory-id", afterRotation.Payload, StringComparison.Ordinal);
             Assert.DoesNotContain("memoryId", afterRotation.Payload, StringComparison.Ordinal);
+            Assert.Equal(IdempotencyAcquireStatus.OutcomeUnknown, outcomeUnknown.Status);
+            Assert.Equal(IdempotencyAcquireStatus.Replay, rotatingReplay.Status);
+            Assert.Equal(IdempotencyAcquireStatus.Replay, replay.Status);
+            Assert.Equal("tool-run-3", replay.ReplayResult!.RunId);
+            Assert.Single(replay.ReplayResult.Trace);
+            Assert.DoesNotContain("sensitive-result", rawExecutionResult, StringComparison.Ordinal);
         }
         finally
         {
@@ -163,6 +200,16 @@ public sealed class SqlServerWorkflowIntegrationTests
         await using var reader = await command.ExecuteReaderAsync();
         Assert.True(await reader.ReadAsync());
         return (reader.IsDBNull(0) ? null : reader.GetString(0), reader.GetString(1));
+    }
+
+    private static async Task<string> ReadExecutionResultAsync(string connectionString, string executionKey)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT ResultCipher FROM dbo.AiMentorToolExecutions WHERE ExecutionKey=@key;";
+        command.Parameters.AddWithValue("@key", executionKey);
+        return (string)(await command.ExecuteScalarAsync() ?? string.Empty);
     }
 
     private sealed class MutationTool : IServerTool

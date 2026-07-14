@@ -29,6 +29,29 @@ public interface IToolExecutor
         string? idempotencyKey = null, string? approvalId = null, CancellationToken cancellationToken = default);
 }
 
+/// <summary>表示幂等执行账本的占位、回放、冲突、忙碌或结果不确定结论。</summary>
+public enum IdempotencyAcquireStatus { Acquired, Replay, InProgress, OutcomeUnknown, FingerprintMismatch, Capacity }
+
+/// <summary>返回幂等账本原子占位结果、租约令牌或已完成的加密回放结果。</summary>
+public sealed record IdempotencyAcquireResult(
+    IdempotencyAcquireStatus Status,
+    string? LeaseToken = null,
+    ToolExecutionResult? ReplayResult = null);
+
+/// <summary>在副作用执行前建立持久化占位，并区分可安全重试和结果不确定状态。</summary>
+public interface IToolExecutionLedger
+{
+    Task<IdempotencyAcquireResult> TryAcquireAsync(string executionKey, string requestFingerprint, string runId,
+        TimeSpan leaseDuration, TimeSpan retention, int maximumEntries,
+        CancellationToken cancellationToken = default);
+    Task MarkExecutingAsync(string executionKey, string leaseToken, CancellationToken cancellationToken = default);
+    Task CompleteAsync(string executionKey, string leaseToken, ToolExecutionResult result,
+        CancellationToken cancellationToken = default);
+    Task MarkOutcomeUnknownAsync(string executionKey, string leaseToken,
+        CancellationToken cancellationToken = default);
+    Task AbandonAsync(string executionKey, string leaseToken, CancellationToken cancellationToken = default);
+}
+
 /// <summary>执行有界 Agent 规划并返回可审计的工具步骤和终止状态。</summary>
 public interface IAgentRunner
 {
@@ -106,4 +129,5 @@ public sealed class ToolExecutorOptions
     public TimeSpan MaximumTimeout { get; init; } = TimeSpan.FromSeconds(30);
     public TimeSpan IdempotencyRetention { get; init; } = TimeSpan.FromHours(1);
     public int MaximumIdempotencyEntries { get; init; } = 10_000;
+    public TimeSpan IdempotencyLeaseDuration { get; init; } = TimeSpan.FromSeconds(45);
 }

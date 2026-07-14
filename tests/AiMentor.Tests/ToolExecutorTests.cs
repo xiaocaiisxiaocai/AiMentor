@@ -121,6 +121,19 @@ public sealed class ToolExecutorTests
     }
 
     [Fact]
+    public async Task OutcomeUnknownLedgerStateShouldNeverInvokeToolAgain()
+    {
+        var tool = new FakeTool("stable.mutate", ToolOperationRisk.Mutation, requiresIdempotencyKey: true);
+        var executor = CreateExecutor(tool, new OutcomeUnknownLedger());
+
+        var result = await executor.ExecuteAsync(tool.Descriptor.Name, EmptyArguments, Access, "request-unknown");
+
+        Assert.Equal(ToolExecutionStatus.OutcomeUnknown, result.Status);
+        Assert.Equal("TOOL_EXECUTION_OUTCOME_UNKNOWN", result.Safety.Code);
+        Assert.Equal(0, tool.ExecutionCount);
+    }
+
+    [Fact]
     public void MutationToolWithoutIdempotencyRequirementShouldFailRegistration()
     {
         var tool = new FakeTool("unsafe.mutate", ToolOperationRisk.Mutation);
@@ -141,14 +154,26 @@ public sealed class ToolExecutorTests
         Assert.Equal(0, tool.ExecutionCount);
     }
 
-    private static SafeToolExecutor CreateExecutor(IServerTool tool)
+    private static SafeToolExecutor CreateExecutor(IServerTool tool, IToolExecutionLedger? ledger = null)
     {
         var safety = new RuleBasedToolInvocationSafetyService(new ToolSafetyOptions
         {
             AllowedTools = new HashSet<string>([tool.Descriptor.Name], StringComparer.OrdinalIgnoreCase)
         });
         return new SafeToolExecutor(new ServerToolRegistry([tool]), safety, new InMemoryTraceSink(),
-            new ToolExecutorOptions(), TimeProvider.System);
+            new ToolExecutorOptions(), TimeProvider.System, executionLedger: ledger);
+    }
+
+    private sealed class OutcomeUnknownLedger : IToolExecutionLedger
+    {
+        public Task<IdempotencyAcquireResult> TryAcquireAsync(string executionKey, string requestFingerprint,
+            string runId, TimeSpan leaseDuration, TimeSpan retention, int maximumEntries,
+            CancellationToken cancellationToken = default) => Task.FromResult(
+                new IdempotencyAcquireResult(IdempotencyAcquireStatus.OutcomeUnknown));
+        public Task MarkExecutingAsync(string executionKey, string leaseToken, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task CompleteAsync(string executionKey, string leaseToken, ToolExecutionResult result, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task MarkOutcomeUnknownAsync(string executionKey, string leaseToken, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task AbandonAsync(string executionKey, string leaseToken, CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 
     private sealed class FakeTool(

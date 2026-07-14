@@ -1,4 +1,4 @@
-using System.Collections.Concurrent;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using AiMentor.Application;
@@ -41,9 +41,10 @@ public sealed class SafeToolExecutor(
     ITraceSink traceSink,
     ToolExecutorOptions options,
     TimeProvider timeProvider,
-    IToolApprovalService? approvalService = null) : IToolExecutor
+    IToolApprovalService? approvalService = null,
+    IToolExecutionLedger? executionLedger = null) : IToolExecutor
 {
-    private readonly ConcurrentDictionary<string, IdempotentExecution> _idempotentExecutions = new(StringComparer.Ordinal);
+    private readonly IToolExecutionLedger _executionLedger = executionLedger ?? new InMemoryToolExecutionLedger(timeProvider);
 
     public async Task<ToolExecutionResult> ExecuteAsync(string toolName, JsonElement arguments, AccessContext access,
         string? idempotencyKey = null, string? approvalId = null, CancellationToken cancellationToken = default)
@@ -67,35 +68,71 @@ public sealed class SafeToolExecutor(
             return await RejectAsync(runId, tool.Descriptor.Name, "IDEMPOTENCY_KEY_INVALID", "Idempotency-Key 格式无效。", cancellationToken);
 
         if (!tool.Descriptor.RequiresIdempotencyKey)
-            return await ExecuteCoreAsync(runId, tool, normalizedArguments, access, approvalId, cancellationToken);
+            return await ExecuteCoreAsync(runId, tool, normalizedArguments, access, approvalId, null, cancellationToken);
 
-        var cacheKey = string.Join('\u001f', access.TenantId, access.SubjectId, tool.Descriptor.Name, normalizedIdempotencyKey);
-        if (options.IdempotencyRetention <= TimeSpan.Zero || options.MaximumIdempotencyEntries <= 0)
+        if (options.IdempotencyRetention <= TimeSpan.Zero || options.MaximumIdempotencyEntries <= 0
+            || options.IdempotencyLeaseDuration <= options.MaximumTimeout)
             return await RejectAsync(runId, tool.Descriptor.Name, "IDEMPOTENCY_CONFIGURATION_INVALID",
-                "服务器幂等缓存配置无效。", cancellationToken);
-        PruneIdempotencyCache(timeProvider.GetUtcNow());
-        if (_idempotentExecutions.Count >= options.MaximumIdempotencyEntries
-            && !_idempotentExecutions.ContainsKey(cacheKey))
-            return await RejectAsync(runId, tool.Descriptor.Name, "IDEMPOTENCY_CAPACITY_EXCEEDED",
-                "服务器幂等缓存已达到容量上限，请稍后重试。", cancellationToken);
+                "服务器幂等执行账本配置无效。", cancellationToken);
 
         var requestFingerprint = JsonArgumentFingerprint.Create(tool.Descriptor.Name, normalizedArguments, access);
-        var candidate = new IdempotentExecution(timeProvider.GetUtcNow(), requestFingerprint,
-            new Lazy<Task<ToolExecutionResult>>(
-            () => ExecuteCoreAsync(runId, tool, normalizedArguments, access, approvalId, CancellationToken.None),
-            LazyThreadSafetyMode.ExecutionAndPublication));
-        var execution = _idempotentExecutions.GetOrAdd(cacheKey, candidate);
-        var replay = !ReferenceEquals(candidate, execution);
-        if (replay && !string.Equals(execution.RequestFingerprint, requestFingerprint, StringComparison.Ordinal))
+        var executionKey = CreateExecutionKey(access, tool.Descriptor.Name, normalizedIdempotencyKey!);
+        var acquired = await _executionLedger.TryAcquireAsync(executionKey, requestFingerprint, runId,
+            options.IdempotencyLeaseDuration, options.IdempotencyRetention, options.MaximumIdempotencyEntries,
+            cancellationToken);
+        if (acquired.Status == IdempotencyAcquireStatus.Replay && acquired.ReplayResult is not null)
+            return acquired.ReplayResult with { IdempotentReplay = true };
+        if (acquired.Status == IdempotencyAcquireStatus.FingerprintMismatch)
             return await RejectAsync(runId, tool.Descriptor.Name, "IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST",
                 "相同 Idempotency-Key 已绑定其他工具参数。", cancellationToken);
-        var result = await execution.Task.Value.WaitAsync(cancellationToken);
-        if (result.Status != ToolExecutionStatus.Completed) _idempotentExecutions.TryRemove(cacheKey, out _);
-        return result with { IdempotentReplay = replay };
+        if (acquired.Status == IdempotencyAcquireStatus.InProgress)
+            return await RejectAsync(runId, tool.Descriptor.Name, "IDEMPOTENCY_EXECUTION_IN_PROGRESS",
+                "相同幂等请求正在执行，请稍后查询或重试。", cancellationToken);
+        if (acquired.Status == IdempotencyAcquireStatus.OutcomeUnknown)
+            return await OutcomeUnknownAsync(runId, tool.Descriptor.Name, cancellationToken);
+        if (acquired.Status == IdempotencyAcquireStatus.Capacity)
+            return await RejectAsync(runId, tool.Descriptor.Name, "IDEMPOTENCY_CAPACITY_EXCEEDED",
+                "服务器幂等执行账本已达到容量上限，请稍后重试。", cancellationToken);
+        if (acquired.Status != IdempotencyAcquireStatus.Acquired || acquired.LeaseToken is null)
+            return await RejectAsync(runId, tool.Descriptor.Name, "IDEMPOTENCY_LEDGER_FAILED",
+                "服务器无法建立幂等执行占位。", cancellationToken);
+
+        var sideEffectStarted = false;
+        try
+        {
+            var result = await ExecuteCoreAsync(runId, tool, normalizedArguments, access, approvalId,
+                async token =>
+                {
+                    await _executionLedger.MarkExecutingAsync(executionKey, acquired.LeaseToken, token);
+                    sideEffectStarted = true;
+                }, cancellationToken);
+            if (!sideEffectStarted)
+            {
+                await _executionLedger.AbandonAsync(executionKey, acquired.LeaseToken, CancellationToken.None);
+                return result;
+            }
+            if (result.Status is ToolExecutionStatus.Completed or ToolExecutionStatus.ResultTooLarge)
+            {
+                await _executionLedger.CompleteAsync(executionKey, acquired.LeaseToken, result,
+                    CancellationToken.None);
+                return result;
+            }
+            await _executionLedger.MarkOutcomeUnknownAsync(executionKey, acquired.LeaseToken, CancellationToken.None);
+            return await OutcomeUnknownAsync(runId, tool.Descriptor.Name, CancellationToken.None);
+        }
+        catch
+        {
+            if (sideEffectStarted)
+                await _executionLedger.MarkOutcomeUnknownAsync(executionKey, acquired.LeaseToken, CancellationToken.None);
+            else
+                await _executionLedger.AbandonAsync(executionKey, acquired.LeaseToken, CancellationToken.None);
+            throw;
+        }
     }
 
     private async Task<ToolExecutionResult> ExecuteCoreAsync(string runId, IServerTool tool, JsonElement arguments,
-        AccessContext access, string? approvalId, CancellationToken cancellationToken)
+        AccessContext access, string? approvalId, Func<CancellationToken, Task>? beforeExecute,
+        CancellationToken cancellationToken)
     {
         var trace = new List<TraceStep>
         {
@@ -154,6 +191,7 @@ public sealed class SafeToolExecutor(
         timeoutSource.CancelAfter(timeout);
         try
         {
+            if (beforeExecute is not null) await beforeExecute(cancellationToken);
             var output = await tool.ExecuteAsync(new ToolExecutionContext(access, runId), arguments, timeoutSource.Token);
             if (Encoding.UTF8.GetByteCount(output.GetRawText()) > tool.Descriptor.MaximumResultBytes)
             {
@@ -205,6 +243,19 @@ public sealed class SafeToolExecutor(
         return CompleteAsync(runId, toolName, ToolExecutionStatus.Rejected, null, decision, false, trace, cancellationToken);
     }
 
+    private Task<ToolExecutionResult> OutcomeUnknownAsync(string runId, string toolName,
+        CancellationToken cancellationToken)
+    {
+        var decision = new SafetyDecision(SafetyAction.Refuse, "TOOL_EXECUTION_OUTCOME_UNKNOWN",
+            "上一次工具执行可能已经产生副作用，系统不会自动重试，请人工核对目标状态。");
+        var trace = new List<TraceStep>
+        {
+            Step("tool.idempotency", "outcome_unknown", new Dictionary<string, object?> { ["code"] = decision.Code })
+        };
+        return CompleteAsync(runId, toolName, ToolExecutionStatus.OutcomeUnknown, null, decision, false, trace,
+            cancellationToken);
+    }
+
     private async Task<ToolExecutionResult> CompleteAsync(string runId, string toolName, ToolExecutionStatus status,
         JsonElement? output, SafetyDecision decision, bool replay, IReadOnlyList<TraceStep> trace,
         CancellationToken cancellationToken)
@@ -221,21 +272,12 @@ public sealed class SafeToolExecutor(
                 ? normalized : null;
     }
 
-    private void PruneIdempotencyCache(DateTimeOffset now)
-    {
-        foreach (var item in _idempotentExecutions)
-        {
-            if (item.Value.CreatedAt.Add(options.IdempotencyRetention) <= now
-                && item.Value.Task.IsValueCreated && item.Value.Task.Value.IsCompleted)
-                _idempotentExecutions.TryRemove(item.Key, out _);
-        }
-    }
-
     private TraceStep Step(string name, string outcome, IReadOnlyDictionary<string, object?> details) =>
         new(name, outcome, timeProvider.GetUtcNow(), details);
 
-    private sealed record IdempotentExecution(DateTimeOffset CreatedAt, string RequestFingerprint,
-        Lazy<Task<ToolExecutionResult>> Task);
+    private static string CreateExecutionKey(AccessContext access, string toolName, string idempotencyKey) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(
+            $"{access.TenantId}\u001f{access.SubjectId}\u001f{toolName.ToLowerInvariant()}\u001f{idempotencyKey}")));
 }
 
 /// <summary>返回不含文档正文的只读知识库规模统计。</summary>

@@ -5,7 +5,7 @@ namespace AiMentor.Domain;
 /// <summary>按副作用和权限敏感度划分服务器工具。</summary>
 public enum ToolOperationRisk { ReadOnly, Mutation, Privileged }
 /// <summary>描述工具调用经过安全门禁后的终态。</summary>
-public enum ToolExecutionStatus { Completed, Rejected, RequiresApproval, TimedOut, ResultTooLarge, Failed }
+public enum ToolExecutionStatus { Completed, Rejected, RequiresApproval, TimedOut, ResultTooLarge, Failed, OutcomeUnknown }
 
 /// <summary>服务器维护的工具能力、风险和资源限制元数据。</summary>
 public sealed record ToolDescriptor(

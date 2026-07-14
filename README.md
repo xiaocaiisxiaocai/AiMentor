@@ -228,7 +228,7 @@ $env:AIMENTOR_MEMORY_ENCRYPTION_KEY = '<至少32字节的Base64密钥>'
 dotnet run --project src\AiMentor.Api
 ```
 
-开发环境 SQL Server 模式会按需创建 `AiMentorToolApprovals` 和 `AiMentorAgentRuns`，并用数据库应用锁避免多个实例同时建表。Production 强制 `Workflow:Provider=SqlServer`、`Encrypt=True`、`TrustServerCertificate=False`，且默认关闭运行时建表；发布账号应依次执行 [`001_workflow.sql`](deploy/sql/001_workflow.sql) 和 [`002_workflow_key_version.sql`](deploy/sql/002_workflow_key_version.sql)，应用账号只授予表级读写权限。
+开发环境 SQL Server 模式会按需创建 `AiMentorToolApprovals`、`AiMentorAgentRuns` 和 `AiMentorToolExecutions`，并用数据库应用锁避免多个实例同时建表。Production 强制 `Workflow:Provider=SqlServer`、`Encrypt=True`、`TrustServerCertificate=False`，且默认关闭运行时建表；发布账号应依次执行 [`001_workflow.sql`](deploy/sql/001_workflow.sql)、[`002_workflow_key_version.sql`](deploy/sql/002_workflow_key_version.sql) 和 [`003_tool_execution_ledger.sql`](deploy/sql/003_tool_execution_ledger.sql)，应用账号只授予表级读写权限。
 
 ### 工作流密钥轮换
 
@@ -246,9 +246,24 @@ $env:Workflow__Encryption__Keys__2026_07 = '<新32字节主密钥的Base64>'
 SELECT KeyVersion, COUNT_BIG(*) AS CheckpointCount
 FROM dbo.AiMentorAgentRuns
 GROUP BY KeyVersion;
+
+SELECT KeyVersion, COUNT_BIG(*) AS ExecutionCount
+FROM dbo.AiMentorToolExecutions
+GROUP BY KeyVersion;
 ```
 
 `KeyVersion IS NULL` 表示升级前由记忆主密钥加密的兼容记录。迁移期间必须保留 `AIMENTOR_MEMORY_ENCRYPTION_KEY`；这类记录恢复时会转换为活动工作流密钥。未知版本、错误 `runId`、被篡改密文或过早删除旧密钥都会失败关闭。健康检查只公开活动版本名称，不公开任何密钥材料。
+
+### 持久化幂等执行账本
+
+要求幂等键的工具在真正调用前会进入 `AiMentorToolExecutions` 状态机：
+
+1. `Reserved`：只完成原子占位，尚未进入工具；实例失联且租约过期后可以安全接管。
+2. `Executing`：已消费必要审批并即将或已经调用工具；实例失联后转换为 `OutcomeUnknown`。
+3. `Completed`：结果使用工作流活动密钥加密保存；相同身份、工具、幂等键和参数会直接回放，不再次执行。
+4. `OutcomeUnknown`：工具可能已产生副作用但结果没有可靠写回；所有自动重试均拒绝并要求人工核对目标系统状态。
+
+账本只保存身份、工具和幂等键组合的 SHA-256 摘要，不保存原始幂等键；工具结果和 Trace 以版本化密文保存。相同幂等键绑定不同参数仍返回 `IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_REQUEST`。这一设计实现的是“不会盲目重复副作用”，不是对任意外部系统承诺理论上的 exactly-once；要自动消解 `OutcomeUnknown`，目标工具还必须提供自身幂等接口或状态查询/补偿能力。
 
 数据库访问使用参数化 `SqlCommand`、异步连接和显式事务，接口依据 [Microsoft.Data.SqlClient 官方包说明](https://github.com/dotnet/SqlClient/blob/main/src/Microsoft.Data.SqlClient/src/PackageReadme.md) 核对；审批与租约的一次性语义属于本项目额外实现，不能仅依赖驱动默认行为。
 
@@ -310,15 +325,16 @@ $env:Authentication__GroupsClaim = 'groups'
 
 ## 下一阶段
 
-1. 在 SQL Server 容器环境完成 API 实例真实强杀、连接中断和滚动部署验收；LocalDB 已验证租约过期接管与在线重加密的数据层语义。
-2. 为跨小时 Workflow 增加取消、补偿、续租和人工任务队列；当前短租约只覆盖短时 Agent 工具审批恢复。
+1. 为 `OutcomeUnknown` 增加人工对账 API、目标状态查询和受控补偿，不允许普通调用者直接清除不确定状态。
+2. 在 SQL Server 容器环境完成 API 实例真实强杀、连接中断和滚动部署验收；LocalDB 已验证租约过期接管、在线重加密和执行账本冻结语义。
+3. 为跨小时 Workflow 增加取消、补偿、续租和人工任务队列；当前短租约只覆盖短时 Agent 工具审批恢复。
 3. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率、恶意文档隔离率和引用正确率门禁。
 4. 接入真实身份提供方做两个主体的有效 Token 端到端验收，并覆盖密钥轮换、过期 Token、错误 audience、组变更和审批人离职场景。
 5. 接入真实模型、嵌入与语义重排供应商，比较当前确定性重排、归一化加权和 RRF 等策略，并运行同一套契约测试和 150 条回归，确认沙箱与生产适配器行为边界。
 
 ## 验证状态
 
-- 2026-07-14 本地自动化测试 69/69 通过；Agent 审批覆盖暂停、待决恢复、批准、拒绝、过期、跨用户、容量、并发恢复、跨运行器会话重建、租约接管和重放。真实 SQL Server LocalDB 测试验证了并发审批只消费一次、崩溃租约到期后由新实例接管、旧密钥检查点在线重加密、仅保留新密钥仍可恢复，以及检查点参数不以明文落库。150 条离线评测决策匹配率 90%、引用召回率 75%，质量门禁通过；NuGet 直接与传递依赖未发现已知漏洞。
+- 2026-07-14 本地自动化测试 72/72 通过；Agent 审批覆盖暂停、待决恢复、批准、拒绝、过期、跨用户、容量、并发恢复、跨运行器会话重建、租约接管和重放。真实 SQL Server LocalDB 测试验证了并发审批只消费一次、崩溃租约到期后由新实例接管、旧密钥检查点在线重加密、仅保留新密钥仍可恢复、执行结果加密回放，以及已开始副作用的崩溃窗口冻结为 `OutcomeUnknown`。安全执行器回归还验证不确定态不会再次调用工具。150 条离线评测决策匹配率 90%、引用召回率 75%，质量门禁通过；NuGet 直接与传递依赖未发现已知漏洞。
 - OpenSearch 请求契约已由自动化测试验证：索引映射、搜索管线、批量摄取，以及 BM25/k-NN 两个分支中的租户和 ACL 过滤。
 - 2026-07-13 尝试拉取 `opensearchproject/opensearch:3.5.0` 做真实容器验收，但镜像仓库连续两次无下载进度并超时，未创建镜像或容器。因此真实集群验收尚未通过，网络恢复后必须重新执行 `docker compose up -d` 和 HTTP 闭环。
 - 2026-07-13 拉取 `mcr.microsoft.com/mssql/server:2022-latest` 在 120 秒内无下载进度并超时；2026-07-14 改用本机 SQL Server LocalDB 完成真实事务测试并通过。容器部署形态仍需在镜像网络恢复后补做启动、健康检查和进程强杀验收，但数据库事务实现已获得真实 SQL 执行证据。
