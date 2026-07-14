@@ -37,6 +37,7 @@ public sealed class SqlServerWorkflowIntegrationTests
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "004_tool_execution_reconciliation.sql"));
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "005_tool_reconciliation_reviews.sql"));
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "006_agent_run_cancellation.sql"));
+            await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "007_tool_compensations.sql"));
             var clock = new MutableTimeProvider(new DateTimeOffset(2026, 7, 14, 1, 0, 0, TimeSpan.Zero));
             var trace = new InMemoryTraceSink();
             var tool = new MutationTool();
@@ -153,6 +154,61 @@ public sealed class SqlServerWorkflowIntegrationTests
                 TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
             var rawExecutionResult = await ReadExecutionResultAsync(testConnection, completedKey);
 
+            // 使用两个服务实例和两代密钥贯通补偿，证明审批、密文轮换和反向幂等不依赖进程内状态。
+            var reversibleTool = new ReversibleMutationTool();
+            var compensationRegistry = new ServerToolRegistry([reversibleTool]);
+            using var compensationV1 = new SqlServerToolCompensationService(compensationRegistry, workflowCipher,
+                trace, new ToolCompensationOptions(), sqlOptions, clock);
+            var compensationArguments = JsonSerializer.SerializeToElement(new { value = "updated-value" });
+            var preparation = await compensationV1.PrepareForwardAsync(new string('E', 64), reversibleTool,
+                new ToolExecutionContext(requester, "forward-compensation-run"), compensationArguments);
+            await reversibleTool.ExecuteAsync(new ToolExecutionContext(requester, "forward-compensation-run"),
+                compensationArguments);
+            await compensationV1.ActivateAsync(preparation);
+            var rawCompensationBefore = await ReadCompensationAsync(testConnection, preparation.Id);
+            var compensationPending = await compensationV1.RequestApprovalAsync(preparation.Id,
+                "恢复补偿前状态", requester);
+            using var compensationV2 = new SqlServerToolCompensationService(compensationRegistry, rotatedCipher,
+                trace, new ToolCompensationOptions(), sqlOptions, clock);
+            await compensationV2.DecideAsync(preparation.Id, compensationPending.ApprovalId!, true,
+                "secret-decision-reason", approver);
+            var compensationCompleted = await compensationV2.ExecuteAsync(preparation.Id,
+                compensationPending.ApprovalId!, "independent-reverse-key", requester);
+            var compensationReplay = await compensationV1.ExecuteAsync(preparation.Id,
+                compensationPending.ApprovalId!, "independent-reverse-key", requester);
+            var rawCompensationAfter = await ReadCompensationAsync(testConnection, preparation.Id);
+
+            // 反向工具开始后让租约过期；第二实例只能冻结结果不确定，不能自动接管或重放。
+            var blockingTool = new BlockingCompensableTool();
+            var blockingRegistry = new ServerToolRegistry([blockingTool]);
+            using var blockingServiceA = new SqlServerToolCompensationService(blockingRegistry, rotatedCipher,
+                trace, new ToolCompensationOptions(), sqlOptions, clock);
+            using var blockingServiceB = new SqlServerToolCompensationService(blockingRegistry, rotatedCipher,
+                trace, new ToolCompensationOptions(), sqlOptions, clock);
+            var blockingArguments = JsonSerializer.SerializeToElement(new { value = "after" });
+            var blockingPreparation = await blockingServiceA.PrepareForwardAsync(new string('F', 64), blockingTool,
+                new ToolExecutionContext(requester, "blocking-forward"), blockingArguments);
+            await blockingTool.ExecuteAsync(new ToolExecutionContext(requester, "blocking-forward"),
+                blockingArguments);
+            await blockingServiceA.ActivateAsync(blockingPreparation);
+            var blockingApproval = await blockingServiceA.RequestApprovalAsync(blockingPreparation.Id,
+                "验证补偿租约过期", requester);
+            await blockingServiceB.DecideAsync(blockingPreparation.Id, blockingApproval.ApprovalId!, true,
+                "批准故障注入", approver);
+            var blockedExecution = blockingServiceA.ExecuteAsync(blockingPreparation.Id,
+                blockingApproval.ApprovalId!, "blocking-reverse-key", requester);
+            await blockingTool.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var concurrentExecution = await Assert.ThrowsAsync<ToolCompensationException>(() =>
+                blockingServiceB.ExecuteAsync(blockingPreparation.Id, blockingApproval.ApprovalId!,
+                    "blocking-reverse-key", requester));
+            clock.Advance(TimeSpan.FromSeconds(46));
+            var frozenSummary = Assert.Single(await blockingServiceB.ListAsync(requester),
+                item => item.Id == blockingPreparation.Id);
+            blockingTool.Release.TrySetResult();
+            var lostLease = await Assert.ThrowsAsync<ToolCompensationException>(() => blockedExecution);
+            var blockedRetry = await Assert.ThrowsAsync<ToolCompensationException>(() => blockingServiceB.ExecuteAsync(
+                blockingPreparation.Id, blockingApproval.ApprovalId!, "blocking-reverse-key", requester));
+
             var cancellationCheckpoint = CreateCheckpoint(requester, arguments, clock.GetUtcNow()) with
             {
                 RunId = "sql-run-cancel"
@@ -198,11 +254,41 @@ public sealed class SqlServerWorkflowIntegrationTests
             Assert.Equal("tool-run-3", replay.ReplayResult!.RunId);
             Assert.Single(replay.ReplayResult.Trace);
             Assert.DoesNotContain("sensitive-result", rawExecutionResult, StringComparison.Ordinal);
+            Assert.Equal("v1", rawCompensationBefore.KeyVersion);
+            Assert.DoesNotContain("sensitive-before-value", rawCompensationBefore.SnapshotCipher,
+                StringComparison.Ordinal);
+            Assert.DoesNotContain("previousValue", rawCompensationBefore.SnapshotCipher, StringComparison.Ordinal);
+            Assert.Equal(ToolCompensationStatus.Completed, compensationCompleted.Status);
+            Assert.True(compensationReplay.IdempotentReplay);
+            Assert.Equal(1, reversibleTool.CompensationCount);
+            Assert.Equal("sensitive-before-value", reversibleTool.State);
+            Assert.Equal("v2", rawCompensationAfter.KeyVersion);
+            Assert.NotEqual(rawCompensationBefore.SnapshotCipher, rawCompensationAfter.SnapshotCipher);
+            Assert.Equal(64, rawCompensationAfter.DecisionReasonHash?.Length);
+            Assert.Equal(64, rawCompensationAfter.PreparationTokenHash.Length);
+            Assert.Equal((byte)ToolCompensationStatus.Completed, rawCompensationAfter.Status);
+            Assert.Equal(ToolCompensationStatus.OutcomeUnknown, frozenSummary.Status);
+            Assert.Equal("TOOL_COMPENSATION_EXECUTION_IN_PROGRESS", concurrentExecution.Code);
+            Assert.Equal("TOOL_COMPENSATION_LEASE_LOST", lostLease.Code);
+            Assert.Equal("TOOL_COMPENSATION_OUTCOME_UNKNOWN", blockedRetry.Code);
+            Assert.Equal(1, blockingTool.CompensationCount);
             Assert.Equal(AgentRunCancellationStatus.Forbidden, forbiddenCancellation.Status);
             Assert.Equal(AgentRunCancellationStatus.Requested, requestedCancellation.Status);
             Assert.Equal(AgentRunLeaseRenewalStatus.CancellationRequested, cancellationRenewal);
             Assert.Equal(AgentRunLeaseTransitionStatus.CancellationRequested, cancellationCompletion);
             Assert.Equal(AgentRunLeaseStatus.Cancelled, cancelledResume.Status);
+
+            // 删除迁移创建的补偿表后启用开发初始化，验证运行时建表路径与 007 契约保持一致。
+            await DropCompensationTableAsync(testConnection);
+            var runtimeSchemaOptions = new SqlServerWorkflowOptions
+            {
+                ConnectionString = testConnection,
+                InitializeSchema = true
+            };
+            using var runtimeSchemaService = new SqlServerToolCompensationService(compensationRegistry,
+                rotatedCipher, trace, new ToolCompensationOptions(), runtimeSchemaOptions, clock);
+            Assert.Empty(await runtimeSchemaService.ListAsync(requester));
+            Assert.True(await CompensationTableExistsAsync(testConnection));
         }
         finally
         {
@@ -279,6 +365,41 @@ public sealed class SqlServerWorkflowIntegrationTests
         return (string)(await command.ExecuteScalarAsync() ?? string.Empty);
     }
 
+    private static async Task<(string KeyVersion, string SnapshotCipher, string? DecisionReasonHash,
+        string PreparationTokenHash, byte Status)> ReadCompensationAsync(string connectionString, string id)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = """
+            SELECT KeyVersion,SnapshotCipher,DecisionReasonHash,PreparationTokenHash,Status
+            FROM dbo.AiMentorToolCompensations WHERE Id=@id;
+            """;
+        command.Parameters.AddWithValue("@id", id);
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+        return (reader.GetString(0), reader.GetString(1), reader.IsDBNull(2) ? null : reader.GetString(2),
+            reader.GetString(3), reader.GetByte(4));
+    }
+
+    private static async Task DropCompensationTableAsync(string connectionString)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "DROP TABLE dbo.AiMentorToolCompensations;";
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<bool> CompensationTableExistsAsync(string connectionString)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT CASE WHEN OBJECT_ID(N'dbo.AiMentorToolCompensations',N'U') IS NULL THEN 0 ELSE 1 END;";
+        return Convert.ToInt32(await command.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture) == 1;
+    }
+
     private sealed class MutationTool : IServerTool
     {
         public ToolDescriptor Descriptor { get; } = new("memory.delete", "删除指定记忆。",
@@ -291,6 +412,57 @@ public sealed class SqlServerWorkflowIntegrationTests
 
         public Task<JsonElement> ExecuteAsync(ToolExecutionContext context, JsonElement arguments,
             CancellationToken cancellationToken = default) => throw new NotSupportedException();
+    }
+
+    private sealed class ReversibleMutationTool : ICompensableServerTool
+    {
+        public string State { get; private set; } = "sensitive-before-value";
+        public int CompensationCount { get; private set; }
+        public string CompensationToolName => "test.state.restore";
+        public ToolDescriptor Descriptor { get; } = new("test.state.update", "更新测试状态。",
+            ToolOperationRisk.Mutation, TimeSpan.FromSeconds(1), 4_096, true);
+        public SafetyDecision ValidateArguments(JsonElement arguments) => SafetyDecision.Allowed;
+        public Task<JsonElement> CaptureCompensationStateAsync(ToolExecutionContext context, JsonElement arguments,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(JsonSerializer.SerializeToElement(new { previousValue = State }));
+        public Task<JsonElement> ExecuteAsync(ToolExecutionContext context, JsonElement arguments,
+            CancellationToken cancellationToken = default)
+        {
+            State = arguments.GetProperty("value").GetString()!;
+            return Task.FromResult(JsonSerializer.SerializeToElement(new { State }));
+        }
+        public Task<JsonElement> CompensateAsync(ToolExecutionContext context, JsonElement compensationState,
+            CancellationToken cancellationToken = default)
+        {
+            State = compensationState.GetProperty("previousValue").GetString()!;
+            CompensationCount++;
+            return Task.FromResult(JsonSerializer.SerializeToElement(new { State }));
+        }
+    }
+
+    private sealed class BlockingCompensableTool : ICompensableServerTool
+    {
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public int CompensationCount { get; private set; }
+        public string CompensationToolName => "test.blocking.restore";
+        public ToolDescriptor Descriptor { get; } = new("test.blocking.update", "阻塞补偿测试工具。",
+            ToolOperationRisk.Mutation, TimeSpan.FromSeconds(1), 4_096, true);
+        public SafetyDecision ValidateArguments(JsonElement arguments) => SafetyDecision.Allowed;
+        public Task<JsonElement> CaptureCompensationStateAsync(ToolExecutionContext context, JsonElement arguments,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(JsonSerializer.SerializeToElement(new { previousValue = "before" }));
+        public Task<JsonElement> ExecuteAsync(ToolExecutionContext context, JsonElement arguments,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(JsonSerializer.SerializeToElement(new { updated = true }));
+        public async Task<JsonElement> CompensateAsync(ToolExecutionContext context, JsonElement compensationState,
+            CancellationToken cancellationToken = default)
+        {
+            CompensationCount++;
+            Started.TrySetResult();
+            await Release.Task.WaitAsync(cancellationToken);
+            return JsonSerializer.SerializeToElement(new { restored = true });
+        }
     }
 
     private sealed class MutableTimeProvider(DateTimeOffset now) : TimeProvider

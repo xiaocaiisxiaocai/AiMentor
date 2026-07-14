@@ -115,7 +115,7 @@ dotnet run --project .\src\AiMentor.Evaluation\AiMentor.Evaluation.csproj
   -BasePort 5610
 ```
 
-脚本要求 Docker Desktop 已运行，且指定的 SQL 与六个连续 API 端口均可绑定。它真实执行 001–006 迁移，并先启动仅 `Testing` 环境可启用的执行屏障实例：SQL 状态写入 `Executing` 后、真实工具调用前发布文件信号，脚本确认数据库状态后立即强杀进程；租约到期时，无屏障替代实例必须把请求冻结为 `OutcomeUnknown`，不能自动重放。随后脚本使用不同身份完成常规申请、独立业务审批、第一人复核，并强制终止首次调用实例和第一复核实例；两个剩余 API 实例并发争抢第二人裁决，必须恰好一个成功。最后启动同身份替代实例验证滚动部署后返回 `Reconciled`。脚本不输出数据库密码，失败时保留诊断日志路径，成功后自动删除临时资源。
+脚本要求 Docker Desktop 已运行，且指定的 SQL 与六个连续 API 端口均可绑定。它真实执行 001–007 迁移，并先启动仅 `Testing` 环境可启用的执行屏障实例：SQL 状态写入 `Executing` 后、真实工具调用前发布文件信号，脚本确认数据库状态后立即强杀进程；租约到期时，无屏障替代实例必须把请求冻结为 `OutcomeUnknown`，不能自动重放。随后脚本使用不同身份完成常规申请、独立业务审批、第一人复核，并强制终止首次调用实例和第一复核实例；两个剩余 API 实例并发争抢第二人裁决，必须恰好一个成功。最后启动同身份替代实例验证滚动部署后返回 `Reconciled`。脚本不输出数据库密码，失败时保留诊断日志路径，成功后自动删除临时资源。
 
 2026-07-13 的当前可复现基线：150 条全部执行，决策匹配率 90.00%，复合来源按“全部命中”计算的用例级引用召回率 75.00%；无答案、记忆、安全、ACL 四类决策匹配率均为 100%。查询规范化修复了 P1 定义和 VegaBus 必需字段等被问句模板稀释的召回问题；输出审核也识别出 A-009 虽被旧实现标为“已回答”，实际生成内容无法通过证据落地检查，现改为安全拒答。架构类仍受限于总体设计文档尚未进入当前 23 份知识包文档，事故复合引用召回率也仍需通过更好的分块与多跳检索改进。这些指标是阶段性回归基线，不是生产上线验收结论。
 
@@ -249,7 +249,7 @@ $env:AIMENTOR_MEMORY_ENCRYPTION_KEY = '<至少32字节的Base64密钥>'
 dotnet run --project src\AiMentor.Api
 ```
 
-开发环境 SQL Server 模式会按需创建 `AiMentorToolApprovals`、`AiMentorAgentRuns`、`AiMentorToolExecutions` 和 `AiMentorToolReconciliations`，并用数据库应用锁避免多个实例同时建表。Production 强制 `Workflow:Provider=SqlServer`、`Encrypt=True`、`TrustServerCertificate=False`，且默认关闭运行时建表；发布账号应依次执行 [`001_workflow.sql`](deploy/sql/001_workflow.sql)、[`002_workflow_key_version.sql`](deploy/sql/002_workflow_key_version.sql)、[`003_tool_execution_ledger.sql`](deploy/sql/003_tool_execution_ledger.sql)、[`004_tool_execution_reconciliation.sql`](deploy/sql/004_tool_execution_reconciliation.sql)、[`005_tool_reconciliation_reviews.sql`](deploy/sql/005_tool_reconciliation_reviews.sql) 和 [`006_agent_run_cancellation.sql`](deploy/sql/006_agent_run_cancellation.sql)，应用账号只授予表级读写权限。
+开发环境 SQL Server 模式会按需创建 `AiMentorToolApprovals`、`AiMentorAgentRuns`、`AiMentorToolExecutions`、`AiMentorToolReconciliations` 和 `AiMentorToolCompensations`，并用数据库应用锁避免多个实例同时建表。Production 强制 `Workflow:Provider=SqlServer`、`Encrypt=True`、`TrustServerCertificate=False`，且默认关闭运行时建表；发布账号应依次执行 [`001_workflow.sql`](deploy/sql/001_workflow.sql)、[`002_workflow_key_version.sql`](deploy/sql/002_workflow_key_version.sql)、[`003_tool_execution_ledger.sql`](deploy/sql/003_tool_execution_ledger.sql)、[`004_tool_execution_reconciliation.sql`](deploy/sql/004_tool_execution_reconciliation.sql)、[`005_tool_reconciliation_reviews.sql`](deploy/sql/005_tool_reconciliation_reviews.sql)、[`006_agent_run_cancellation.sql`](deploy/sql/006_agent_run_cancellation.sql) 和 [`007_tool_compensations.sql`](deploy/sql/007_tool_compensations.sql)，应用账号只授予表级读写权限。
 
 ### 工作流密钥轮换
 
@@ -306,7 +306,7 @@ GROUP BY KeyVersion;
 
 `memory.correct` 是首个真正可逆的修改工具。它在正向副作用前读取当前用户拥有的记忆，捕获旧值、正向完成后的预期版本和原到期时间，并立即使用带 `compensationId + forwardToolName` 认证上下文的工作流密钥加密。正向执行完成后，`ToolExecutionResult.compensationId` 才会公开；随后必须由原调用者申请独立补偿审批、由不同 `tool-approvers` 裁决，并使用新的反向 `Idempotency-Key` 执行。恢复仍经过记忆工作流的所有权、内容安全和乐观版本门禁：只有目标仍处于本次正向执行产生的版本时才能恢复，期间被其他操作更改时不会覆盖新值。
 
-补偿服务不会回显快照或反向工具输出，审批决定理由只存不可逆摘要。相同反向幂等键完成后只回放结果，不再次恢复；调用进入反向工具后发生超时、异常或写回中断时冻结为 `OutcomeUnknown`，禁止自动重试。当前完整执行闭环仅在 `Workflow:Provider=InMemory` 单实例开发模式启用；`SqlServer` 多实例模式使用显式不可用实现，在耐久迁移落地前会以 `TOOL_COMPENSATION_DURABLE_STORE_UNAVAILABLE` 在正向副作用前失败关闭，绝不静默回退到进程内状态。
+补偿服务不会回显快照或反向工具输出，审批决定理由和准备令牌只存不可逆摘要。相同反向幂等键完成后只回放结果，不再次恢复；调用进入反向工具后发生超时、异常、租约过期或写回中断时冻结为 `OutcomeUnknown`，禁止自动接管重试。`Workflow:Provider=InMemory` 提供单实例实现；`SqlServer` 使用 `AiMentorToolCompensations` 耐久保存同一状态机，以串行化事务裁决审批和争抢反向执行，以状态、租约令牌和到期时间条件完成写回。快照读取旧 `KeyVersion` 时会在当前反向执行租约内在线重加密。配置还强制反向租约长于工具超时，错误配置在进入 `Executing` 前失败关闭。
 
 数据库访问使用参数化 `SqlCommand`、异步连接和显式事务，接口依据 [Microsoft.Data.SqlClient 官方包说明](https://github.com/dotnet/SqlClient/blob/main/src/Microsoft.Data.SqlClient/src/PackageReadme.md) 核对；审批与租约的一次性语义属于本项目额外实现，不能仅依赖驱动默认行为。
 
@@ -373,7 +373,7 @@ $env:Authentication__GroupsClaim = 'groups'
 
 ## 下一阶段
 
-1. 为当前单实例加密补偿闭环增加 SQL Server 耐久状态表、条件租约、密钥轮换和多实例强杀验收；在该迁移完成前 SQL 模式保持失败关闭。`memory.delete` 在安全快照方案完成前继续人工对账。
+1. 扩展真实容器脚本，在补偿 `Executing` 精确窗口强杀 API 实例，并验证替代实例冻结、补偿人工对账和多实例审批/执行争抢；LocalDB 已完成等价租约过期冻结测试。`memory.delete` 在安全快照方案完成前继续人工对账。
 2. 增加跨小时故障验收和人工任务队列；工具 `Executing` 精确窗口强杀、多实例并发裁决和滚动回放已通过真实容器验证。
 3. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率、恶意文档隔离率和引用正确率门禁。
 4. 接入真实身份提供方做两个主体的有效 Token 端到端验收，并覆盖密钥轮换、过期 Token、错误 audience、组变更和审批人离职场景。
@@ -381,7 +381,7 @@ $env:Authentication__GroupsClaim = 'groups'
 
 ## 验证状态
 
-- 2026-07-14 本地自动化测试 97/97 通过；新增加密补偿快照、正向完成后发布、独立审批、职责分离、批准过期、独立幂等回放、补偿结果不确定冻结、真实记忆版本恢复和 SQL 模式失败关闭测试。InMemory 与真实 SQL Server 均验证只有当前实例、当前令牌、未过期租约可以续期，并覆盖等待审批取消、活动工具取消、跨用户拒绝、重复取消、取消与完成竞争及取消后禁止恢复。活动修改工具在心跳观察取消后收到取消令牌，测试确认尚未发生的副作用不会执行。真实 SQL Server LocalDB 执行 `001` 至 `006`，同时验证加密回放、`OutcomeUnknown`、租户隔离、目标探测和双人裁决。Docker 临时 SQL Server 与最多六个并发 API 实例进一步验证精确强杀、租约过期冻结、并发复核单胜者和 `Reconciled` 滚动回放。150 条离线评测决策匹配率 90%、引用召回率 75%，质量门禁通过；NuGet 直接与传递依赖未发现已知漏洞。
+- 2026-07-14 本地自动化测试 98/98 通过；InMemory 与 SQL Server 补偿路径均覆盖加密快照、正向完成后发布、独立审批、职责分离、批准过期、独立幂等回放、错误租约配置前置拒绝和结果不确定冻结。真实 SQL Server LocalDB 执行 `001` 至 `007`，验证两个服务实例跨密钥版本审批和执行、快照密文、在线重加密、反向租约过期冻结及禁止重放；同时保留原有加密回放、租户隔离、目标探测、双人裁决和主动取消验收。Docker 临时 SQL Server 与最多六个并发 API 实例已验证正向工具精确强杀、租约过期冻结、并发复核单胜者和 `Reconciled` 滚动回放；补偿精确窗口强杀仍列为下一项。150 条离线评测决策匹配率 90%、引用召回率 75%，质量门禁通过；NuGet 直接与传递依赖未发现已知漏洞。
 - OpenSearch 请求契约已由自动化测试验证：索引映射、搜索管线、批量摄取，以及 BM25/k-NN 两个分支中的租户和 ACL 过滤。
 - 2026-07-13 尝试拉取 `opensearchproject/opensearch:3.5.0` 做真实容器验收，但镜像仓库连续两次无下载进度并超时，未创建镜像或容器。因此真实集群验收尚未通过，网络恢复后必须重新执行 `docker compose up -d` 和 HTTP 闭环。
 - 2026-07-13 拉取 `mcr.microsoft.com/mssql/server:2022-latest` 在 120 秒内无下载进度并超时；2026-07-14 改用本机 SQL Server LocalDB 完成真实事务测试并通过。容器部署形态仍需在镜像网络恢复后补做启动、健康检查和进程强杀验收，但数据库事务实现已获得真实 SQL 执行证据。

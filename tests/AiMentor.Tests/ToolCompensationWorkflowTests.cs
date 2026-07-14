@@ -171,6 +171,31 @@ public sealed class ToolCompensationWorkflowTests
         Assert.Equal(0, tool.CompensationCount);
     }
 
+    [Fact]
+    public async Task InvalidLeaseConfigurationFailsBeforeReverseToolStarts()
+    {
+        var tool = new ReversibleTestTool();
+        var service = CreateService(tool, options: new ToolCompensationOptions
+        {
+            ExecutionLeaseDuration = TimeSpan.FromSeconds(1)
+        });
+        var arguments = JsonSerializer.SerializeToElement(new { value = 2 });
+        var preparation = await service.PrepareForwardAsync(new string('D', 64), tool,
+            new ToolExecutionContext(Requester, "forward-run"), arguments);
+        await tool.ExecuteAsync(new ToolExecutionContext(Requester, "forward-run"), arguments);
+        await service.ActivateAsync(preparation);
+        var pending = await service.RequestApprovalAsync(preparation.Id, "验证错误租约配置", Requester);
+        await service.DecideAsync(preparation.Id, pending.ApprovalId!, true, "独立批准", Approver);
+
+        var invalid = await Assert.ThrowsAsync<ToolCompensationException>(() => service.ExecuteAsync(
+            preparation.Id, pending.ApprovalId!, "invalid-lease-key", Requester));
+
+        Assert.Equal("TOOL_COMPENSATION_CONFIGURATION_INVALID", invalid.Code);
+        Assert.Equal(ToolCompensationStatus.Approved,
+            Assert.Single(await service.ListAsync(Requester)).Status);
+        Assert.Equal(0, tool.CompensationCount);
+    }
+
     private static InMemoryToolCompensationService CreateService(IServerTool tool, TimeProvider? timeProvider = null,
         ToolCompensationOptions? options = null)
     {

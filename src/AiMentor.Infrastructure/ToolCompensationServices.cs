@@ -28,7 +28,7 @@ public sealed class InMemoryToolCompensationService(
     {
         ValidateOptions();
         ValidateAccess(context.Access);
-        if (string.IsNullOrWhiteSpace(executionKey) || executionKey.Length > 128)
+        if (executionKey.Length != 64 || !executionKey.All(Uri.IsHexDigit))
             throw Failure("TOOL_COMPENSATION_FORWARD_KEY_INVALID", "正向执行标识无效。",
                 ToolCompensationErrorKind.Validation);
 
@@ -220,6 +220,7 @@ public sealed class InMemoryToolCompensationService(
                 ToolCompensationErrorKind.Validation);
         var executionKey = ExecutionKey(id, requester, normalizedIdempotencyKey);
         Entry entry;
+        ICompensableServerTool tool;
         lock (_gate)
         {
             Prune(timeProvider.GetUtcNow());
@@ -242,18 +243,19 @@ public sealed class InMemoryToolCompensationService(
                 || !FixedEquals(entry.ApprovalId, normalizedApprovalId))
                 throw Failure("TOOL_COMPENSATION_APPROVAL_REQUIRED", "补偿执行需要匹配的独立批准凭据。",
                     ToolCompensationErrorKind.Forbidden);
+            if (!registry.TryGet(entry.ForwardToolName, out var registered)
+                || registered is not ICompensableServerTool resolvedTool
+                || !string.Equals(resolvedTool.CompensationToolName, entry.CompensationToolName,
+                    StringComparison.Ordinal))
+                throw Failure("TOOL_COMPENSATION_CONTRACT_CHANGED", "补偿工具契约已变化，未进入反向执行。",
+                    ToolCompensationErrorKind.Conflict);
+            if (options.ExecutionLeaseDuration <= resolvedTool.Descriptor.Timeout)
+                throw Failure("TOOL_COMPENSATION_CONFIGURATION_INVALID",
+                    "补偿执行租约必须长于反向工具超时。", ToolCompensationErrorKind.Unavailable);
+            tool = resolvedTool;
             entry.Status = ToolCompensationStatus.Executing;
             entry.CompensationExecutionKey = executionKey;
             entry.ExecutionLeaseExpiresAt = timeProvider.GetUtcNow().Add(options.ExecutionLeaseDuration);
-        }
-
-        if (!registry.TryGet(entry.ForwardToolName, out var registered)
-            || registered is not ICompensableServerTool tool
-            || !string.Equals(tool.CompensationToolName, entry.CompensationToolName, StringComparison.Ordinal))
-        {
-            MarkOutcomeUnknown(entry.Id, executionKey);
-            throw Failure("TOOL_COMPENSATION_CONTRACT_CHANGED", "补偿工具契约已变化，结果保持不确定并停止执行。",
-                ToolCompensationErrorKind.Conflict);
         }
 
         try
@@ -366,6 +368,8 @@ public sealed class InMemoryToolCompensationService(
     {
         if (options.CompensationLifetime <= TimeSpan.Zero || options.ApprovalLifetime <= TimeSpan.Zero
             || options.ExecutionLeaseDuration <= TimeSpan.Zero || options.MaximumEntries <= 0
+            || options.CompensationLifetime <= options.ApprovalLifetime
+            || options.CompensationLifetime <= options.ExecutionLeaseDuration
             || options.MaximumSnapshotBytes <= 0 || options.ApproverGroups.Count == 0)
             throw new InvalidOperationException("工具补偿配置无效。");
     }

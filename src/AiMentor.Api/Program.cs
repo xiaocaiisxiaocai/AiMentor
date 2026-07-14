@@ -244,8 +244,7 @@ if (string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreC
     });
     builder.Services.AddSingleton<IAgentRunCheckpointStore, SqlServerAgentRunCheckpointStore>();
     builder.Services.AddSingleton<IToolExecutionLedger, SqlServerToolExecutionLedger>();
-    // SQL Server 多实例模式在耐久迁移落地前明确失败关闭，绝不回退到进程内补偿状态。
-    builder.Services.AddSingleton<IToolCompensationService, UnavailableToolCompensationService>();
+    builder.Services.AddSingleton<IToolCompensationService, SqlServerToolCompensationService>();
 }
 else if (string.Equals(workflowProvider, "InMemory", StringComparison.OrdinalIgnoreCase))
 {
