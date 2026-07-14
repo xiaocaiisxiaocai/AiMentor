@@ -168,6 +168,7 @@ builder.Services.AddSingleton<IToolApprovalService>(services =>
 builder.Services.AddSingleton(new ToolExecutorOptions());
 builder.Services.AddSingleton<IToolExecutor, SafeToolExecutor>();
 builder.Services.AddSingleton(new ToolExecutionReconciliationOptions());
+builder.Services.AddSingleton<IToolOutcomeProbe, MemoryDeleteOutcomeProbe>();
 builder.Services.AddSingleton<IToolExecutionReconciliationService, ToolExecutionReconciliationService>();
 builder.Services.AddSingleton(new AgentExecutionOptions());
 builder.Services.AddSingleton<IAgentRunner, AgentFrameworkToolRunner>();
@@ -362,6 +363,14 @@ toolExecutions.MapGet("/outcome-unknown", ListOutcomeUnknownToolExecutionsAsync)
     .Produces<IReadOnlyList<OutcomeUnknownToolExecution>>()
     .ProducesValidationProblem()
     .ProducesProblem(StatusCodes.Status403Forbidden)
+    .RequireRateLimiting("questions");
+toolExecutions.MapPost("/{executionKey}/probe", ProbeOutcomeUnknownToolExecutionAsync)
+    .WithName("ProbeOutcomeUnknownToolExecutionV1")
+    .WithSummary("使用与原调用匹配的参数只读核验结果不确定操作的目标状态")
+    .Produces<ToolOutcomeProbeResult>()
+    .ProducesValidationProblem()
+    .ProducesProblem(StatusCodes.Status403Forbidden)
+    .ProducesProblem(StatusCodes.Status404NotFound)
     .RequireRateLimiting("questions");
 
 var agents = v1.MapGroup("/agents").WithTags("AiMentor agents v1");
@@ -620,6 +629,35 @@ static async Task<IResult> ListOutcomeUnknownToolExecutionsAsync(int? limit,
             instance: context.Request.Path,
             extensions: new Dictionary<string, object?> { ["code"] = exception.Code });
     }
+}
+
+static async Task<IResult> ProbeOutcomeUnknownToolExecutionAsync(string executionKey,
+    ProbeToolOutcomeRequest request, IToolExecutionReconciliationService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        var arguments = JsonSerializer.SerializeToElement(request.Arguments);
+        return Results.Ok(await service.ProbeOutcomeAsync(accessProvider.GetAccessContext(context.User),
+            executionKey, arguments, cancellationToken));
+    }
+    catch (ToolExecutionReconciliationException exception)
+    {
+        return ToolReconciliationProblem(exception, context);
+    }
+}
+
+static IResult ToolReconciliationProblem(ToolExecutionReconciliationException exception, HttpContext context)
+{
+    var status = exception.Kind switch
+    {
+        ToolExecutionReconciliationErrorKind.Forbidden => StatusCodes.Status403Forbidden,
+        ToolExecutionReconciliationErrorKind.NotFound => StatusCodes.Status404NotFound,
+        _ => StatusCodes.Status400BadRequest
+    };
+    return Results.Problem(statusCode: status, title: "工具执行对账请求失败", detail: exception.Message,
+        instance: context.Request.Path,
+        extensions: new Dictionary<string, object?> { ["code"] = exception.Code });
 }
 
 static async Task<IResult> RunAgentAsync(RunAgentRequest request, IAgentRunner runner,

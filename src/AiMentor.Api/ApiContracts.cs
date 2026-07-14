@@ -46,6 +46,10 @@ public sealed record DecideToolApprovalRequest(
     bool Approved,
     [property: Required, StringLength(500, MinimumLength = 1)] string Reason);
 
+/// <summary>提交与原调用指纹完全匹配的候选参数，用于只读核验目标系统状态。</summary>
+public sealed record ProbeToolOutcomeRequest(
+    [property: Required] Dictionary<string, JsonElement> Arguments);
+
 /// <summary>提交给受限 Agent 的自然语言目标。</summary>
 public sealed record RunAgentRequest(
     [property: Required, StringLength(4_000, MinimumLength = 1)] string Input);

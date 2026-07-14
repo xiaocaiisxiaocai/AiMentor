@@ -113,6 +113,26 @@ public sealed class InMemoryToolExecutionLedger(TimeProvider timeProvider) : ITo
         }
     }
 
+    /// <inheritdoc />
+    public Task<OutcomeUnknownToolExecutionDetail?> GetOutcomeUnknownAsync(string tenantId, string executionKey,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ArgumentException.ThrowIfNullOrWhiteSpace(tenantId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(executionKey);
+        lock (_gate)
+        {
+            if (!_entries.TryGetValue(executionKey, out var entry)
+                || entry.Status != LedgerStatus.OutcomeUnknown
+                || !string.Equals(entry.TenantId, tenantId, StringComparison.Ordinal))
+                return Task.FromResult<OutcomeUnknownToolExecutionDetail?>(null);
+            var summary = new OutcomeUnknownToolExecution(executionKey, entry.TenantId, entry.SubjectId,
+                entry.ToolName, entry.RunId, entry.CreatedAt, entry.UpdatedAt);
+            return Task.FromResult<OutcomeUnknownToolExecutionDetail?>(
+                new OutcomeUnknownToolExecutionDetail(summary, entry.RequestFingerprint));
+        }
+    }
+
     private Task TransitionAsync(string executionKey, string leaseToken, LedgerStatus expected, LedgerStatus next,
         ToolExecutionResult? result, CancellationToken cancellationToken)
     {
@@ -307,6 +327,30 @@ public sealed class SqlServerToolExecutionLedger(
                 reader.GetString(3), reader.GetString(4), reader.GetFieldValue<DateTimeOffset>(5),
                 reader.GetFieldValue<DateTimeOffset>(6)));
         return records;
+    }
+
+    /// <inheritdoc />
+    public async Task<OutcomeUnknownToolExecutionDetail?> GetOutcomeUnknownAsync(string tenantId,
+        string executionKey, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(tenantId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(executionKey);
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT ExecutionKey,TenantId,SubjectId,ToolName,RunId,CreatedAt,UpdatedAt,RequestFingerprint
+            FROM dbo.{TableName}
+            WHERE ExecutionKey=@key AND TenantId=@tenantId AND Status=3;
+            """;
+        AddAnsiString(command, "@key", 64, executionKey);
+        AddString(command, "@tenantId", 128, tenantId);
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken)) return null;
+        var summary = new OutcomeUnknownToolExecution(reader.GetString(0), reader.GetString(1), reader.GetString(2),
+            reader.GetString(3), reader.GetString(4), reader.GetFieldValue<DateTimeOffset>(5),
+            reader.GetFieldValue<DateTimeOffset>(6));
+        return new OutcomeUnknownToolExecutionDetail(summary, reader.GetString(7));
     }
 
     private async Task TransitionAsync(string executionKey, string leaseToken, int expected, int next,

@@ -14,7 +14,12 @@ public interface IMemoryStore
         string value, DateTimeOffset? expiresAt, DateTimeOffset now, CancellationToken cancellationToken = default);
     Task<MemoryStoreResult<bool>> DeleteAsync(string memoryId, AccessContext access, int expectedVersion,
         CancellationToken cancellationToken = default);
+    Task<MemoryTargetState> ProbeTargetStateAsync(string memoryId, AccessContext access, int expectedVersion,
+        CancellationToken cancellationToken = default);
 }
+
+/// <summary>描述删除工具目标在当前所有权边界内的可验证状态，不返回记忆正文。</summary>
+public enum MemoryTargetState { Absent, PresentAtExpectedVersion, PresentAtDifferentVersion, Inaccessible }
 
 /// <summary>存储层返回的稳定状态，避免基础设施异常直接泄漏到 API。</summary>
 public enum MemoryStoreStatus { Success, NotFound, Conflict, Expired, RetentionExceeded, AlreadyExists }

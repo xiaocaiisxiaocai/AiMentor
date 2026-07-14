@@ -174,6 +174,21 @@ public sealed class EncryptedFileMemoryStore : IMemoryStore, IDisposable
         }, cancellationToken);
     }
 
+    /// <inheritdoc />
+    public async Task<MemoryTargetState> ProbeTargetStateAsync(string memoryId, AccessContext access,
+        int expectedVersion, CancellationToken cancellationToken = default)
+    {
+        return await ReadAsync(snapshot =>
+        {
+            var memory = snapshot.Memories.FirstOrDefault(item => item.Id == memoryId);
+            if (memory is null) return MemoryTargetState.Absent;
+            if (!OwnedBy(memory, access)) return MemoryTargetState.Inaccessible;
+            return memory.Version == expectedVersion
+                ? MemoryTargetState.PresentAtExpectedVersion
+                : MemoryTargetState.PresentAtDifferentVersion;
+        }, cancellationToken);
+    }
+
     public void Dispose() => _gate.Dispose();
 
     private async Task<T> ReadAsync<T>(Func<StoreSnapshot, T> action, CancellationToken cancellationToken)

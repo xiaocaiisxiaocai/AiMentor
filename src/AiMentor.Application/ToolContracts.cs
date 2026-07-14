@@ -57,6 +57,23 @@ public sealed record OutcomeUnknownToolExecution(
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt);
 
+/// <summary>供内部目标状态探测使用的结果不确定记录，参数摘要不会由 API 返回。</summary>
+public sealed record OutcomeUnknownToolExecutionDetail(
+    OutcomeUnknownToolExecution Execution,
+    string RequestFingerprint);
+
+/// <summary>表示目标系统对一次结果不确定操作给出的只读核验结论。</summary>
+public enum ToolOutcomeProbeState { Applied, NotApplied, Indeterminate }
+
+/// <summary>返回不含目标正文的工具处置证据，可供后续双人裁决使用。</summary>
+public sealed record ToolOutcomeProbeResult(
+    string ExecutionKey,
+    string ToolName,
+    ToolOutcomeProbeState State,
+    string Code,
+    string Explanation,
+    DateTimeOffset ObservedAt);
+
 /// <summary>在副作用执行前建立持久化占位，并区分可安全重试和结果不确定状态。</summary>
 public interface IToolExecutionLedger
 {
@@ -71,12 +88,24 @@ public interface IToolExecutionLedger
     Task AbandonAsync(string executionKey, string leaseToken, CancellationToken cancellationToken = default);
     Task<IReadOnlyList<OutcomeUnknownToolExecution>> ListOutcomeUnknownAsync(string tenantId, int limit,
         CancellationToken cancellationToken = default);
+    Task<OutcomeUnknownToolExecutionDetail?> GetOutcomeUnknownAsync(string tenantId, string executionKey,
+        CancellationToken cancellationToken = default);
 }
 
 /// <summary>按当前访问者租户查询需要外部核验的工具执行，不提供自动重放或清除能力。</summary>
 public interface IToolExecutionReconciliationService
 {
     Task<IReadOnlyList<OutcomeUnknownToolExecution>> ListOutcomeUnknownAsync(AccessContext access, int limit,
+        CancellationToken cancellationToken = default);
+    Task<ToolOutcomeProbeResult> ProbeOutcomeAsync(AccessContext access, string executionKey, JsonElement arguments,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>由具体工具实现只读目标状态核验，禁止在探测过程中产生补偿副作用。</summary>
+public interface IToolOutcomeProbe
+{
+    string ToolName { get; }
+    Task<ToolOutcomeProbeResult> ProbeAsync(OutcomeUnknownToolExecution execution, JsonElement arguments,
         CancellationToken cancellationToken = default);
 }
 
@@ -89,7 +118,7 @@ public sealed class ToolExecutionReconciliationOptions
 }
 
 /// <summary>区分工具执行对账请求的输入错误和授权失败。</summary>
-public enum ToolExecutionReconciliationErrorKind { Validation, Forbidden }
+public enum ToolExecutionReconciliationErrorKind { Validation, Forbidden, NotFound }
 
 /// <summary>携带可安全返回给 API 调用方的稳定对账错误代码。</summary>
 public sealed class ToolExecutionReconciliationException(

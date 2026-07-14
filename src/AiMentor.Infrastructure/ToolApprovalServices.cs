@@ -287,7 +287,7 @@ public sealed class InMemoryToolApprovalService(
 }
 
 /// <summary>生成与 JSON 对象属性顺序无关、与调用身份和工具绑定的参数摘要。</summary>
-internal static class JsonArgumentFingerprint
+public static class JsonArgumentFingerprint
 {
     public static string Create(string toolName, JsonElement arguments, AccessContext access)
     {

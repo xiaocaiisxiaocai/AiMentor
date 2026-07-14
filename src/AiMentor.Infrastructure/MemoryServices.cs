@@ -109,6 +109,23 @@ public sealed class InMemoryMemoryStore : IMemoryStore
         }
     }
 
+    /// <inheritdoc />
+    public Task<MemoryTargetState> ProbeTargetStateAsync(string memoryId, AccessContext access, int expectedVersion,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_gate)
+        {
+            if (!_memories.TryGetValue(memoryId, out var memory))
+                return Task.FromResult(MemoryTargetState.Absent);
+            if (!OwnedBy(memory.TenantId, memory.SubjectId, access))
+                return Task.FromResult(MemoryTargetState.Inaccessible);
+            return Task.FromResult(memory.Version == expectedVersion
+                ? MemoryTargetState.PresentAtExpectedVersion
+                : MemoryTargetState.PresentAtDifferentVersion);
+        }
+    }
+
     private static bool OwnedBy(string tenantId, string subjectId, AccessContext access) =>
         string.Equals(tenantId, access.TenantId, StringComparison.OrdinalIgnoreCase)
         && string.Equals(subjectId, access.SubjectId, StringComparison.Ordinal);

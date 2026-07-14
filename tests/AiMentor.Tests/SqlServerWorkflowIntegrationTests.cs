@@ -91,7 +91,7 @@ public sealed class SqlServerWorkflowIntegrationTests
 
             using var executionLedger = new SqlServerToolExecutionLedger(sqlOptions, rotatedCipher, clock);
             var executionKey = new string('A', 64);
-            var fingerprint = new string('B', 64);
+            var fingerprint = JsonArgumentFingerprint.Create("memory.delete", arguments, requester);
             var executing = await executionLedger.TryAcquireAsync(new ToolExecutionLedgerRequest(executionKey,
                     fingerprint, "tool-run-1", "tenant-a", "requester-a", "memory.delete"),
                 TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
@@ -102,6 +102,11 @@ public sealed class SqlServerWorkflowIntegrationTests
                 TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
             var tenantUnknown = await executionLedger.ListOutcomeUnknownAsync("tenant-a", 50);
             var otherTenantUnknown = await executionLedger.ListOutcomeUnknownAsync("tenant-b", 50);
+            var reconciliation = new ToolExecutionReconciliationService(executionLedger, trace,
+                new ToolExecutionReconciliationOptions(), clock,
+                [new MemoryDeleteOutcomeProbe(new InMemoryMemoryStore(), clock)]);
+            var sqlProbe = await reconciliation.ProbeOutcomeAsync(
+                AccessContext.Create("tenant-a", "reconciler-a", ["tool-reconcilers"]), executionKey, arguments);
 
             var completedKey = new string('C', 64);
             using var oldExecutionLedger = new SqlServerToolExecutionLedger(sqlOptions, workflowCipher, clock);
@@ -141,6 +146,7 @@ public sealed class SqlServerWorkflowIntegrationTests
             Assert.Equal(IdempotencyAcquireStatus.OutcomeUnknown, outcomeUnknown.Status);
             Assert.Equal("tenant-a", Assert.Single(tenantUnknown).TenantId);
             Assert.Empty(otherTenantUnknown);
+            Assert.Equal(ToolOutcomeProbeState.Applied, sqlProbe.State);
             Assert.Equal(IdempotencyAcquireStatus.Replay, rotatingReplay.Status);
             Assert.Equal(IdempotencyAcquireStatus.Replay, replay.Status);
             Assert.Equal("tool-run-3", replay.ReplayResult!.RunId);

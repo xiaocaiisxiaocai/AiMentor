@@ -147,6 +147,7 @@ dotnet run --project .\src\AiMentor.Api\AiMentor.Api.csproj --urls http://127.0.
 - `GET /api/v1/tool-approvals?status=Pending`：申请人查看自己的审批；`tool-approvers` 组可查看当前租户内可裁决审批。
 - `POST /api/v1/tool-approvals/{approvalId}/decision`：由同租户、不同用户且属于 `tool-approvers` 组的审批人批准或拒绝。
 - `GET /api/v1/tool-executions/outcome-unknown?limit=50`：仅 `tool-reconcilers` 组可查看当前租户的结果不确定执行摘要；不返回工具参数、审批内容或执行结果。
+- `POST /api/v1/tool-executions/{executionKey}/probe`：提交候选工具参数；指纹与原调用完全匹配后，只读核验目标状态并返回 `Applied`、`NotApplied` 或 `Indeterminate`。
 - `POST /api/v1/agents/runs`：执行受限 Agent 规划闭环；请求体为 `{"input":"当前知识库有多少文档和分块？"}`，返回最终回答、工具步骤、安全决策与轨迹。
 - `POST /api/v1/agents/runs/{runId}/resume`：原调用者在审批裁决后恢复暂停的 Agent；尚未裁决时仍返回 `202 AwaitingApproval`，批准后继续原生函数调用，拒绝或过期则安全终止。
 - 原 V0 接口默认关闭；只有非 Production 环境显式设置 `Api:EnableLegacyV0=true` 才会挂载兼容入口。
@@ -272,6 +273,10 @@ GROUP BY KeyVersion;
 
 此接口故意不提供“清除状态”“标记成功”或“再次执行”。在目标系统没有可验证状态查询、补偿契约、双人复核与审计原因之前，人工改变 `OutcomeUnknown` 可能制造重复副作用或掩盖真实失败。后续应为每个修改性工具单独实现目标状态适配器，再设计受控裁决状态机，而不是提供通用解冻按钮。
 
+`memory.delete` 已提供首个目标状态探测器。对账人员调用 `POST /api/v1/tool-executions/{executionKey}/probe` 并提交原 `memoryId` 与 `expectedVersion`；系统使用账本记录的原租户、原用户和工具名重算规范化参数指纹，固定时间比较通过后才查询记忆存储。目标确实不存在返回 `Applied`，原版本仍存在返回 `NotApplied`，版本已变化或目标存在但不属于原调用者返回 `Indeterminate`。候选参数不写入执行账本、响应或 Trace，目标状态查询也不会执行删除或补偿。
+
+这一探测结论目前只是处置证据，不会自动改变账本状态。下一阶段需要把证据快照、两名不同对账人员的一致裁决、裁决时效和新审批凭据组合为持久化状态机；在此之前，即使结果是 `NotApplied` 也不能自动重试。
+
 数据库访问使用参数化 `SqlCommand`、异步连接和显式事务，接口依据 [Microsoft.Data.SqlClient 官方包说明](https://github.com/dotnet/SqlClient/blob/main/src/Microsoft.Data.SqlClient/src/PackageReadme.md) 核对；审批与租约的一次性语义属于本项目额外实现，不能仅依赖驱动默认行为。
 
 Agent 路径不是让模型直接执行代码：每个 `AIFunction` 只是当前请求的受限适配器，工具名称来自服务器注册表，调用仍进入同一 `IToolExecutor`。框架函数循环只负责“模型选择—回填结果”；服务端额外负责总预算和终止条件。默认确定性模型会对知识统计问题选择 `knowledge.stats`，便于在没有外部模型密钥时完成真实函数调用回归；接入真实模型时仍复用相同安全边界。
@@ -332,7 +337,7 @@ $env:Authentication__GroupsClaim = 'groups'
 
 ## 下一阶段
 
-1. 为 `OutcomeUnknown` 增加按工具实现的目标状态查询、双人裁决和受控补偿；只读租户对账 API 已完成，普通调用者仍不能清除不确定状态。
+1. 为 `OutcomeUnknown` 增加双人裁决、证据快照和受控补偿；只读租户查询及 `memory.delete` 目标状态探测已完成，普通调用者仍不能清除不确定状态。
 2. 在 SQL Server 容器环境完成 API 实例真实强杀、连接中断和滚动部署验收；LocalDB 已验证租约过期接管、在线重加密和执行账本冻结语义。
 3. 为跨小时 Workflow 增加取消、补偿、续租和人工任务队列；当前短租约只覆盖短时 Agent 工具审批恢复。
 3. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率、恶意文档隔离率和引用正确率门禁。
@@ -341,7 +346,7 @@ $env:Authentication__GroupsClaim = 'groups'
 
 ## 验证状态
 
-- 2026-07-14 本地自动化测试 75/75 通过；Agent 审批覆盖暂停、待决恢复、批准、拒绝、过期、跨用户、容量、并发恢复、跨运行器会话重建、租约接管和重放。真实 SQL Server LocalDB 测试验证了并发审批只消费一次、崩溃租约到期后由新实例接管、旧密钥检查点在线重加密、仅保留新密钥仍可恢复、执行结果加密回放、已开始副作用的崩溃窗口冻结为 `OutcomeUnknown`，以及结果不确定查询的租户隔离。安全执行器回归还验证不确定态不会再次调用工具。150 条离线评测决策匹配率 90%、引用召回率 75%，质量门禁通过；NuGet 直接与传递依赖未发现已知漏洞。
+- 2026-07-14 本地自动化测试 77/77 通过；Agent 审批覆盖暂停、待决恢复、批准、拒绝、过期、跨用户、容量、并发恢复、跨运行器会话重建、租约接管和重放。真实 SQL Server LocalDB 测试验证了并发审批只消费一次、崩溃租约到期后由新实例接管、旧密钥检查点在线重加密、仅保留新密钥仍可恢复、执行结果加密回放、已开始副作用的崩溃窗口冻结为 `OutcomeUnknown`、租户隔离，以及 SQL 记录上的 `memory.delete` 目标状态探测。安全执行器回归还验证不确定态不会再次调用工具，外部所有者的同名目标也不会被误报为已删除。150 条离线评测决策匹配率 90%、引用召回率 75%，质量门禁通过；NuGet 直接与传递依赖未发现已知漏洞。
 - OpenSearch 请求契约已由自动化测试验证：索引映射、搜索管线、批量摄取，以及 BM25/k-NN 两个分支中的租户和 ACL 过滤。
 - 2026-07-13 尝试拉取 `opensearchproject/opensearch:3.5.0` 做真实容器验收，但镜像仓库连续两次无下载进度并超时，未创建镜像或容器。因此真实集群验收尚未通过，网络恢复后必须重新执行 `docker compose up -d` 和 HTTP 闭环。
 - 2026-07-13 拉取 `mcr.microsoft.com/mssql/server:2022-latest` 在 120 秒内无下载进度并超时；2026-07-14 改用本机 SQL Server LocalDB 完成真实事务测试并通过。容器部署形态仍需在镜像网络恢复后补做启动、健康检查和进程强杀验收，但数据库事务实现已获得真实 SQL 执行证据。

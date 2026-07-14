@@ -176,6 +176,8 @@ public sealed class ToolExecutorTests
         public Task AbandonAsync(string executionKey, string leaseToken, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<IReadOnlyList<OutcomeUnknownToolExecution>> ListOutcomeUnknownAsync(string tenantId, int limit,
             CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<OutcomeUnknownToolExecutionDetail?> GetOutcomeUnknownAsync(string tenantId, string executionKey,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 
     private sealed class FakeTool(
