@@ -25,12 +25,16 @@ try
     using var repository = new MarkdownKnowledgeRepository(knowledgeRoot);
     await repository.InitializeAsync();
     using IChatClient chatClient = new DeterministicGroundedChatClient();
-    var service = new TrustedQuestionService(repository, new RuleBasedQueryNormalizer(), new RuleBasedInputSafetyService(),
+    var queryNormalizer = new RuleBasedQueryNormalizer();
+    var recordingRepository = new RecordingKnowledgeRepository(repository);
+    var service = new TrustedQuestionService(recordingRepository, queryNormalizer, new RuleBasedInputSafetyService(),
         new RuleBasedRetrievedContentSafetyService(),
         new LexicalEvidenceReranker(), new RuleBasedEvidenceSufficiencyEvaluator(),
         new AgentFrameworkAnswerComposer(chatClient), new RuleBasedOutputSafetyService(),
         new InMemoryTraceSink(), new TrustedQuestionOptions(), new EmptyMemoryContextProvider());
-    var runner = new EvaluationRunner(new TrustedQuestionEvaluationTarget(service));
+    var fixtureRegistry = new KnowledgeAclEvaluationFixtureRegistry(recordingRepository, repository, queryNormalizer,
+        BuiltInEvaluationFixtures.Create());
+    var runner = new EvaluationRunner(new TrustedQuestionEvaluationTarget(service), fixtureRegistry);
     var report = EvaluationReportBuilder.Build(await runner.RunAsync(cases));
 
     Console.WriteLine(JsonSerializer.Serialize(new

@@ -178,10 +178,18 @@ public static class EvaluationScorer
             || observation.Fixture.Status == EvaluationFixtureStatus.VerificationFailed)
             return Fail("citation_provenance", "CITATION_PROVENANCE_VERIFICATION_FAILED",
                 "执行夹具身份不匹配或证据集合验证失败。");
-        return observation.Citations.All(citation => CitationMatches(
-                new ExpectedCitation(citation.DocumentId, citation.Version), observation.Fixture.AccessibleCitations))
-            ? Pass("citation_provenance", "CITATION_PROVENANCE_VERIFIED", "所有引用均来自夹具确认的可访问证据集合。")
-            : Fail("citation_provenance", "CITATION_PROVENANCE_INVALID", "观察结果包含夹具未确认可访问的引用。");
+        if (observation.Fixture.RetrievedEvidence is null)
+            return Fail("citation_provenance", "CITATION_PROVENANCE_VERIFICATION_FAILED",
+                "执行夹具没有提供本次实际检索证据。");
+        return observation.Citations.All(citation => observation.Fixture.RetrievedEvidence.Any(evidence =>
+                string.Equals(citation.DocumentId, evidence.DocumentId, StringComparison.Ordinal)
+                && string.Equals(citation.Version, evidence.Version, StringComparison.Ordinal)
+                && string.Equals(citation.Title, evidence.Title, StringComparison.Ordinal)
+                && string.Equals(citation.Section, evidence.Section, StringComparison.Ordinal)
+                && string.Equals(citation.Quote, evidence.Quote, StringComparison.Ordinal)
+                && citation.Score.Equals(evidence.Score)))
+            ? Pass("citation_provenance", "CITATION_PROVENANCE_VERIFIED", "所有引用均精确来自本次实际检索证据。")
+            : Fail("citation_provenance", "CITATION_PROVENANCE_INVALID", "观察结果包含未在本次检索中出现或内容不一致的引用。");
     }
 
     private static AssertionResult ScoreV2Trace(EvaluationOracle oracle, EvaluationObservation observation)
@@ -314,7 +322,7 @@ public static class EvaluationScorer
     private static AssertionResult NotReady(string name, string code, string detail) => new(name, AssertionStatus.NotReady, code, detail);
 }
 
-public sealed class EvaluationRunner(IEvaluationTarget target)
+public sealed class EvaluationRunner(IEvaluationTarget target, IEvaluationFixtureRegistry? fixtureRegistry = null)
 {
     public async Task<IReadOnlyList<EvaluationCaseResult>> RunAsync(IEnumerable<EvaluationCase> cases,
         CancellationToken cancellationToken = default)
@@ -328,11 +336,15 @@ public sealed class EvaluationRunner(IEvaluationTarget target)
             EvaluationObservation observation;
             try
             {
-                observation = await target.ExecuteAsync(input, cancellationToken)
-                              ?? throw new InvalidOperationException("评测目标返回了空观察结果。");
+                // Fixture 只能由评测运行时 Registry 生成；Target 自报的 Ready 不属于可信测量证据。
+                observation = fixtureRegistry is null
+                    ? (await target.ExecuteAsync(input, cancellationToken)) with { Fixture = null }
+                    : await fixtureRegistry.ExecuteAsync(input, target, cancellationToken);
                 if (observation.Citations is null || observation.Trace is null
                     || observation.SafetyCode is null || observation.TerminalCode is null || observation.Answer is null)
                     throw new InvalidOperationException("评测目标返回了包含空必填字段的观察结果。");
+                if (observation.Fixture is { AccessibleCitations: null })
+                    throw new InvalidOperationException("评测 Fixture 返回了空证据集合。");
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {

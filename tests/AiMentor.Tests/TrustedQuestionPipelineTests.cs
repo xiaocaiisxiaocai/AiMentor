@@ -12,12 +12,16 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
 {
     private readonly MarkdownKnowledgeRepository _repository = new(WorkspacePathLocator.FindKnowledgeRoot());
     private readonly DeterministicGroundedChatClient _chatClient = new();
+    private RecordingKnowledgeRepository _recordingRepository = null!;
+    private RuleBasedQueryNormalizer _queryNormalizer = null!;
     private TrustedQuestionService _service = null!;
 
     public async Task InitializeAsync()
     {
         await _repository.InitializeAsync();
-        _service = new TrustedQuestionService(_repository, new RuleBasedQueryNormalizer(), new RuleBasedInputSafetyService(),
+        _recordingRepository = new RecordingKnowledgeRepository(_repository);
+        _queryNormalizer = new RuleBasedQueryNormalizer();
+        _service = new TrustedQuestionService(_recordingRepository, _queryNormalizer, new RuleBasedInputSafetyService(),
             new RuleBasedRetrievedContentSafetyService(),
             new LexicalEvidenceReranker(), new RuleBasedEvidenceSufficiencyEvaluator(),
             new AgentFrameworkAnswerComposer(_chatClient), new RuleBasedOutputSafetyService(),
@@ -42,11 +46,13 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
             Path.Combine(evaluationRoot, "evaluation-critical-v2.jsonl"),
             Path.Combine(evaluationRoot, "evaluation-suite-v2.json"));
 
-        var results = await new EvaluationRunner(new TrustedQuestionEvaluationTarget(_service)).RunAsync(cases);
+        var registry = new KnowledgeAclEvaluationFixtureRegistry(_recordingRepository, _repository, _queryNormalizer,
+            BuiltInEvaluationFixtures.Create());
+        var results = await new EvaluationRunner(new TrustedQuestionEvaluationTarget(_service), registry).RunAsync(cases);
         var report = EvaluationReportBuilder.Build(results);
 
-        Assert.Equal(2, report.Total);
-        Assert.Equal(2, report.Passed);
+        Assert.Equal(4, report.Total);
+        Assert.Equal(4, report.Passed);
         Assert.Equal(1, report.OracleCoverage);
         Assert.True(report.QualityGate.Passed);
     }

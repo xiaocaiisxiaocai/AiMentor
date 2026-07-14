@@ -1,14 +1,22 @@
 {
   "schema_version": 2,
-  "cases_sha256": "2257389929BF61AF2C79F11C3E3FAF28FD4A88CDD5F6DB0535A9A9F7D6E417A7",
-  "expected_case_count": 2,
+  "cases_sha256": "1AE36EAEA1CA894A79C13C455EBFABDB2656D1DAB9EB848A44A83290F539F6E8",
+  "expected_case_count": 4,
   "expected_category_counts": {
     "no_answer": 1,
-    "security": 1
+    "security": 1,
+    "acl": 2
   },
   "default_groups": [
     "all-employees",
     "all-rnd"
   ],
-  "case_group_overrides": {}
+  "case_group_overrides": {
+    "ACL2-001-ALLOW": [
+      "knowledge-admin"
+    ],
+    "ACL2-001-DENY": [
+      "all-rnd"
+    ]
+  }
 }

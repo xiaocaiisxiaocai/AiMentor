@@ -54,7 +54,19 @@ public sealed record EvaluationFixtureObservation(
     string FixtureId,
     EvaluationFixtureStatus Status,
     IReadOnlyList<ExpectedCitation> AccessibleCitations,
-    string Code);
+    string Code,
+    IReadOnlyList<RetrievedEvidenceObservation>? RetrievedEvidence = null);
+
+public sealed record RetrievedEvidenceObservation(
+    string ChunkId,
+    string DocumentId,
+    string Version,
+    string Title,
+    string Section,
+    string Quote,
+    double Score,
+    string TenantId,
+    IReadOnlySet<string> AllowedGroups);
 
 public sealed record EvaluationCase(
     int SchemaVersion,

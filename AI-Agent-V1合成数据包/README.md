@@ -18,7 +18,7 @@
 - `manifests\glossary.json`：术语表。
 - `evaluation\evaluation-cases.jsonl`：150 道评测题。
 - `evaluation\evaluation-suite.json`：普通主体基线和 ACL 题逐题主体组覆盖。
-- `evaluation\evaluation-critical-v2.jsonl`：2 道已具备确定性 Oracle 的 critical 输入安全题。
+- `evaluation\evaluation-critical-v2.jsonl`：4 道已具备确定性 Oracle 的 critical 输入安全与 ACL 双主体题。
 - `evaluation\evaluation-suite-v2.json`：v2 小套件的完整性清单，与v1 基线独立。
 - `evaluation\schema.md`：评测字段和判定规则。
 
@@ -41,6 +41,6 @@
 
 当前 v1 题集中的 `expected_behavior` 是人工规格说明，不等于可执行 Oracle。严格执行器会把缺少真实主体、恶意内容、工具参数、缓存、状态变化或结构化输出断言的题标为 `NotReady`；不得用旧式宽泛终态匹配把它们算作通过。
 
-v2 不修改或替代 v1 的 150 题基线。当前只收录 `N-004` 和 `SEC-001`：两者均能仅依靠实际用户输入，经输入安全链路稳定产生拒答、原因码、无引用和提前终止轨迹。其他 26 道 critical 题仍缺少可验证的 ACL 资源、恶意检索内容、工具参数、PII 载荷或跨用户状态，在完成真实 Fixture 前不得迁移为可通过 Oracle。
+v2 不修改或替代 v1 的 150 题基线。`N-004` 和 `SEC-001` 仅依靠实际用户输入，经输入安全链路稳定产生拒答、原因码、无引用和提前终止轨迹；`ACL2-001-ALLOW/DENY` 使用同一问题和真实受限文档 `BK-POL-009 v1.2`，分别以 `knowledge-admin` 与 `all-rnd` 验证授权回答和未授权隐藏。其他 critical 题仍缺少可验证资源、恶意检索内容、工具参数、PII 载荷或跨用户状态，在完成真实 Fixture 前不得迁移为可通过 Oracle。
 
-2026-07-14 使用当前确定性目标执行 v2 小套件：2/2 Pass，0 Fail，0 NotReady，Oracle 覆盖率 100%，critical 阻断数为 0，门禁退出码为 0。该套件没有必需引用，因此引用召回率正确显示为 N/A。
+2026-07-14 使用当前确定性目标执行 v2 小套件：4/4 Pass，0 Fail，0 NotReady，动作、引用和 Oracle 覆盖率均为 100%，critical 阻断数为 0，门禁退出码为 0。ACL Fixture 的 Ready 只能由 Runner 侧 Registry 根据实际检索主体、返回 Evidence 和轨迹生成，Target 自报状态不受信任。

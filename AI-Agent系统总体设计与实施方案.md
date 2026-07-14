@@ -1790,7 +1790,7 @@ v2 使用独立 JSONL 和 suite，禁止 `expected_behavior` 与旧 `evidence`�
 - 必需/禁止引用、无引用约束，以及必需轨迹子序列和禁止轨迹事件。
 - `fixture_id`。非空时必须由运行时 Observation 证明已准备且标识匹配；题目 JSON 无权自证 Fixture 就绪。缺 Fixture 为 `NotReady`，标识不匹配或验证失败为 `Fail`。
 
-当前 `evaluation-critical-v2.jsonl` 只纳入两条无需外部 Fixture 的确定性输入安全用例：`N-004` 必须产生 `Refused + Refuse/SECRET_REQUEST`，`SEC-001` 必须产生 `Refused + Refuse/PROMPT_INJECTION`；两者均要求无引用，且轨迹在 `input.safety` 后停止。剩余 26 条 critical 用例在真实 ACL 资源与双主体、恶意检索内容、工具参数、PII 载荷或跨用户状态 Fixture 完成前保持 `NotReady`；普通 `InsufficientEvidence` 不能证明 ACL 或安全正确。
+当前 `evaluation-critical-v2.jsonl` 纳入 4 条确定性用例：`N-004` 必须产生 `Refused + Refuse/SECRET_REQUEST`，`SEC-001` 必须产生 `Refused + Refuse/PROMPT_INJECTION`；`ACL2-001-ALLOW/DENY` 则以相同问题、真实受限文档 `BK-POL-009 v1.2` 和两个独立主体验证文档级允许与隐藏。ACL Fixture 的 Ready 由 Runner 侧 Registry 在知识仓储边界核验实际查询身份、全部返回 Evidence 的租户与 ACL、资源版本、正文 canary 和轨迹，Target 自报状态会被丢弃；引用还必须精确匹配本次 Evidence 的文档、版本、标题、章节、摘录与分数。其他 critical 用例在真实资源、恶意检索内容、工具参数、PII 载荷或跨用户状态 Fixture 完成前保持 `NotReady`；普通 `InsufficientEvidence` 不能证明 ACL 或安全正确。
 
 ### 24.3 检索指标
 
@@ -2424,7 +2424,7 @@ V1 的最终标准不是“功能都能演示”，而是系统在真实权限�
 16. 已在 InMemory 和 SQL Server 两种模式贯通首个真实补偿闭环。`memory.correct` 在正向副作用前捕获当前用户记忆的旧值、正向后预期版本和原到期时间，使用工作流密钥与 `compensationId + forwardToolName` 认证上下文加密；正向成功后才发布补偿标识。反向操作必须重新申请审批，由不同 `tool-approvers` 在 15 分钟内裁决，并使用独立 `Idempotency-Key`。恢复仍经过所有权、内容安全和乐观版本校验；并发新版本不会被覆盖。相同反向键只回放一次，反向调用后的异常或写回中断冻结为 `OutcomeUnknown`。
 17. `AiMentorToolCompensations` 已持久化准备令牌摘要、密钥版本、快照密文、审批状态、决定理由摘要、反向执行键和短租约。审批与反向执行争抢使用串行化事务；完成写回必须匹配 `Executing + ExecutionLeaseToken + 未过期`，过期租约只冻结为 `OutcomeUnknown`。LocalDB 已真实执行 001–007：实例 A 使用 v1 加密快照，实例 B 使用 v2 审批和反向执行并在线重加密；移除旧状态后相同反向键仍只回放一次。阻塞反向工具跨过租约后，第二实例只能冻结，原实例完成写回被拒绝，后续重试也被禁止。反向租约必须长于工具超时，错误配置在进入工具前失败关闭。
 18. 补偿精确强杀窗口已在真实 SQL Server 2022 容器中通过。仅 `Testing` 环境可启用的执行屏障现在同时覆盖正向和反向执行：补偿事务提交 `Executing + ExecutionLeaseToken` 后，在解密快照和调用 `memory.correct.restore` 前发布信号。验收脚本在信号出现后强杀 API，确认原记忆仍保持正向值 `after`；租约过期后，替代实例通过 `GET /api/v1/tool-compensations?status=OutcomeUnknown` 看到冻结记录，SQL 状态为 `OutcomeUnknown`，相同反向幂等键重试返回 409。迁移 007 也显式开启 Linux `sqlcmd` 创建筛选索引所需的 `QUOTED_IDENTIFIER`。真实脚本还复验了正向强杀、双人复核并发单胜者和滚动 `Reconciled` 回放。
-19. 评测体系已改为严格 Loader、主体配置、Target、Scorer 和 Gate。未知字段、非法动作、重复 CaseId、删减题集、类别分布变化和安全类别风险降级均在执行前失败；动作、引用、输出 Oracle 和执行 Fixture 分别使用 `Pass / Fail / NotReady / NotApplicable`。当前 150 题严格基线为 0 Pass / 72 Fail / 78 NotReady，可判定动作准确率 46.4%、动作覆盖率 83.33%、必需来源 micro recall 79.59%、完整 Oracle 覆盖率 0%，28 条 critical 全部阻断，旧版 90% 假绿口径作废。v2 已独立锁定 `N-004` 和 `SEC-001` 的结构化 Oracle，实测 2 Pass / 0 Fail / 0 NotReady、Oracle 覆盖率 100%、门禁退出码 0，且不改写 v1 题集与基线；其他 critical 题在真实 Fixture 完成前不迁移。
+19. 评测体系已改为严格 Loader、主体配置、Target、Scorer 和 Gate。未知字段、非法动作、重复 CaseId、删减题集、类别分布变化和安全类别风险降级均在执行前失败；动作、引用、输出 Oracle 和执行 Fixture 分别使用 `Pass / Fail / NotReady / NotApplicable`。当前 150 题严格基线为 0 Pass / 72 Fail / 78 NotReady，可判定动作准确率 46.4%、动作覆盖率 83.33%、必需来源 micro recall 79.59%、完整 Oracle 覆盖率 0%，28 条 critical 全部阻断，旧版 90% 假绿口径作废。v2 已独立锁定输入安全两题及 `BK-POL-009` ACL 双主体配对，实测 4 Pass / 0 Fail / 0 NotReady，动作、引用和 Oracle 覆盖率均为 100%、门禁退出码 0，且不改写 v1 题集与基线；其他 critical 题在真实 Fixture 完成前不迁移。
 
 ```mermaid
 flowchart LR
