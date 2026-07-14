@@ -126,6 +126,53 @@ public sealed class InMemoryMemoryStore : IMemoryStore
         }
     }
 
+    /// <inheritdoc />
+    public Task<MemoryStoreResult<MemoryRecord>> RestoreCompensationAsync(string memoryId, AccessContext access,
+        int expectedVersion, string previousValue, DateTimeOffset previousExpiresAt, DateTimeOffset now,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_gate)
+        {
+            if (!_memories.TryGetValue(memoryId, out var memory)
+                || !OwnedBy(memory.TenantId, memory.SubjectId, access))
+                return Task.FromResult(new MemoryStoreResult<MemoryRecord>(MemoryStoreStatus.NotFound));
+            if (memory.Version != expectedVersion)
+                return Task.FromResult(new MemoryStoreResult<MemoryRecord>(MemoryStoreStatus.Conflict));
+            // 该专用路径只能恢复服务器加密快照，允许回到比正向更正更晚的原期限。
+            var restored = memory with
+            {
+                Value = previousValue,
+                Version = memory.Version + 1,
+                UpdatedAt = now,
+                ExpiresAt = previousExpiresAt
+            };
+            _memories[memoryId] = restored;
+            return Task.FromResult(new MemoryStoreResult<MemoryRecord>(MemoryStoreStatus.Success, restored));
+        }
+    }
+
+    /// <inheritdoc />
+    public Task<MemoryCorrectionCompensationState> ProbeCorrectionCompensationAsync(string memoryId,
+        AccessContext access, int expectedVersionAfterForward, string previousValue,
+        DateTimeOffset previousExpiresAt, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        lock (_gate)
+        {
+            if (!_memories.TryGetValue(memoryId, out var memory)
+                || !OwnedBy(memory.TenantId, memory.SubjectId, access))
+                return Task.FromResult(MemoryCorrectionCompensationState.Inaccessible);
+            if (memory.Version == expectedVersionAfterForward)
+                return Task.FromResult(MemoryCorrectionCompensationState.NotApplied);
+            return Task.FromResult(memory.Version == expectedVersionAfterForward + 1
+                && string.Equals(memory.Value, previousValue, StringComparison.Ordinal)
+                && memory.ExpiresAt.Equals(previousExpiresAt)
+                    ? MemoryCorrectionCompensationState.Applied
+                    : MemoryCorrectionCompensationState.Changed);
+        }
+    }
+
     private static bool OwnedBy(string tenantId, string subjectId, AccessContext access) =>
         string.Equals(tenantId, access.TenantId, StringComparison.OrdinalIgnoreCase)
         && string.Equals(subjectId, access.SubjectId, StringComparison.Ordinal);

@@ -169,7 +169,21 @@ builder.Services.AddSingleton<IToolApprovalService>(services =>
         ? ActivatorUtilities.CreateInstance<SqlServerToolApprovalService>(services)
         : ActivatorUtilities.CreateInstance<InMemoryToolApprovalService>(services));
 builder.Services.AddSingleton(new ToolExecutorOptions());
-builder.Services.AddSingleton(new ToolCompensationOptions());
+var compensationReconcilerGroups = builder.Configuration
+    .GetSection("ToolCompensation:ReconcilerGroups").Get<string[]>()
+    ?? ["tool-reconcilers"];
+var compensationEvidenceLifetimeSeconds = builder.Configuration.GetValue(
+    "ToolCompensation:ReconciliationEvidenceLifetimeSeconds", 300);
+if (compensationReconcilerGroups.Length == 0
+    || compensationReconcilerGroups.Any(string.IsNullOrWhiteSpace)
+    || compensationEvidenceLifetimeSeconds is < 30 or > 3_600)
+    throw new InvalidOperationException(
+        "ToolCompensation 对账组不能为空，证据有效期必须在 30 到 3600 秒之间。");
+builder.Services.AddSingleton(new ToolCompensationOptions
+{
+    ReconcilerGroups = new HashSet<string>(compensationReconcilerGroups, StringComparer.OrdinalIgnoreCase),
+    ReconciliationEvidenceLifetime = TimeSpan.FromSeconds(compensationEvidenceLifetimeSeconds)
+});
 var barrierSignalPath = builder.Configuration["Testing:ToolExecutionBarrier:SignalPath"];
 var barrierReleasePath = builder.Configuration["Testing:ToolExecutionBarrier:ReleasePath"];
 if (builder.Environment.IsEnvironment("Testing")
@@ -195,6 +209,7 @@ builder.Services.AddSingleton<IToolExecutor, SafeToolExecutor>();
 builder.Services.AddSingleton(new ToolExecutionReconciliationOptions());
 builder.Services.AddSingleton<IToolOutcomeProbe, MemoryDeleteOutcomeProbe>();
 builder.Services.AddSingleton<IToolExecutionReconciliationService, ToolExecutionReconciliationService>();
+builder.Services.AddSingleton<IToolCompensationOutcomeProbe, MemoryCorrectRestoreOutcomeProbe>();
 builder.Services.AddSingleton(new AgentExecutionOptions
 {
     // 最大运行时间可长于租约；活动恢复实例通过短租约心跳维持独占权。
@@ -257,6 +272,9 @@ else
 {
     throw new InvalidOperationException("Workflow:Provider 仅支持 InMemory 或 SqlServer。");
 }
+builder.Services.AddSingleton<IToolCompensationReconciliationService>(services =>
+    services.GetRequiredService<IToolCompensationService>() as IToolCompensationReconciliationService
+    ?? throw new InvalidOperationException("当前补偿存储未实现结果不确定对账契约。"));
 builder.Services.AddSingleton(new EncryptedFileMemoryStoreOptions { FilePath = memoryStorePath });
 builder.Services.AddSingleton<IMemoryStore, EncryptedFileMemoryStore>();
 builder.Services.AddSingleton<IMemoryContentSafetyService, RuleBasedMemoryContentSafetyService>();
@@ -435,6 +453,22 @@ toolCompensations.MapPost("/{compensationId}/execute", ExecuteToolCompensationAs
     .ProducesProblem(StatusCodes.Status404NotFound)
     .ProducesProblem(StatusCodes.Status409Conflict)
     .ProducesProblem(StatusCodes.Status503ServiceUnavailable)
+    .RequireRateLimiting("questions");
+toolCompensations.MapPost("/{compensationId}/probe", ProbeOutcomeUnknownToolCompensationAsync)
+    .WithName("ProbeOutcomeUnknownToolCompensationV1")
+    .WithSummary("由工具对账人员只读核验结果不确定反向补偿的目标状态")
+    .Produces<ToolCompensationOutcomeProbeResult>()
+    .ProducesValidationProblem()
+    .ProducesProblem(StatusCodes.Status403Forbidden)
+    .ProducesProblem(StatusCodes.Status404NotFound)
+    .RequireRateLimiting("questions");
+toolCompensations.MapPost("/{compensationId}/reviews", ReviewOutcomeUnknownToolCompensationAsync)
+    .WithName("ReviewOutcomeUnknownToolCompensationV1")
+    .WithSummary("由两名不同工具对账人员在证据有效期内复核结果不确定反向补偿")
+    .Produces<ToolCompensationReconciliationReviewResult>()
+    .ProducesValidationProblem()
+    .ProducesProblem(StatusCodes.Status403Forbidden)
+    .ProducesProblem(StatusCodes.Status404NotFound)
     .RequireRateLimiting("questions");
 
 var toolExecutions = v1.MapGroup("/tool-executions").WithTags("AiMentor tool reconciliation v1");
@@ -785,6 +819,36 @@ static IResult ToolCompensationProblem(ToolCompensationException exception, Http
     return Results.Problem(statusCode: statusCode, title: "工具补偿请求失败", detail: exception.Message,
         instance: context.Request.Path,
         extensions: new Dictionary<string, object?> { ["code"] = exception.Code });
+}
+
+static async Task<IResult> ProbeOutcomeUnknownToolCompensationAsync(string compensationId,
+    IToolCompensationReconciliationService service, IRequestAccessContextProvider accessProvider,
+    HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        return Results.Ok(await service.ProbeOutcomeAsync(compensationId,
+            accessProvider.GetAccessContext(context.User), cancellationToken));
+    }
+    catch (ToolCompensationException exception)
+    {
+        return ToolCompensationProblem(exception, context);
+    }
+}
+
+static async Task<IResult> ReviewOutcomeUnknownToolCompensationAsync(string compensationId,
+    ReviewToolCompensationOutcomeRequest request, IToolCompensationReconciliationService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        return Results.Ok(await service.ReviewOutcomeAsync(compensationId, request.Confirmed!.Value, request.Reason,
+            accessProvider.GetAccessContext(context.User), cancellationToken));
+    }
+    catch (ToolCompensationException exception)
+    {
+        return ToolCompensationProblem(exception, context);
+    }
 }
 
 static async Task<IResult> ListOutcomeUnknownToolExecutionsAsync(int? limit,

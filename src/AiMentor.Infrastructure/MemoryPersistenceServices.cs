@@ -189,6 +189,47 @@ public sealed class EncryptedFileMemoryStore : IMemoryStore, IDisposable
         }, cancellationToken);
     }
 
+    /// <inheritdoc />
+    public async Task<MemoryStoreResult<MemoryRecord>> RestoreCompensationAsync(string memoryId,
+        AccessContext access, int expectedVersion, string previousValue, DateTimeOffset previousExpiresAt,
+        DateTimeOffset now, CancellationToken cancellationToken = default)
+    {
+        return await MutateAsync(snapshot =>
+        {
+            var memory = snapshot.Memories.FirstOrDefault(item => item.Id == memoryId && OwnedBy(item, access));
+            if (memory is null) return new MemoryStoreResult<MemoryRecord>(MemoryStoreStatus.NotFound);
+            if (memory.Version != expectedVersion)
+                return new MemoryStoreResult<MemoryRecord>(MemoryStoreStatus.Conflict);
+            // 旧值来自已认证上下文绑定的加密补偿快照，不接受 API 提供的任意延长期限。
+            memory.ValueCipher = _cipher.Protect(previousValue, Context(memory, "value"));
+            memory.Version++;
+            memory.UpdatedAt = now;
+            memory.ExpiresAt = previousExpiresAt;
+            return new MemoryStoreResult<MemoryRecord>(MemoryStoreStatus.Success, FromStored(memory));
+        }, cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public async Task<MemoryCorrectionCompensationState> ProbeCorrectionCompensationAsync(string memoryId,
+        AccessContext access, int expectedVersionAfterForward, string previousValue,
+        DateTimeOffset previousExpiresAt, CancellationToken cancellationToken = default)
+    {
+        return await ReadAsync(snapshot =>
+        {
+            var memory = snapshot.Memories.FirstOrDefault(item => item.Id == memoryId);
+            if (memory is null || !OwnedBy(memory, access))
+                return MemoryCorrectionCompensationState.Inaccessible;
+            if (memory.Version == expectedVersionAfterForward)
+                return MemoryCorrectionCompensationState.NotApplied;
+            return memory.Version == expectedVersionAfterForward + 1
+                && string.Equals(_cipher.Unprotect(memory.ValueCipher, Context(memory, "value")), previousValue,
+                    StringComparison.Ordinal)
+                && memory.ExpiresAt.Equals(previousExpiresAt)
+                    ? MemoryCorrectionCompensationState.Applied
+                    : MemoryCorrectionCompensationState.Changed;
+        }, cancellationToken);
+    }
+
     public void Dispose() => _gate.Dispose();
 
     private async Task<T> ReadAsync<T>(Func<StoreSnapshot, T> action, CancellationToken cancellationToken)

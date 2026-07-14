@@ -60,6 +60,11 @@ public sealed record DecideToolCompensationRequest(
 public sealed record ExecuteToolCompensationRequest(
     [property: Required, StringLength(128, MinimumLength = 1)] string ApprovalId);
 
+/// <summary>提交当前反向目标证据、确认意见和理由；理由只以不可逆摘要进入对账状态。</summary>
+public sealed record ReviewToolCompensationOutcomeRequest(
+    [property: Required] bool? Confirmed,
+    [property: Required, StringLength(500, MinimumLength = 1)] string Reason);
+
 /// <summary>提交与原调用指纹完全匹配的候选参数，用于只读核验目标系统状态。</summary>
 public sealed record ProbeToolOutcomeRequest(
     [property: Required] Dictionary<string, JsonElement> Arguments);

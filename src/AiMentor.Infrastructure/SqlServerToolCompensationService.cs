@@ -20,9 +20,12 @@ public sealed class SqlServerToolCompensationService(
     ToolCompensationOptions compensationOptions,
     SqlServerWorkflowOptions sqlOptions,
     TimeProvider timeProvider,
-    IToolExecutionBarrier? executionBarrier = null) : IToolCompensationService, IDisposable
+    IToolExecutionBarrier? executionBarrier = null,
+    IEnumerable<IToolCompensationOutcomeProbe>? outcomeProbes = null) :
+    IToolCompensationService, IToolCompensationReconciliationService, IDisposable
 {
     private const string TableName = "AiMentorToolCompensations";
+    private const string ReconciliationTableName = "AiMentorToolCompensationReconciliations";
     private const string Columns = "Id,ForwardExecutionKey,TenantId,RequesterSubjectId,ForwardToolName," +
         "CompensationToolName,Status,PreparationTokenHash,KeyVersion,SnapshotCipher,CreatedAt,ExpiresAt," +
         "ApprovalId,Justification,ApprovalExpiresAt,ApproverSubjectId,DecisionReasonHash," +
@@ -30,6 +33,8 @@ public sealed class SqlServerToolCompensationService(
     private readonly SemaphoreSlim _initializationGate = new(1, 1);
     private readonly IToolExecutionBarrier _executionBarrier =
         executionBarrier ?? NoOpToolExecutionBarrier.Instance;
+    private readonly Dictionary<string, IToolCompensationOutcomeProbe> _outcomeProbes =
+        (outcomeProbes ?? []).ToDictionary(probe => probe.CompensationToolName, StringComparer.OrdinalIgnoreCase);
     private volatile bool _initialized;
 
     public bool IsAvailable => true;
@@ -393,6 +398,213 @@ public sealed class SqlServerToolCompensationService(
         }
     }
 
+    /// <inheritdoc />
+    public async Task<ToolCompensationOutcomeProbeResult> ProbeOutcomeAsync(string compensationId,
+        AccessContext reconciler, CancellationToken cancellationToken = default)
+    {
+        ValidateReconciler(reconciler);
+        var id = RequiredText(compensationId, 64, "TOOL_COMPENSATION_ID_INVALID", "补偿标识无效。");
+        await EnsureInitializedAsync(cancellationToken);
+
+        CompensationRow row;
+        await using (var connection = await OpenAsync(cancellationToken))
+        await using (var command = connection.CreateCommand())
+        {
+            command.CommandText = $"SELECT {Columns} FROM dbo.{TableName} " +
+                "WHERE Id=@id AND TenantId=@tenant AND Status=@unknown;";
+            AddString(command, "@id", 64, id);
+            AddString(command, "@tenant", 128, reconciler.TenantId);
+            AddByte(command, "@unknown", ToolCompensationStatus.OutcomeUnknown);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+            if (!await reader.ReadAsync(cancellationToken)) throw OutcomeUnknownNotFound();
+            row = Read(reader);
+        }
+
+        if (!_outcomeProbes.TryGetValue(row.CompensationToolName, out var probe))
+            throw Failure("TOOL_COMPENSATION_OUTCOME_PROBE_NOT_SUPPORTED",
+                "该反向工具尚未提供目标状态探测器。", ToolCompensationErrorKind.Validation);
+
+        // 快照只能在服务端按原认证上下文解密，并以原所有者身份交给专属只读探测器。
+        var snapshotJson = cipher.Unprotect(row.KeyVersion, row.SnapshotCipher,
+            SnapshotContext(row.Id, row.ForwardToolName));
+        using var snapshot = JsonDocument.Parse(snapshotJson);
+        var owner = AccessContext.Create(row.TenantId, row.RequesterSubjectId, []);
+        var probeResult = await probe.ProbeAsync(row.Id, owner, snapshot.RootElement.Clone(), cancellationToken);
+        var result = ToolCompensationProbeResultValidator.Validate(probeResult, row.Id,
+            row.CompensationToolName, timeProvider.GetUtcNow());
+        await AuditAsync("tool.compensation.reconciliation.probe", result.State.ToString(), reconciler,
+            row.Id, row.CompensationToolName, result.Code, cancellationToken);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public async Task<ToolCompensationReconciliationReviewResult> ReviewOutcomeAsync(string compensationId,
+        bool confirmed, string reason, AccessContext reconciler, CancellationToken cancellationToken = default)
+    {
+        ValidateReconciler(reconciler);
+        var normalizedReason = RequiredText(reason, 500,
+            "TOOL_COMPENSATION_RECONCILIATION_REASON_INVALID", "补偿对账理由必须为 1 到 500 个字符。");
+        var evidence = await ProbeOutcomeAsync(compensationId, reconciler, cancellationToken);
+        if (confirmed && evidence.State == ToolOutcomeProbeState.Indeterminate)
+            throw Failure("TOOL_COMPENSATION_RECONCILIATION_EVIDENCE_INDETERMINATE",
+                "不确定证据不能用于结案或授权重试。", ToolCompensationErrorKind.Validation);
+
+        var now = timeProvider.GetUtcNow();
+        var evidenceExpiresAt = evidence.ObservedAt.Add(compensationOptions.ReconciliationEvidenceLifetime);
+        var reasonHash = Hash(normalizedReason);
+        ToolCompensationReconciliationReviewResult result;
+
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(
+            IsolationLevel.Serializable, cancellationToken);
+
+        // 先锁定主补偿记录，确保整个复核期间它仍是当前租户的 OutcomeUnknown。
+        await using (var compensation = connection.CreateCommand())
+        {
+            compensation.Transaction = transaction;
+            compensation.CommandText = $"SELECT Status FROM dbo.{TableName} WITH (UPDLOCK,HOLDLOCK) " +
+                "WHERE Id=@id AND TenantId=@tenant;";
+            AddString(compensation, "@id", 64, evidence.CompensationId);
+            AddString(compensation, "@tenant", 128, reconciler.TenantId);
+            var value = await compensation.ExecuteScalarAsync(cancellationToken);
+            if (value is null || Convert.ToByte(value, CultureInfo.InvariantCulture) !=
+                (byte)ToolCompensationStatus.OutcomeUnknown)
+                throw OutcomeUnknownNotFound();
+        }
+
+        CompensationReviewRow? current;
+        await using (var read = connection.CreateCommand())
+        {
+            read.Transaction = transaction;
+            read.CommandText = $"SELECT EvidenceState,EvidenceCode,EvidenceExpiresAt," +
+                $"FirstReviewerSubjectId,Status FROM dbo.{ReconciliationTableName} WITH (UPDLOCK,HOLDLOCK) " +
+                "WHERE CompensationId=@id;";
+            AddString(read, "@id", 64, evidence.CompensationId);
+            await using var reader = await read.ExecuteReaderAsync(cancellationToken);
+            current = await reader.ReadAsync(cancellationToken)
+                ? new CompensationReviewRow((ToolOutcomeProbeState)reader.GetByte(0), reader.GetString(1),
+                    reader.GetFieldValue<DateTimeOffset>(2), reader.GetString(3), reader.GetByte(4))
+                : null;
+        }
+
+        if (!confirmed)
+        {
+            await ReplaceFirstReviewAsync(connection, transaction, evidence, reconciler, reasonHash,
+                evidenceExpiresAt, status: 1, cancellationToken);
+            result = new(evidence.CompensationId, ToolReconciliationReviewStatus.Rejected,
+                evidence.State, evidenceExpiresAt);
+        }
+        else if (current is null || current.Status != 0)
+        {
+            await ReplaceFirstReviewAsync(connection, transaction, evidence, reconciler, reasonHash,
+                evidenceExpiresAt, status: 0, cancellationToken);
+            result = new(evidence.CompensationId, ToolReconciliationReviewStatus.AwaitingSecondReviewer,
+                evidence.State, evidenceExpiresAt);
+        }
+        else if (current.EvidenceExpiresAt <= now || evidence.ObservedAt > current.EvidenceExpiresAt)
+        {
+            // 删除过期首审，返回本次过期结论；下一次调用必须从新的第一人证据开始。
+            await using var deleteExpired = connection.CreateCommand();
+            deleteExpired.Transaction = transaction;
+            deleteExpired.CommandText = $"DELETE dbo.{ReconciliationTableName} WHERE CompensationId=@id AND Status=0;";
+            AddString(deleteExpired, "@id", 64, evidence.CompensationId);
+            await deleteExpired.ExecuteNonQueryAsync(cancellationToken);
+            result = new(evidence.CompensationId, ToolReconciliationReviewStatus.EvidenceExpired,
+                evidence.State, current.EvidenceExpiresAt);
+        }
+        else if (string.Equals(current.FirstReviewerSubjectId, reconciler.SubjectId, StringComparison.Ordinal))
+        {
+            result = new(evidence.CompensationId, ToolReconciliationReviewStatus.ReviewerMustDiffer,
+                evidence.State, current.EvidenceExpiresAt);
+        }
+        else if (current.EvidenceState != evidence.State
+                 || !string.Equals(current.EvidenceCode, evidence.Code, StringComparison.Ordinal))
+        {
+            // 不允许把两次不同观察拼接成双人结论；清除旧首审后必须重新开始。
+            await using var deleteChanged = connection.CreateCommand();
+            deleteChanged.Transaction = transaction;
+            deleteChanged.CommandText = $"DELETE dbo.{ReconciliationTableName} WHERE CompensationId=@id AND Status=0;";
+            AddString(deleteChanged, "@id", 64, evidence.CompensationId);
+            await deleteChanged.ExecuteNonQueryAsync(cancellationToken);
+            result = new(evidence.CompensationId, ToolReconciliationReviewStatus.EvidenceChanged,
+                evidence.State, current.EvidenceExpiresAt);
+        }
+        else
+        {
+            // 第二名不同复核人在同一串行化事务内写入裁决并改变主记录，保证并发单胜者。
+            await using (var finish = connection.CreateCommand())
+            {
+                finish.Transaction = transaction;
+                finish.CommandText = $"UPDATE dbo.{ReconciliationTableName} SET " +
+                    "SecondReviewerSubjectId=@reviewer,SecondConfirmed=1,SecondReasonHash=@reason," +
+                    "SecondReviewedAt=@now,Status=2,UpdatedAt=@now WHERE CompensationId=@id AND Status=0;";
+                AddString(finish, "@reviewer", 256, reconciler.SubjectId);
+                AddAnsiString(finish, "@reason", 64, reasonHash);
+                AddDate(finish, "@now", now); AddString(finish, "@id", 64, evidence.CompensationId);
+                if (await finish.ExecuteNonQueryAsync(cancellationToken) != 1)
+                    throw Failure("TOOL_COMPENSATION_RECONCILIATION_CONFLICT", "补偿复核状态发生并发变化。",
+                        ToolCompensationErrorKind.Conflict);
+            }
+
+            await using (var resolve = connection.CreateCommand())
+            {
+                resolve.Transaction = transaction;
+                if (evidence.State == ToolOutcomeProbeState.Applied)
+                {
+                    resolve.CommandText = $"UPDATE dbo.{TableName} SET Status=@completed,CompletedAt=@now," +
+                        "ExecutionLeaseToken=NULL,ExecutionLeaseExpiresAt=NULL,UpdatedAt=@now " +
+                        "WHERE Id=@id AND Status=@unknown;";
+                    AddByte(resolve, "@completed", ToolCompensationStatus.Completed);
+                }
+                else
+                {
+                    resolve.CommandText = $"UPDATE dbo.{TableName} SET Status=@available,ApprovalId=NULL," +
+                        "Justification=NULL,ApprovalExpiresAt=NULL,ApproverSubjectId=NULL,DecisionReasonHash=NULL," +
+                        "CompensationExecutionKey=NULL,ExecutionLeaseToken=NULL,ExecutionLeaseExpiresAt=NULL," +
+                        "CompletedAt=NULL,UpdatedAt=@now WHERE Id=@id AND Status=@unknown;";
+                    AddByte(resolve, "@available", ToolCompensationStatus.Available);
+                }
+                AddDate(resolve, "@now", now); AddString(resolve, "@id", 64, evidence.CompensationId);
+                AddByte(resolve, "@unknown", ToolCompensationStatus.OutcomeUnknown);
+                if (await resolve.ExecuteNonQueryAsync(cancellationToken) != 1)
+                    throw Failure("TOOL_COMPENSATION_RECONCILIATION_CONFLICT", "补偿主记录状态发生并发变化。",
+                        ToolCompensationErrorKind.Conflict);
+            }
+            result = new(evidence.CompensationId,
+                evidence.State == ToolOutcomeProbeState.Applied
+                    ? ToolReconciliationReviewStatus.ResolvedApplied
+                    : ToolReconciliationReviewStatus.RetryAuthorized,
+                evidence.State, current.EvidenceExpiresAt);
+        }
+
+        await transaction.CommitAsync(cancellationToken);
+        await AuditAsync("tool.compensation.reconciliation.review", result.Status.ToString(), reconciler,
+            evidence.CompensationId, evidence.CompensationToolName,
+            $"TOOL_COMPENSATION_RECONCILIATION_{result.Status.ToString().ToUpperInvariant()}", cancellationToken);
+        return result;
+    }
+
+    private static async Task ReplaceFirstReviewAsync(SqlConnection connection, SqlTransaction transaction,
+        ToolCompensationOutcomeProbeResult evidence, AccessContext reconciler, string reasonHash,
+        DateTimeOffset expiresAt, byte status, CancellationToken cancellationToken)
+    {
+        await using var replace = connection.CreateCommand();
+        replace.Transaction = transaction;
+        replace.CommandText = $"DELETE dbo.{ReconciliationTableName} WHERE CompensationId=@id; " +
+            $"INSERT dbo.{ReconciliationTableName} (CompensationId,TenantId,EvidenceState,EvidenceCode," +
+            "EvidenceObservedAt,EvidenceExpiresAt,FirstReviewerSubjectId,FirstConfirmed,FirstReasonHash," +
+            "FirstReviewedAt,Status,UpdatedAt) VALUES(@id,@tenant,@state,@code,@observed,@expires," +
+            "@reviewer,@confirmed,@reason,@now,@status,@now);";
+        AddString(replace, "@id", 64, evidence.CompensationId);
+        AddString(replace, "@tenant", 128, reconciler.TenantId);
+        AddInt(replace, "@state", (int)evidence.State); AddString(replace, "@code", 128, evidence.Code);
+        AddDate(replace, "@observed", evidence.ObservedAt); AddDate(replace, "@expires", expiresAt);
+        AddString(replace, "@reviewer", 256, reconciler.SubjectId);
+        AddBool(replace, "@confirmed", status == 0); AddAnsiString(replace, "@reason", 64, reasonHash);
+        AddDate(replace, "@now", evidence.ObservedAt); AddInt(replace, "@status", status);
+        await replace.ExecuteNonQueryAsync(cancellationToken);
+    }
+
     private async Task TransitionPreparationAsync(ToolCompensationPreparation preparation,
         ToolCompensationStatus next, string outcome, string code, CancellationToken cancellationToken)
     {
@@ -548,6 +760,13 @@ public sealed class SqlServerToolCompensationService(
         if (string.IsNullOrWhiteSpace(access.TenantId) || string.IsNullOrWhiteSpace(access.SubjectId))
             throw Failure("TOOL_COMPENSATION_ACCESS_INVALID", "补偿访问身份无效。", ToolCompensationErrorKind.Validation);
     }
+    private void ValidateReconciler(AccessContext access)
+    {
+        ValidateAccess(access);
+        if (!access.Groups.Overlaps(compensationOptions.ReconcilerGroups))
+            throw Failure("TOOL_COMPENSATION_RECONCILER_ROLE_REQUIRED", "当前用户不属于工具对账人员组。",
+                ToolCompensationErrorKind.Forbidden);
+    }
     private void ValidateConfiguration()
     {
         if (string.IsNullOrWhiteSpace(sqlOptions.ConnectionString) || compensationOptions.CompensationLifetime <= TimeSpan.Zero
@@ -555,7 +774,9 @@ public sealed class SqlServerToolCompensationService(
             || compensationOptions.CompensationLifetime <= compensationOptions.ApprovalLifetime
             || compensationOptions.CompensationLifetime <= compensationOptions.ExecutionLeaseDuration
             || compensationOptions.MaximumEntries <= 0 || compensationOptions.MaximumSnapshotBytes <= 0
-            || compensationOptions.ApproverGroups.Count == 0) throw new InvalidOperationException("SQL Server 工具补偿配置无效。");
+            || compensationOptions.ApproverGroups.Count == 0 || compensationOptions.ReconcilerGroups.Count == 0
+            || compensationOptions.ReconciliationEvidenceLifetime <= TimeSpan.Zero)
+            throw new InvalidOperationException("SQL Server 工具补偿配置无效。");
     }
     private async Task<SqlConnection> OpenAsync(CancellationToken cancellationToken)
     { var connection = new SqlConnection(sqlOptions.ConnectionString); await connection.OpenAsync(cancellationToken); return connection; }
@@ -579,11 +800,16 @@ public sealed class SqlServerToolCompensationService(
         "没有找到当前用户可访问的补偿。", ToolCompensationErrorKind.NotFound);
     private static ToolCompensationException OutcomeUnknown() => Failure("TOOL_COMPENSATION_OUTCOME_UNKNOWN",
         "正向或补偿结果不确定，禁止自动重试。", ToolCompensationErrorKind.Conflict);
+    private static ToolCompensationException OutcomeUnknownNotFound() => Failure(
+        "TOOL_COMPENSATION_OUTCOME_UNKNOWN_NOT_FOUND", "当前租户不存在可对账的结果不确定补偿。",
+        ToolCompensationErrorKind.NotFound);
     private static ToolCompensationException Failure(string code, string message, ToolCompensationErrorKind kind) => new(code, message, kind);
     private static void AddString(SqlCommand command, string name, int size, string value) => command.Parameters.Add(name, SqlDbType.NVarChar, size).Value = value;
     private static void AddAnsiString(SqlCommand command, string name, int size, string value) => command.Parameters.Add(name, SqlDbType.Char, size).Value = value;
     private static void AddDate(SqlCommand command, string name, DateTimeOffset value) => command.Parameters.Add(name, SqlDbType.DateTimeOffset).Value = value;
     private static void AddByte(SqlCommand command, string name, ToolCompensationStatus value) => command.Parameters.Add(name, SqlDbType.TinyInt).Value = (byte)value;
+    private static void AddInt(SqlCommand command, string name, int value) => command.Parameters.Add(name, SqlDbType.Int).Value = value;
+    private static void AddBool(SqlCommand command, string name, bool value) => command.Parameters.Add(name, SqlDbType.Bit).Value = value;
 
     private const string RuntimeSchemaSql = """
         SET XACT_ABORT ON; BEGIN TRANSACTION;
@@ -608,6 +834,22 @@ public sealed class SqlServerToolCompensationService(
             ON dbo.AiMentorToolCompensations(TenantId,Status,CreatedAt DESC);
           CREATE UNIQUE INDEX UX_AiMentorToolCompensations_Approval
             ON dbo.AiMentorToolCompensations(ApprovalId) WHERE ApprovalId IS NOT NULL;
+        END;
+        IF OBJECT_ID(N'dbo.AiMentorToolCompensationReconciliations',N'U') IS NULL
+        BEGIN
+          CREATE TABLE dbo.AiMentorToolCompensationReconciliations(
+            CompensationId nvarchar(64) NOT NULL CONSTRAINT PK_AiMentorToolCompensationReconciliations PRIMARY KEY,
+            TenantId nvarchar(128) NOT NULL,EvidenceState tinyint NOT NULL,EvidenceCode nvarchar(128) NOT NULL,
+            EvidenceObservedAt datetimeoffset(7) NOT NULL,EvidenceExpiresAt datetimeoffset(7) NOT NULL,
+            FirstReviewerSubjectId nvarchar(256) NOT NULL,FirstConfirmed bit NOT NULL,
+            FirstReasonHash char(64) NOT NULL,FirstReviewedAt datetimeoffset(7) NOT NULL,
+            SecondReviewerSubjectId nvarchar(256) NULL,SecondConfirmed bit NULL,
+            SecondReasonHash char(64) NULL,SecondReviewedAt datetimeoffset(7) NULL,
+            Status tinyint NOT NULL,UpdatedAt datetimeoffset(7) NOT NULL,RowVersion rowversion NOT NULL,
+            CONSTRAINT FK_AiMentorToolCompensationReconciliations_Compensation FOREIGN KEY(CompensationId)
+              REFERENCES dbo.AiMentorToolCompensations(Id) ON DELETE CASCADE);
+          CREATE INDEX IX_AiMentorToolCompensationReconciliations_TenantStatusExpiry
+            ON dbo.AiMentorToolCompensationReconciliations(TenantId,Status,EvidenceExpiresAt);
         END; COMMIT TRANSACTION;
         """;
 
@@ -618,6 +860,9 @@ public sealed class SqlServerToolCompensationService(
         DateTimeOffset? ApprovalExpiresAt, string? ApproverSubjectId, string? DecisionReasonHash,
         string? CompensationExecutionKey, string? ExecutionLeaseToken, DateTimeOffset? ExecutionLeaseExpiresAt,
         DateTimeOffset? CompletedAt);
+
+    private sealed record CompensationReviewRow(ToolOutcomeProbeState EvidenceState, string EvidenceCode,
+        DateTimeOffset EvidenceExpiresAt, string FirstReviewerSubjectId, byte Status);
 
     public void Dispose() => _initializationGate.Dispose();
 }

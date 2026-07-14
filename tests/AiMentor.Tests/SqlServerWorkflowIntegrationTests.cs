@@ -38,6 +38,7 @@ public sealed class SqlServerWorkflowIntegrationTests
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "005_tool_reconciliation_reviews.sql"));
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "006_agent_run_cancellation.sql"));
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "007_tool_compensations.sql"));
+            await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "008_tool_compensation_reconciliation.sql"));
             var clock = new MutableTimeProvider(new DateTimeOffset(2026, 7, 14, 1, 0, 0, TimeSpan.Zero));
             var trace = new InMemoryTraceSink();
             var tool = new MutationTool();
@@ -181,11 +182,12 @@ public sealed class SqlServerWorkflowIntegrationTests
             // 反向工具开始后让租约过期；第二实例只能冻结结果不确定，不能自动接管或重放。
             var blockingTool = new BlockingCompensableTool();
             var compensationBarrier = new RecordingExecutionBarrier();
+            var blockingProbe = new BlockingCompensationOutcomeProbe(blockingTool, clock);
             var blockingRegistry = new ServerToolRegistry([blockingTool]);
             using var blockingServiceA = new SqlServerToolCompensationService(blockingRegistry, rotatedCipher,
-                trace, new ToolCompensationOptions(), sqlOptions, clock, compensationBarrier);
+                trace, new ToolCompensationOptions(), sqlOptions, clock, compensationBarrier, [blockingProbe]);
             using var blockingServiceB = new SqlServerToolCompensationService(blockingRegistry, rotatedCipher,
-                trace, new ToolCompensationOptions(), sqlOptions, clock);
+                trace, new ToolCompensationOptions(), sqlOptions, clock, outcomeProbes: [blockingProbe]);
             var blockingArguments = JsonSerializer.SerializeToElement(new { value = "after" });
             var blockingPreparation = await blockingServiceA.PrepareForwardAsync(new string('F', 64), blockingTool,
                 new ToolExecutionContext(requester, "blocking-forward"), blockingArguments);
@@ -214,6 +216,14 @@ public sealed class SqlServerWorkflowIntegrationTests
             var lostLease = await Assert.ThrowsAsync<ToolCompensationException>(() => blockedExecution);
             var blockedRetry = await Assert.ThrowsAsync<ToolCompensationException>(() => blockingServiceB.ExecuteAsync(
                 blockingPreparation.Id, blockingApproval.ApprovalId!, "blocking-reverse-key", requester));
+            var compensationReconcilerA = AccessContext.Create("tenant-a", "comp-reconciler-a", ["tool-reconcilers"]);
+            var compensationReconcilerB = AccessContext.Create("tenant-a", "comp-reconciler-b", ["tool-reconcilers"]);
+            var compensationProbe = await blockingServiceB.ProbeOutcomeAsync(blockingPreparation.Id,
+                compensationReconcilerA);
+            var compensationFirstReview = await blockingServiceB.ReviewOutcomeAsync(blockingPreparation.Id, true,
+                "已确认反向目标状态", compensationReconcilerA);
+            var compensationSecondReview = await blockingServiceB.ReviewOutcomeAsync(blockingPreparation.Id, true,
+                "独立确认反向目标状态", compensationReconcilerB);
 
             var cancellationCheckpoint = CreateCheckpoint(requester, arguments, clock.GetUtcNow()) with
             {
@@ -278,6 +288,11 @@ public sealed class SqlServerWorkflowIntegrationTests
             Assert.Equal("TOOL_COMPENSATION_LEASE_LOST", lostLease.Code);
             Assert.Equal("TOOL_COMPENSATION_OUTCOME_UNKNOWN", blockedRetry.Code);
             Assert.Equal(1, blockingTool.CompensationCount);
+            Assert.Equal(ToolOutcomeProbeState.Applied, compensationProbe.State);
+            Assert.Equal(ToolReconciliationReviewStatus.AwaitingSecondReviewer, compensationFirstReview.Status);
+            Assert.Equal(ToolReconciliationReviewStatus.ResolvedApplied, compensationSecondReview.Status);
+            Assert.Contains(await blockingServiceB.ListAsync(requester, ToolCompensationStatus.Completed),
+                item => item.Id == blockingPreparation.Id);
             Assert.Equal(AgentRunCancellationStatus.Forbidden, forbiddenCancellation.Status);
             Assert.Equal(AgentRunCancellationStatus.Requested, requestedCancellation.Status);
             Assert.Equal(AgentRunLeaseRenewalStatus.CancellationRequested, cancellationRenewal);
@@ -393,7 +408,8 @@ public sealed class SqlServerWorkflowIntegrationTests
         await using var connection = new SqlConnection(connectionString);
         await connection.OpenAsync();
         await using var command = connection.CreateCommand();
-        command.CommandText = "DROP TABLE dbo.AiMentorToolCompensations;";
+        command.CommandText = "DROP TABLE IF EXISTS dbo.AiMentorToolCompensationReconciliations; " +
+            "DROP TABLE dbo.AiMentorToolCompensations;";
         await command.ExecuteNonQueryAsync();
     }
 
@@ -468,6 +484,24 @@ public sealed class SqlServerWorkflowIntegrationTests
             Started.TrySetResult();
             await Release.Task.WaitAsync(cancellationToken);
             return JsonSerializer.SerializeToElement(new { restored = true });
+        }
+    }
+
+    /// <summary>只观察测试反向工具是否已经提交，验证 SQL 对账不会再次调用补偿工具。</summary>
+    private sealed class BlockingCompensationOutcomeProbe(BlockingCompensableTool tool, TimeProvider timeProvider) :
+        IToolCompensationOutcomeProbe
+    {
+        public string CompensationToolName => "test.blocking.restore";
+
+        public Task<ToolCompensationOutcomeProbeResult> ProbeAsync(string compensationId, AccessContext owner,
+            JsonElement compensationState, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var applied = tool.CompensationCount == 1;
+            return Task.FromResult(new ToolCompensationOutcomeProbeResult(compensationId, CompensationToolName,
+                applied ? ToolOutcomeProbeState.Applied : ToolOutcomeProbeState.NotApplied,
+                applied ? "TEST_RESTORE_APPLIED" : "TEST_RESTORE_NOT_APPLIED",
+                applied ? "测试反向状态已经提交。" : "测试反向状态尚未提交。", timeProvider.GetUtcNow()));
         }
     }
 

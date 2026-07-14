@@ -111,6 +111,41 @@ public interface IToolCompensationService
         string idempotencyKey, AccessContext requester, CancellationToken cancellationToken = default);
 }
 
+/// <summary>表示一次结果不确定补偿的只读目标状态证据；不包含加密快照或目标正文。</summary>
+public sealed record ToolCompensationOutcomeProbeResult(
+    string CompensationId,
+    string CompensationToolName,
+    ToolOutcomeProbeState State,
+    string Code,
+    string Explanation,
+    DateTimeOffset ObservedAt);
+
+/// <summary>携带反向补偿复核状态及证据有效期，供调用方等待独立第二人复核。</summary>
+public sealed record ToolCompensationReconciliationReviewResult(
+    string CompensationId,
+    ToolReconciliationReviewStatus Status,
+    ToolOutcomeProbeState EvidenceState,
+    DateTimeOffset EvidenceExpiresAt);
+
+/// <summary>
+/// 对结果不确定的反向补偿执行目标探测和双人复核；实现必须按租户隔离且不得回显补偿快照。
+/// </summary>
+public interface IToolCompensationReconciliationService
+{
+    Task<ToolCompensationOutcomeProbeResult> ProbeOutcomeAsync(string compensationId, AccessContext reconciler,
+        CancellationToken cancellationToken = default);
+    Task<ToolCompensationReconciliationReviewResult> ReviewOutcomeAsync(string compensationId, bool confirmed,
+        string reason, AccessContext reconciler, CancellationToken cancellationToken = default);
+}
+
+/// <summary>由具体反向工具实现只读目标状态核验，探测过程不得产生补偿副作用。</summary>
+public interface IToolCompensationOutcomeProbe
+{
+    string CompensationToolName { get; }
+    Task<ToolCompensationOutcomeProbeResult> ProbeAsync(string compensationId, AccessContext owner,
+        JsonElement compensationState, CancellationToken cancellationToken = default);
+}
+
 /// <summary>配置补偿快照、审批、执行租约、保留期与内存容量边界。</summary>
 public sealed class ToolCompensationOptions
 {
@@ -121,6 +156,9 @@ public sealed class ToolCompensationOptions
     public int MaximumSnapshotBytes { get; init; } = 16 * 1024;
     public IReadOnlySet<string> ApproverGroups { get; init; } =
         new HashSet<string>(["tool-approvers"], StringComparer.OrdinalIgnoreCase);
+    public IReadOnlySet<string> ReconcilerGroups { get; init; } =
+        new HashSet<string>(["tool-reconcilers"], StringComparer.OrdinalIgnoreCase);
+    public TimeSpan ReconciliationEvidenceLifetime { get; init; } = TimeSpan.FromMinutes(5);
 }
 
 /// <summary>区分补偿输入、权限、资源、冲突、容量和当前部署能力错误。</summary>

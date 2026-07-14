@@ -157,7 +157,7 @@ try {
     foreach ($migration in @('001_workflow.sql', '002_workflow_key_version.sql',
             '003_tool_execution_ledger.sql', '004_tool_execution_reconciliation.sql',
             '005_tool_reconciliation_reviews.sql', '006_agent_run_cancellation.sql',
-            '007_tool_compensations.sql')) {
+            '007_tool_compensations.sql', '008_tool_compensation_reconciliation.sql')) {
         docker exec -e "SQLCMDPASSWORD=$password" $SqlContainer /opt/mssql-tools18/bin/sqlcmd `
             -S localhost -U sa -C -b -d $database -i "$remoteMigrations/$migration" | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "迁移失败：$migration" }

@@ -455,7 +455,9 @@ public sealed class MemoryDeleteTool(IMemoryWorkflowService memoryWorkflow) : IM
 /// <summary>
 /// 使用乐观版本更正当前用户记忆，并在正向执行前捕获旧值、版本和到期时间作为加密补偿快照。
 /// </summary>
-public sealed class MemoryCorrectTool(IMemoryWorkflowService memoryWorkflow) : ICompensableServerTool
+public sealed class MemoryCorrectTool(IMemoryWorkflowService memoryWorkflow, IMemoryStore memoryStore,
+    TimeProvider timeProvider) :
+    ICompensableServerTool
 {
     public ToolDescriptor Descriptor { get; } = new("memory.correct", "更正当前用户拥有的版本化记忆。",
         ToolOperationRisk.Mutation, TimeSpan.FromSeconds(3), 2 * 1024, true);
@@ -521,9 +523,17 @@ public sealed class MemoryCorrectTool(IMemoryWorkflowService memoryWorkflow) : I
     {
         var snapshot = compensationState.Deserialize<MemoryCorrectionSnapshot>()
             ?? throw new InvalidOperationException("记忆更正补偿快照无效。");
-        var restored = await memoryWorkflow.CorrectAsync(snapshot.MemoryId,
-            new CorrectMemoryCommand(snapshot.PreviousValue, snapshot.ExpectedVersionAfterForward,
-                snapshot.PreviousExpiresAt), context.Access, cancellationToken);
+        var result = await memoryStore.RestoreCompensationAsync(snapshot.MemoryId, context.Access,
+            snapshot.ExpectedVersionAfterForward, snapshot.PreviousValue, snapshot.PreviousExpiresAt,
+            timeProvider.GetUtcNow(), cancellationToken);
+        var restored = result.Status switch
+        {
+            MemoryStoreStatus.Success => result.Value!,
+            MemoryStoreStatus.NotFound => throw new MemoryWorkflowException("MEMORY_NOT_FOUND",
+                "没有找到当前用户可恢复的记忆。", MemoryWorkflowErrorKind.NotFound),
+            _ => throw new MemoryWorkflowException("MEMORY_VERSION_CONFLICT",
+                "记忆版本已经变化，补偿保持关闭。", MemoryWorkflowErrorKind.Conflict)
+        };
         return JsonSerializer.SerializeToElement(new { restored = true, memoryId = restored.Id, restored.Version });
     }
 

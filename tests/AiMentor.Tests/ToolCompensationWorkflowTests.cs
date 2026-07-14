@@ -12,6 +12,10 @@ public sealed class ToolCompensationWorkflowTests
     private static readonly AccessContext Requester = AccessContext.Create("tenant-a", "user-a", ["engineers"]);
     private static readonly AccessContext Approver =
         AccessContext.Create("tenant-a", "approver-a", ["tool-approvers"]);
+    private static readonly AccessContext ReconcilerA =
+        AccessContext.Create("tenant-a", "reconciler-a", ["tool-reconcilers"]);
+    private static readonly AccessContext ReconcilerB =
+        AccessContext.Create("tenant-a", "reconciler-b", ["tool-reconcilers"]);
 
     [Fact]
     public async Task CompensationRequiresIndependentApprovalAndReplaysWithoutSecondSideEffect()
@@ -110,18 +114,20 @@ public sealed class ToolCompensationWorkflowTests
     [Fact]
     public async Task MemoryCorrectionRestoresOnlyTheVersionProducedByItsForwardExecution()
     {
-        var workflow = new MemoryWorkflowService(new InMemoryMemoryStore(),
+        var memoryStore = new InMemoryMemoryStore();
+        var workflow = new MemoryWorkflowService(memoryStore,
             new RuleBasedMemoryContentSafetyService(), new InMemoryTraceSink(), TimeProvider.System,
             new MemoryWorkflowOptions());
         var proposal = await workflow.ProposeAsync(new ProposeMemoryCommand(MemoryScope.UserPreference,
             "answer.format", "列表"), Requester);
         var memory = await workflow.ApproveAsync(proposal.Id, Requester);
-        var tool = new MemoryCorrectTool(workflow);
+        var tool = new MemoryCorrectTool(workflow, memoryStore, TimeProvider.System);
         var arguments = JsonSerializer.SerializeToElement(new
         {
             memoryId = memory.Id,
             expectedVersion = memory.Version,
-            value = "表格"
+            value = "表格",
+            expiresAt = memory.ExpiresAt.AddDays(-1)
         });
 
         var snapshot = await tool.CaptureCompensationStateAsync(new ToolExecutionContext(Requester, "forward"),
@@ -132,6 +138,7 @@ public sealed class ToolCompensationWorkflowTests
 
         Assert.Equal("列表", restored.Value);
         Assert.Equal(3, restored.Version);
+        Assert.Equal(memory.ExpiresAt, restored.ExpiresAt);
     }
 
     [Fact]
@@ -236,13 +243,160 @@ public sealed class ToolCompensationWorkflowTests
         Assert.Equal(0, tool.CompensationCount);
     }
 
+    [Fact]
+    public async Task MemoryRestoreOutcomeUnknownRequiresTwoDifferentReconcilersToResolveApplied()
+    {
+        var clock = new ManualTimeProvider(new DateTimeOffset(2026, 7, 14, 8, 0, 0, TimeSpan.Zero));
+        var memoryStore = new InMemoryMemoryStore();
+        var workflow = new MemoryWorkflowService(memoryStore,
+            new RuleBasedMemoryContentSafetyService(), new InMemoryTraceSink(), clock,
+            new MemoryWorkflowOptions());
+        var memory = await CreateMemoryAsync(workflow);
+        var tool = new ThrowAfterMemoryRestoreTool(new MemoryCorrectTool(workflow, memoryStore, clock));
+        var probe = new MemoryCorrectRestoreOutcomeProbe(memoryStore, clock);
+        var service = CreateService(tool, clock, outcomeProbes: [probe]);
+        var preparation = await PrepareApprovedCorrectionAsync(service, tool, memory);
+
+        await Assert.ThrowsAsync<ToolCompensationException>(() => service.ExecuteAsync(
+            preparation.Id, preparation.ApprovalId, "uncertain-restore", Requester));
+        var forbidden = await Assert.ThrowsAsync<ToolCompensationException>(() =>
+            service.ProbeOutcomeAsync(preparation.Id, Requester));
+        var foreignTenant = await Assert.ThrowsAsync<ToolCompensationException>(() =>
+            service.ProbeOutcomeAsync(preparation.Id,
+                AccessContext.Create("tenant-b", "reconciler-x", ["tool-reconcilers"])));
+        var evidence = await service.ProbeOutcomeAsync(preparation.Id, ReconcilerA);
+        var first = await service.ReviewOutcomeAsync(preparation.Id, true, "目标已恢复", ReconcilerA);
+        var sameReviewer = await service.ReviewOutcomeAsync(preparation.Id, true, "再次确认", ReconcilerA);
+        var second = await service.ReviewOutcomeAsync(preparation.Id, true, "独立确认", ReconcilerB);
+
+        Assert.Equal("TOOL_COMPENSATION_RECONCILER_ROLE_REQUIRED", forbidden.Code);
+        Assert.Equal("TOOL_COMPENSATION_OUTCOME_UNKNOWN_NOT_FOUND", foreignTenant.Code);
+        Assert.Equal(ToolOutcomeProbeState.Applied, evidence.State);
+        Assert.Equal(ToolReconciliationReviewStatus.AwaitingSecondReviewer, first.Status);
+        Assert.Equal(ToolReconciliationReviewStatus.ReviewerMustDiffer, sameReviewer.Status);
+        Assert.Equal(ToolReconciliationReviewStatus.ResolvedApplied, second.Status);
+        Assert.Equal(ToolCompensationStatus.Completed,
+            Assert.Single(await service.ListAsync(Requester)).Status);
+    }
+
+    [Fact]
+    public async Task NotAppliedResolutionClearsOldApprovalAndRequiresANewApproval()
+    {
+        var clock = new ManualTimeProvider(new DateTimeOffset(2026, 7, 14, 8, 0, 0, TimeSpan.Zero));
+        var memoryStore = new InMemoryMemoryStore();
+        var workflow = new MemoryWorkflowService(memoryStore,
+            new RuleBasedMemoryContentSafetyService(), new InMemoryTraceSink(), clock,
+            new MemoryWorkflowOptions());
+        var memory = await CreateMemoryAsync(workflow);
+        var tool = new MemoryCorrectTool(workflow, memoryStore, clock);
+        var service = CreateService(tool, clock, barrier: new ThrowBeforeSideEffectBarrier(),
+            outcomeProbes: [new MemoryCorrectRestoreOutcomeProbe(memoryStore, clock)]);
+        var preparation = await PrepareApprovedCorrectionAsync(service, tool, memory);
+
+        await Assert.ThrowsAsync<ToolCompensationException>(() => service.ExecuteAsync(
+            preparation.Id, preparation.ApprovalId, "old-reverse-key", Requester));
+        Assert.Equal(ToolOutcomeProbeState.NotApplied,
+            (await service.ProbeOutcomeAsync(preparation.Id, ReconcilerA)).State);
+        await service.ReviewOutcomeAsync(preparation.Id, true, "确认未恢复", ReconcilerA);
+        var resolved = await service.ReviewOutcomeAsync(preparation.Id, true, "独立确认未恢复", ReconcilerB);
+        var oldApproval = await Assert.ThrowsAsync<ToolCompensationException>(() => service.ExecuteAsync(
+            preparation.Id, preparation.ApprovalId, "old-reverse-key", Requester));
+
+        Assert.Equal(ToolReconciliationReviewStatus.RetryAuthorized, resolved.Status);
+        var summary = Assert.Single(await service.ListAsync(Requester));
+        Assert.Equal(ToolCompensationStatus.Available, summary.Status);
+        Assert.Null(summary.ApprovalId);
+        Assert.Equal("TOOL_COMPENSATION_APPROVAL_REQUIRED", oldApproval.Code);
+    }
+
+    [Fact]
+    public async Task ExpiredCompensationEvidenceCannotBeCombinedWithSecondReview()
+    {
+        var clock = new ManualTimeProvider(new DateTimeOffset(2026, 7, 14, 8, 0, 0, TimeSpan.Zero));
+        var memoryStore = new InMemoryMemoryStore();
+        var workflow = new MemoryWorkflowService(memoryStore,
+            new RuleBasedMemoryContentSafetyService(), new InMemoryTraceSink(), clock,
+            new MemoryWorkflowOptions());
+        var memory = await CreateMemoryAsync(workflow);
+        var tool = new MemoryCorrectTool(workflow, memoryStore, clock);
+        var service = CreateService(tool, clock, new ToolCompensationOptions
+        {
+            ReconciliationEvidenceLifetime = TimeSpan.FromMinutes(1)
+        }, new ThrowBeforeSideEffectBarrier(), [new MemoryCorrectRestoreOutcomeProbe(memoryStore, clock)]);
+        var preparation = await PrepareApprovedCorrectionAsync(service, tool, memory);
+        await Assert.ThrowsAsync<ToolCompensationException>(() => service.ExecuteAsync(
+            preparation.Id, preparation.ApprovalId, "expiring-evidence", Requester));
+        await service.ReviewOutcomeAsync(preparation.Id, true, "第一人确认", ReconcilerA);
+        clock.Advance(TimeSpan.FromMinutes(2));
+
+        var expired = await service.ReviewOutcomeAsync(preparation.Id, true, "第二人迟到", ReconcilerB);
+
+        Assert.Equal(ToolReconciliationReviewStatus.EvidenceExpired, expired.Status);
+        Assert.Equal(ToolCompensationStatus.OutcomeUnknown,
+            Assert.Single(await service.ListAsync(Requester)).Status);
+    }
+
+    [Theory]
+    [InlineData(true, false, ToolOutcomeProbeState.Applied)]
+    [InlineData(false, true, ToolOutcomeProbeState.Applied)]
+    [InlineData(false, false, (ToolOutcomeProbeState)255)]
+    public async Task InvalidProbeIdentityOrStateCannotResolveAnotherCompensation(
+        bool replaceId, bool replaceTool, ToolOutcomeProbeState state)
+    {
+        var tool = new ReversibleTestTool(throwAfterCompensation: true);
+        var probe = new InvalidCompensationProbe(tool.CompensationToolName, replaceId, replaceTool, state);
+        var service = CreateService(tool, outcomeProbes: [probe]);
+        var arguments = JsonSerializer.SerializeToElement(new { value = 2 });
+        var preparation = await service.PrepareForwardAsync(new string('E', 64), tool,
+            new ToolExecutionContext(Requester, "forward"), arguments);
+        await tool.ExecuteAsync(new ToolExecutionContext(Requester, "forward"), arguments);
+        await service.ActivateAsync(preparation);
+        var pending = await service.RequestApprovalAsync(preparation.Id, "制造结果不确定", Requester);
+        await service.DecideAsync(preparation.Id, pending.ApprovalId!, true, "批准测试", Approver);
+        await Assert.ThrowsAsync<ToolCompensationException>(() => service.ExecuteAsync(
+            preparation.Id, pending.ApprovalId!, "invalid-probe", Requester));
+
+        var failure = await Assert.ThrowsAsync<ToolCompensationException>(() =>
+            service.ProbeOutcomeAsync(preparation.Id, ReconcilerA));
+
+        Assert.Equal("TOOL_COMPENSATION_PROBE_RESULT_INVALID", failure.Code);
+        Assert.Equal(ToolCompensationStatus.OutcomeUnknown,
+            Assert.Single(await service.ListAsync(Requester)).Status);
+    }
+
     private static InMemoryToolCompensationService CreateService(IServerTool tool, TimeProvider? timeProvider = null,
-        ToolCompensationOptions? options = null, IToolExecutionBarrier? barrier = null)
+        ToolCompensationOptions? options = null, IToolExecutionBarrier? barrier = null,
+        IEnumerable<IToolCompensationOutcomeProbe>? outcomeProbes = null)
     {
         var key = RandomNumberGenerator.GetBytes(32);
         var cipher = new AesGcmWorkflowStateCipher("v1", new Dictionary<string, byte[]> { ["v1"] = key });
         return new InMemoryToolCompensationService(new ServerToolRegistry([tool]), cipher, new InMemoryTraceSink(),
-            options ?? new ToolCompensationOptions(), timeProvider ?? TimeProvider.System, barrier);
+            options ?? new ToolCompensationOptions(), timeProvider ?? TimeProvider.System, barrier, outcomeProbes);
+    }
+
+    private static async Task<MemoryRecord> CreateMemoryAsync(MemoryWorkflowService workflow)
+    {
+        var proposal = await workflow.ProposeAsync(new ProposeMemoryCommand(MemoryScope.UserPreference,
+            "answer.format", "列表"), Requester);
+        return await workflow.ApproveAsync(proposal.Id, Requester);
+    }
+
+    private static async Task<(string Id, string ApprovalId)> PrepareApprovedCorrectionAsync(
+        InMemoryToolCompensationService service, ICompensableServerTool tool, MemoryRecord memory)
+    {
+        var arguments = JsonSerializer.SerializeToElement(new
+        {
+            memoryId = memory.Id,
+            expectedVersion = memory.Version,
+            value = "表格"
+        });
+        var preparation = await service.PrepareForwardAsync(new string('F', 64), tool,
+            new ToolExecutionContext(Requester, "forward"), arguments);
+        await tool.ExecuteAsync(new ToolExecutionContext(Requester, "forward"), arguments);
+        await service.ActivateAsync(preparation);
+        var pending = await service.RequestApprovalAsync(preparation.Id, "恢复旧值", Requester);
+        await service.DecideAsync(preparation.Id, pending.ApprovalId!, true, "批准恢复", Approver);
+        return (preparation.Id, pending.ApprovalId!);
     }
 
     /// <summary>阻塞在反向副作用前，并向测试公开账本已经进入 Executing 的确定信号。</summary>
@@ -259,6 +413,53 @@ public sealed class ToolCompensationWorkflowTests
             Entered.TrySetResult((executionKey, toolName));
             await Release.Task.WaitAsync(cancellationToken);
         }
+    }
+
+    /// <summary>模拟反向账本进入 Executing 后、目标副作用开始前实例失联。</summary>
+    private sealed class ThrowBeforeSideEffectBarrier : IToolExecutionBarrier
+    {
+        public Task WaitAfterExecutingAsync(string executionKey, string toolName,
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("模拟反向副作用前实例失联");
+    }
+
+    /// <summary>委托真实记忆恢复后模拟响应丢失，使目标已生效但账本保持结果不确定。</summary>
+    private sealed class ThrowAfterMemoryRestoreTool(MemoryCorrectTool inner) : ICompensableServerTool
+    {
+        public ToolDescriptor Descriptor => inner.Descriptor;
+        public string CompensationToolName => inner.CompensationToolName;
+        public SafetyDecision ValidateArguments(JsonElement arguments) => inner.ValidateArguments(arguments);
+        public Task<JsonElement> CaptureCompensationStateAsync(ToolExecutionContext context, JsonElement arguments,
+            CancellationToken cancellationToken = default) =>
+            inner.CaptureCompensationStateAsync(context, arguments, cancellationToken);
+        public Task<JsonElement> ExecuteAsync(ToolExecutionContext context, JsonElement arguments,
+            CancellationToken cancellationToken = default) => inner.ExecuteAsync(context, arguments, cancellationToken);
+        public async Task<JsonElement> CompensateAsync(ToolExecutionContext context, JsonElement compensationState,
+            CancellationToken cancellationToken = default)
+        {
+            await inner.CompensateAsync(context, compensationState, cancellationToken);
+            throw new InvalidOperationException("模拟恢复提交后响应丢失");
+        }
+    }
+
+    /// <summary>模拟错误或恶意专属探测器，验证编排层不会信任其身份和枚举值。</summary>
+    private sealed class InvalidCompensationProbe(
+        string compensationToolName,
+        bool replaceId,
+        bool replaceTool,
+        ToolOutcomeProbeState state) : IToolCompensationOutcomeProbe
+    {
+        public string CompensationToolName => compensationToolName;
+
+        public Task<ToolCompensationOutcomeProbeResult> ProbeAsync(string compensationId, AccessContext owner,
+            JsonElement compensationState, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new ToolCompensationOutcomeProbeResult(
+            replaceId ? Guid.NewGuid().ToString("N") : compensationId,
+            replaceTool ? "other.restore" : CompensationToolName,
+            state,
+            "TEST_PROBE_RESULT",
+            "测试探测结果。",
+            DateTimeOffset.MaxValue));
     }
 
     /// <summary>提供可观察状态的最小可逆工具，用于验证快照、审批、幂等和结果不确定边界。</summary>

@@ -15,13 +15,17 @@ public sealed class InMemoryToolCompensationService(
     ITraceSink traceSink,
     ToolCompensationOptions options,
     TimeProvider timeProvider,
-    IToolExecutionBarrier? executionBarrier = null) : IToolCompensationService
+    IToolExecutionBarrier? executionBarrier = null,
+    IEnumerable<IToolCompensationOutcomeProbe>? outcomeProbes = null) :
+    IToolCompensationService, IToolCompensationReconciliationService
 {
     private readonly object _gate = new();
     private readonly Dictionary<string, Entry> _entries = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _forwardExecutions = new(StringComparer.Ordinal);
     private readonly IToolExecutionBarrier _executionBarrier =
         executionBarrier ?? NoOpToolExecutionBarrier.Instance;
+    private readonly Dictionary<string, IToolCompensationOutcomeProbe> _outcomeProbes =
+        (outcomeProbes ?? []).ToDictionary(probe => probe.CompensationToolName, StringComparer.OrdinalIgnoreCase);
 
     public bool IsAvailable => true;
 
@@ -313,6 +317,134 @@ public sealed class InMemoryToolCompensationService(
         }
     }
 
+    /// <inheritdoc />
+    public async Task<ToolCompensationOutcomeProbeResult> ProbeOutcomeAsync(string compensationId,
+        AccessContext reconciler, CancellationToken cancellationToken = default)
+    {
+        ValidateReconciler(reconciler);
+        var id = RequiredText(compensationId, 128, "TOOL_COMPENSATION_ID_INVALID", "补偿标识无效。");
+        Entry entry;
+        IToolCompensationOutcomeProbe probe;
+        string snapshotJson;
+        lock (_gate)
+        {
+            Prune(timeProvider.GetUtcNow());
+            entry = RequireOutcomeUnknown(id, reconciler);
+            if (!_outcomeProbes.TryGetValue(entry.CompensationToolName, out probe!))
+                throw Failure("TOOL_COMPENSATION_OUTCOME_PROBE_NOT_SUPPORTED",
+                    "该反向工具尚未提供目标状态探测器。", ToolCompensationErrorKind.Validation);
+            // 快照只在服务端解密并直接传给专属探测器，绝不经由 API 或审计详情返回。
+            snapshotJson = cipher.Unprotect(entry.KeyVersion, entry.SnapshotCipher,
+                SnapshotContext(entry.Id, entry.ForwardToolName));
+        }
+
+        using var snapshot = JsonDocument.Parse(snapshotJson);
+        var probeResult = await probe.ProbeAsync(entry.Id, Access(entry), snapshot.RootElement.Clone(), cancellationToken);
+        var result = ToolCompensationProbeResultValidator.Validate(probeResult, entry.Id,
+            entry.CompensationToolName, timeProvider.GetUtcNow());
+        await AuditAsync("tool.compensation.reconciliation.probe", result.State.ToString(), reconciler, entry.Id,
+            entry.CompensationToolName, result.Code, cancellationToken);
+        return result;
+    }
+
+    /// <inheritdoc />
+    public async Task<ToolCompensationReconciliationReviewResult> ReviewOutcomeAsync(string compensationId,
+        bool confirmed, string reason, AccessContext reconciler, CancellationToken cancellationToken = default)
+    {
+        ValidateReconciler(reconciler);
+        var normalizedReason = RequiredText(reason, 500, "TOOL_COMPENSATION_RECONCILIATION_REASON_INVALID",
+            "补偿对账理由必须为 1 到 500 个字符。");
+        var evidence = await ProbeOutcomeAsync(compensationId, reconciler, cancellationToken);
+        if (confirmed && evidence.State == ToolOutcomeProbeState.Indeterminate)
+            throw Failure("TOOL_COMPENSATION_RECONCILIATION_EVIDENCE_INDETERMINATE",
+                "不确定证据不能用于结案或授权重试。", ToolCompensationErrorKind.Validation);
+
+        ToolCompensationReconciliationReviewResult result;
+        lock (_gate)
+        {
+            var entry = RequireOutcomeUnknown(evidence.CompensationId, reconciler);
+            var expiresAt = evidence.ObservedAt.Add(options.ReconciliationEvidenceLifetime);
+            var reasonHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalizedReason)));
+            if (!confirmed)
+            {
+                entry.ClearReview();
+                result = new(entry.Id, ToolReconciliationReviewStatus.Rejected, evidence.State, expiresAt);
+            }
+            else if (entry.ReviewExpiresAt is null)
+            {
+                result = FirstReview(entry, reconciler, evidence, expiresAt, reasonHash);
+            }
+            else if (entry.ReviewExpiresAt <= timeProvider.GetUtcNow())
+            {
+                entry.ClearReview();
+                result = new(entry.Id, ToolReconciliationReviewStatus.EvidenceExpired,
+                    evidence.State, expiresAt);
+            }
+            else if (entry.ReviewEvidenceState != evidence.State
+                     || !string.Equals(entry.ReviewEvidenceCode, evidence.Code, StringComparison.Ordinal))
+            {
+                entry.ClearReview();
+                result = new(entry.Id, ToolReconciliationReviewStatus.EvidenceChanged,
+                    evidence.State, expiresAt);
+            }
+            else if (string.Equals(entry.FirstReviewerSubjectId, reconciler.SubjectId, StringComparison.Ordinal))
+            {
+                result = new(entry.Id, ToolReconciliationReviewStatus.ReviewerMustDiffer,
+                    evidence.State, entry.ReviewExpiresAt!.Value);
+            }
+            else
+            {
+                // 两名不同人员确认同一份仍有效证据后才改变冻结状态。
+                entry.SecondReviewerSubjectId = reconciler.SubjectId;
+                entry.SecondReviewReasonHash = reasonHash;
+                entry.Status = evidence.State == ToolOutcomeProbeState.Applied
+                    ? ToolCompensationStatus.Completed : ToolCompensationStatus.Available;
+                if (entry.Status == ToolCompensationStatus.Completed)
+                    entry.CompletedAt = timeProvider.GetUtcNow();
+                else
+                {
+                    // 未恢复只证明旧反向调用没有生效；重新执行仍须新的独立业务审批和幂等键。
+                    entry.ApprovalId = null;
+                    entry.ApprovalExpiresAt = null;
+                    entry.ApproverSubjectId = null;
+                    entry.DecisionReasonHash = null;
+                    entry.CompensationExecutionKey = null;
+                }
+                result = new(entry.Id, evidence.State == ToolOutcomeProbeState.Applied
+                        ? ToolReconciliationReviewStatus.ResolvedApplied
+                        : ToolReconciliationReviewStatus.RetryAuthorized,
+                    evidence.State, entry.ReviewExpiresAt!.Value);
+            }
+        }
+        await AuditAsync("tool.compensation.reconciliation.review", result.Status.ToString(), reconciler,
+            evidence.CompensationId, evidence.CompensationToolName,
+            $"TOOL_COMPENSATION_RECONCILIATION_{result.Status.ToString().ToUpperInvariant()}", cancellationToken);
+        return result;
+    }
+
+    private static ToolCompensationReconciliationReviewResult FirstReview(Entry entry, AccessContext reconciler,
+        ToolCompensationOutcomeProbeResult evidence, DateTimeOffset expiresAt, string reasonHash)
+    {
+        entry.FirstReviewerSubjectId = reconciler.SubjectId;
+        entry.FirstReviewReasonHash = reasonHash;
+        entry.ReviewEvidenceState = evidence.State;
+        entry.ReviewEvidenceCode = evidence.Code;
+        entry.ReviewObservedAt = evidence.ObservedAt;
+        entry.ReviewExpiresAt = expiresAt;
+        return new(entry.Id, ToolReconciliationReviewStatus.AwaitingSecondReviewer,
+            evidence.State, expiresAt);
+    }
+
+    private Entry RequireOutcomeUnknown(string id, AccessContext reconciler)
+    {
+        if (!_entries.TryGetValue(id, out var entry)
+            || !string.Equals(entry.TenantId, reconciler.TenantId, StringComparison.Ordinal)
+            || entry.Status != ToolCompensationStatus.OutcomeUnknown)
+            throw Failure("TOOL_COMPENSATION_OUTCOME_UNKNOWN_NOT_FOUND",
+                "当前租户不存在可对账的结果不确定补偿。", ToolCompensationErrorKind.NotFound);
+        return entry;
+    }
+
     private Entry RequirePreparation(ToolCompensationPreparation preparation)
     {
         if (!_entries.TryGetValue(preparation.Id, out var entry)
@@ -381,7 +513,8 @@ public sealed class InMemoryToolCompensationService(
             || options.ExecutionLeaseDuration <= TimeSpan.Zero || options.MaximumEntries <= 0
             || options.CompensationLifetime <= options.ApprovalLifetime
             || options.CompensationLifetime <= options.ExecutionLeaseDuration
-            || options.MaximumSnapshotBytes <= 0 || options.ApproverGroups.Count == 0)
+            || options.MaximumSnapshotBytes <= 0 || options.ApproverGroups.Count == 0
+            || options.ReconcilerGroups.Count == 0 || options.ReconciliationEvidenceLifetime <= TimeSpan.Zero)
             throw new InvalidOperationException("工具补偿配置无效。");
     }
 
@@ -390,6 +523,14 @@ public sealed class InMemoryToolCompensationService(
         if (string.IsNullOrWhiteSpace(access.TenantId) || string.IsNullOrWhiteSpace(access.SubjectId))
             throw Failure("TOOL_COMPENSATION_ACCESS_INVALID", "补偿访问身份无效。",
                 ToolCompensationErrorKind.Validation);
+    }
+
+    private void ValidateReconciler(AccessContext access)
+    {
+        ValidateAccess(access);
+        if (!access.Groups.Overlaps(options.ReconcilerGroups))
+            throw Failure("TOOL_COMPENSATION_RECONCILER_ROLE_REQUIRED",
+                "只有工具对账人员可以核验结果不确定补偿。", ToolCompensationErrorKind.Forbidden);
     }
 
     private static string RequiredText(string? value, int maximumLength, string code, string message)
@@ -463,6 +604,27 @@ public sealed class InMemoryToolCompensationService(
         public string? CompensationExecutionKey { get; set; }
         public DateTimeOffset? ExecutionLeaseExpiresAt { get; set; }
         public DateTimeOffset? CompletedAt { get; set; }
+        public string? FirstReviewerSubjectId { get; set; }
+        public string? FirstReviewReasonHash { get; set; }
+        public string? SecondReviewerSubjectId { get; set; }
+        public string? SecondReviewReasonHash { get; set; }
+        public ToolOutcomeProbeState? ReviewEvidenceState { get; set; }
+        public string? ReviewEvidenceCode { get; set; }
+        public DateTimeOffset? ReviewObservedAt { get; set; }
+        public DateTimeOffset? ReviewExpiresAt { get; set; }
+
+        /// <summary>证据被拒绝、变化或过期时清除第一人复核，防止旧证据与新观察拼接。</summary>
+        public void ClearReview()
+        {
+            FirstReviewerSubjectId = null;
+            FirstReviewReasonHash = null;
+            SecondReviewerSubjectId = null;
+            SecondReviewReasonHash = null;
+            ReviewEvidenceState = null;
+            ReviewEvidenceCode = null;
+            ReviewObservedAt = null;
+            ReviewExpiresAt = null;
+        }
     }
 }
 
