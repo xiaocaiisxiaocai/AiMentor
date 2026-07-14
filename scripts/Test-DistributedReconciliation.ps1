@@ -223,6 +223,104 @@ try {
     Assert-Equal '3' (Invoke-SqlScalar "SELECT Status FROM dbo.AiMentorToolExecutions WHERE ExecutionKey='$crashExecutionKey';") `
         '过期 Executing 未冻结为 OutcomeUnknown'
 
+    # 建立一条真实 memory.correct 补偿记录，随后在反向工具调用前的精确窗口强杀另一个实例。
+    $proposal = Send-Request 'POST' "http://127.0.0.1:$BasePort/api/v1/memories/proposals" @{
+        scope = 'UserPreference'; key = 'distributed.compensation'; value = 'before'
+    }
+    Assert-Equal 202 $proposal.StatusCode '补偿场景记忆提案失败'
+    $memory = Send-Request 'POST' `
+        "http://127.0.0.1:$BasePort/api/v1/memories/proposals/$($proposal.Json.id)/approve"
+    Assert-Equal 201 $memory.StatusCode '补偿场景记忆批准失败'
+    $correctArguments = @{
+        memoryId = $memory.Json.id; expectedVersion = $memory.Json.version; value = 'after'
+    }
+    $correctApproval = Send-Request 'POST' "http://127.0.0.1:$BasePort/api/v1/tool-approvals" @{
+        toolName = 'memory.correct'; arguments = $correctArguments; justification = '建立反向强杀验收记录'
+    }
+    Assert-Equal 202 $correctApproval.StatusCode '更正工具审批申请失败'
+    $correctDecision = Send-Request 'POST' `
+        "http://127.0.0.1:$($BasePort + 1)/api/v1/tool-approvals/$($correctApproval.Json.id)/decision" @{
+        approved = $true; reason = '独立批准更正工具'
+    }
+    Assert-Equal 200 $correctDecision.StatusCode '更正工具审批裁决失败'
+    $correctExecution = Send-Request 'POST' `
+        "http://127.0.0.1:$BasePort/api/v1/tools/memory.correct/execute" @{
+        arguments = $correctArguments; approvalId = $correctApproval.Json.id
+    } @{ 'Idempotency-Key' = 'distributed-compensation-forward-001' }
+    Assert-Equal 200 $correctExecution.StatusCode '更正工具执行失败'
+    Assert-Equal 'Completed' $correctExecution.Json.status '更正工具没有完成正向执行'
+    $compensationId = $correctExecution.Json.compensationId
+    if ([string]::IsNullOrWhiteSpace($compensationId)) { throw '更正工具没有返回补偿标识。' }
+
+    $compensationApproval = Send-Request 'POST' `
+        "http://127.0.0.1:$BasePort/api/v1/tool-compensations/$compensationId/approval" @{
+        justification = '验证补偿精确窗口强杀'
+    }
+    Assert-Equal 202 $compensationApproval.StatusCode '补偿审批申请失败'
+    $compensationDecision = Send-Request 'POST' `
+        "http://127.0.0.1:$($BasePort + 1)/api/v1/tool-compensations/$compensationId/decision" @{
+        approvalId = $compensationApproval.Json.approvalId; approved = $true; reason = '独立批准反向操作'
+    }
+    Assert-Equal 200 $compensationDecision.StatusCode '补偿审批裁决失败'
+
+    $compensationBarrierDirectory = Join-Path $temporaryRoot 'compensation-executing-kill-barrier'
+    New-Item -ItemType Directory -Path $compensationBarrierDirectory -Force | Out-Null
+    $compensationSignal = Join-Path $compensationBarrierDirectory 'executing.signal'
+    $compensationRelease = Join-Path $compensationBarrierDirectory 'executing.release'
+    $compensationCrash = Start-Api 'compensation-executing-kill' ($BasePort + 6) 'requester-a' @('users') `
+        'Testing' $compensationSignal $compensationRelease
+    $compensationBody = @{ approvalId = $compensationApproval.Json.approvalId } |
+        ConvertTo-Json -Depth 4 -Compress
+    $compensationRequest = [System.Net.Http.HttpRequestMessage]::new(
+        [System.Net.Http.HttpMethod]::Post,
+        "http://127.0.0.1:$($BasePort + 6)/api/v1/tool-compensations/$compensationId/execute")
+    $null = $compensationRequest.Headers.TryAddWithoutValidation(
+        'Idempotency-Key', 'distributed-compensation-reverse-001')
+    $compensationRequest.Content = [System.Net.Http.StringContent]::new(
+        $compensationBody, [Text.Encoding]::UTF8, 'application/json')
+    $compensationTask = $client.SendAsync($compensationRequest)
+
+    $compensationSignalObserved = $false
+    for ($attempt = 0; $attempt -lt 200; $attempt++) {
+        if (Test-Path -LiteralPath $compensationSignal) { $compensationSignalObserved = $true; break }
+        Start-Sleep -Milliseconds 25
+    }
+    if (-not $compensationSignalObserved) { throw '未观察到补偿 Executing 屏障信号。' }
+    $compensationSignalParts = (Get-Content -LiteralPath $compensationSignal -Raw).Split('|', 2)
+    Assert-Equal 'memory.correct.restore' $compensationSignalParts[1] '补偿屏障工具名错误'
+    Assert-Equal '5' (Invoke-SqlScalar `
+        "SELECT Status FROM dbo.AiMentorToolCompensations WHERE Id='$compensationId';") `
+        '强杀前补偿账本尚未进入 Executing'
+
+    # 不释放屏障即强杀；原记忆必须保持正向值，证明反向工具尚未开始。
+    Stop-Api $compensationCrash
+    $compensationRequest.Dispose()
+    $memoryAfterKillResponse = Send-Request 'GET' "http://127.0.0.1:$BasePort/api/v1/memories"
+    Assert-Equal 200 $memoryAfterKillResponse.StatusCode '强杀后目标记忆查询失败'
+    $memoryAfterKill = @($memoryAfterKillResponse.Json | Where-Object { $_.id -eq $memory.Json.id })
+    Assert-Equal 1 $memoryAfterKill.Count '强杀后目标记忆不可见'
+    Assert-Equal 'after' $memoryAfterKill[0].value '强杀窗口越过了反向副作用边界'
+    Start-Sleep -Seconds 46
+
+    # 替代实例通过带状态过滤的只读入口触发租约归一化，只能看到冻结状态，不能接管反向执行。
+    $compensationReplacement = Start-Api 'compensation-kill-replacement' ($BasePort + 6) 'requester-a' @('users')
+    $unknownCompensationsResponse = Send-Request 'GET' `
+        "http://127.0.0.1:$($BasePort + 6)/api/v1/tool-compensations?status=OutcomeUnknown"
+    Assert-Equal 200 $unknownCompensationsResponse.StatusCode '结果不确定补偿查询失败'
+    $unknownCompensations = @($unknownCompensationsResponse.Json)
+    $frozenCompensation = @($unknownCompensations | Where-Object { $_.id -eq $compensationId })
+    Assert-Equal 1 $frozenCompensation.Count '替代实例没有查询到结果不确定补偿'
+    Assert-Equal 'OutcomeUnknown' $frozenCompensation[0].status '补偿租约过期后没有冻结'
+    $compensationRetry = Send-Request 'POST' `
+        "http://127.0.0.1:$($BasePort + 6)/api/v1/tool-compensations/$compensationId/execute" @{
+        approvalId = $compensationApproval.Json.approvalId
+    } @{ 'Idempotency-Key' = 'distributed-compensation-reverse-001' }
+    Assert-Equal 409 $compensationRetry.StatusCode '结果不确定补偿被错误接管或重放'
+    Assert-Equal 'TOOL_COMPENSATION_OUTCOME_UNKNOWN' $compensationRetry.Json.code '补偿冻结错误码不稳定'
+    Assert-Equal '8' (Invoke-SqlScalar `
+        "SELECT Status FROM dbo.AiMentorToolCompensations WHERE Id='$compensationId';") `
+        '补偿账本没有持久化 OutcomeUnknown'
+
     $arguments = @{ memoryId = 'missing-memory-for-distributed-test'; expectedVersion = 1 }
     $approval = Send-Request 'POST' "http://127.0.0.1:$BasePort/api/v1/tool-approvals" @{
         toolName = 'memory.delete'; arguments = $arguments; justification = '分布式故障验收'
@@ -281,10 +379,13 @@ try {
 
     [pscustomobject]@{
         Database = $database
-        ConcurrentApiInstances = 6
-        ApiProcessesStarted = 7
+        ConcurrentApiInstances = 7
+        ApiProcessesStarted = 10
         ExecutingSignalObserved = $signalObserved
         ExecutingLeaseRecovery = $crashReplay.Json.status
+        CompensationSignalObserved = $compensationSignalObserved
+        CompensationLeaseRecovery = $frozenCompensation[0].status
+        CompensationTargetValueAfterKill = $memoryAfterKill[0].value
         InitialOutcome = $execution.Json.status
         FirstReview = $firstReview.Json.status
         ConcurrentSecondReviewWinners = $resolved.Count

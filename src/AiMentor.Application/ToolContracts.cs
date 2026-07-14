@@ -101,6 +101,7 @@ public interface IToolCompensationService
     Task MarkForwardOutcomeUnknownAsync(ToolCompensationPreparation preparation,
         CancellationToken cancellationToken = default);
     Task<IReadOnlyList<ToolCompensationSummary>> ListAsync(AccessContext access,
+        ToolCompensationStatus? status = null,
         CancellationToken cancellationToken = default);
     Task<ToolCompensationSummary> RequestApprovalAsync(string compensationId, string justification,
         AccessContext requester, CancellationToken cancellationToken = default);

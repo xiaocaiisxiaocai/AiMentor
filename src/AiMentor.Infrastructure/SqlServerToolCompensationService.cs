@@ -19,7 +19,8 @@ public sealed class SqlServerToolCompensationService(
     ITraceSink traceSink,
     ToolCompensationOptions compensationOptions,
     SqlServerWorkflowOptions sqlOptions,
-    TimeProvider timeProvider) : IToolCompensationService, IDisposable
+    TimeProvider timeProvider,
+    IToolExecutionBarrier? executionBarrier = null) : IToolCompensationService, IDisposable
 {
     private const string TableName = "AiMentorToolCompensations";
     private const string Columns = "Id,ForwardExecutionKey,TenantId,RequesterSubjectId,ForwardToolName," +
@@ -27,6 +28,8 @@ public sealed class SqlServerToolCompensationService(
         "ApprovalId,Justification,ApprovalExpiresAt,ApproverSubjectId,DecisionReasonHash," +
         "CompensationExecutionKey,ExecutionLeaseToken,ExecutionLeaseExpiresAt,CompletedAt";
     private readonly SemaphoreSlim _initializationGate = new(1, 1);
+    private readonly IToolExecutionBarrier _executionBarrier =
+        executionBarrier ?? NoOpToolExecutionBarrier.Instance;
     private volatile bool _initialized;
 
     public bool IsAvailable => true;
@@ -140,21 +143,29 @@ public sealed class SqlServerToolCompensationService(
     }
 
     public async Task<IReadOnlyList<ToolCompensationSummary>> ListAsync(AccessContext access,
+        ToolCompensationStatus? status = null,
         CancellationToken cancellationToken = default)
     {
         ValidateAccess(access);
+        if (status.HasValue && !Enum.IsDefined(status.Value))
+            throw Failure("TOOL_COMPENSATION_STATUS_INVALID", "补偿状态过滤值无效。",
+                ToolCompensationErrorKind.Validation);
         await EnsureInitializedAsync(cancellationToken);
         await NormalizeDueAsync(cancellationToken);
         await using var connection = await OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
         command.CommandText = $"""
             SELECT {Columns} FROM dbo.{TableName}
-            WHERE TenantId=@tenant AND Status<>@prepared AND (@canApprove=1 OR RequesterSubjectId=@subject)
+            WHERE TenantId=@tenant AND Status<>@prepared AND (@status IS NULL OR Status=@status)
+                AND (@canApprove=1 OR RequesterSubjectId=@subject)
             ORDER BY CreatedAt DESC;
             """;
         AddString(command, "@tenant", 128, access.TenantId); AddString(command, "@subject", 256, access.SubjectId);
         command.Parameters.Add("@canApprove", SqlDbType.Bit).Value = access.Groups.Overlaps(compensationOptions.ApproverGroups);
         AddByte(command, "@prepared", ToolCompensationStatus.Prepared);
+        command.Parameters.Add("@status", SqlDbType.TinyInt).Value = status.HasValue
+            ? (byte)status.Value
+            : DBNull.Value;
         var result = new List<ToolCompensationSummary>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken)) result.Add(ToSummary(Read(reader)));
@@ -333,6 +344,9 @@ public sealed class SqlServerToolCompensationService(
 
         try
         {
+            // 事务已提交 Executing 和租约；屏障位于解密及反向副作用之前，供受控强杀验收使用。
+            await _executionBarrier.WaitAfterExecutingAsync(executionKey, row.CompensationToolName,
+                cancellationToken);
             var snapshotJson = cipher.Unprotect(row.KeyVersion, row.SnapshotCipher,
                 SnapshotContext(row.Id, row.ForwardToolName));
             if (cipher.RequiresReencryption(row.KeyVersion))

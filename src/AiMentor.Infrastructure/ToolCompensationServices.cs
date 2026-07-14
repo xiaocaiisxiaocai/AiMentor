@@ -14,11 +14,14 @@ public sealed class InMemoryToolCompensationService(
     IWorkflowStateCipher cipher,
     ITraceSink traceSink,
     ToolCompensationOptions options,
-    TimeProvider timeProvider) : IToolCompensationService
+    TimeProvider timeProvider,
+    IToolExecutionBarrier? executionBarrier = null) : IToolCompensationService
 {
     private readonly object _gate = new();
     private readonly Dictionary<string, Entry> _entries = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _forwardExecutions = new(StringComparer.Ordinal);
+    private readonly IToolExecutionBarrier _executionBarrier =
+        executionBarrier ?? NoOpToolExecutionBarrier.Instance;
 
     public bool IsAvailable => true;
 
@@ -126,9 +129,13 @@ public sealed class InMemoryToolCompensationService(
     }
 
     public Task<IReadOnlyList<ToolCompensationSummary>> ListAsync(AccessContext access,
+        ToolCompensationStatus? status = null,
         CancellationToken cancellationToken = default)
     {
         ValidateAccess(access);
+        if (status.HasValue && !Enum.IsDefined(status.Value))
+            throw Failure("TOOL_COMPENSATION_STATUS_INVALID", "补偿状态过滤值无效。",
+                ToolCompensationErrorKind.Validation);
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
@@ -136,6 +143,7 @@ public sealed class InMemoryToolCompensationService(
             var canApprove = access.Groups.Overlaps(options.ApproverGroups);
             return Task.FromResult<IReadOnlyList<ToolCompensationSummary>>(_entries.Values
                 .Where(entry => entry.Status != ToolCompensationStatus.Prepared
+                    && (!status.HasValue || entry.Status == status.Value)
                     && string.Equals(entry.TenantId, access.TenantId, StringComparison.Ordinal)
                     && (canApprove || string.Equals(entry.RequesterSubjectId, access.SubjectId,
                         StringComparison.Ordinal)))
@@ -260,6 +268,9 @@ public sealed class InMemoryToolCompensationService(
 
         try
         {
+            // 状态已持久化为 Executing，但补偿快照尚未解密、反向工具尚未产生副作用；仅测试屏障会阻塞。
+            await _executionBarrier.WaitAfterExecutingAsync(executionKey, entry.CompensationToolName,
+                cancellationToken);
             var snapshotJson = cipher.Unprotect(entry.KeyVersion, entry.SnapshotCipher,
                 SnapshotContext(entry.Id, entry.ForwardToolName));
             using var snapshotDocument = JsonDocument.Parse(snapshotJson);
@@ -470,6 +481,7 @@ public sealed class UnavailableToolCompensationService : IToolCompensationServic
     public Task MarkForwardOutcomeUnknownAsync(ToolCompensationPreparation preparation,
         CancellationToken cancellationToken = default) => Task.FromException(Unavailable());
     public Task<IReadOnlyList<ToolCompensationSummary>> ListAsync(AccessContext access,
+        ToolCompensationStatus? status = null,
         CancellationToken cancellationToken = default) =>
         Task.FromException<IReadOnlyList<ToolCompensationSummary>>(Unavailable());
     public Task<ToolCompensationSummary> RequestApprovalAsync(string compensationId, string justification,

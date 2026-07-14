@@ -1,3 +1,5 @@
+-- sqlcmd 容器连接的 QUOTED_IDENTIFIER 默认值可能关闭；筛选唯一索引要求显式开启。
+SET QUOTED_IDENTIFIER ON;
 SET XACT_ABORT ON;
 BEGIN TRANSACTION;
 

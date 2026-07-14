@@ -708,12 +708,14 @@ static IResult ToolApprovalProblem(ToolApprovalException exception, HttpContext 
         extensions: new Dictionary<string, object?> { ["code"] = exception.Code });
 }
 
-static async Task<IResult> ListToolCompensationsAsync(IToolCompensationService service,
+static async Task<IResult> ListToolCompensationsAsync(ToolCompensationStatus? status,
+    IToolCompensationService service,
     IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
 {
     try
     {
-        return Results.Ok(await service.ListAsync(accessProvider.GetAccessContext(context.User), cancellationToken));
+        return Results.Ok(await service.ListAsync(accessProvider.GetAccessContext(context.User), status,
+            cancellationToken));
     }
     catch (ToolCompensationException exception)
     {

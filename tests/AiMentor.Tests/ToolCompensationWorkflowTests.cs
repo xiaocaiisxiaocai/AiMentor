@@ -64,7 +64,47 @@ public sealed class ToolCompensationWorkflowTests
         Assert.Equal("TOOL_COMPENSATION_OUTCOME_UNKNOWN", retry.Code);
         Assert.Equal(ToolCompensationStatus.OutcomeUnknown,
             Assert.Single(await service.ListAsync(Requester)).Status);
+        Assert.Single(await service.ListAsync(Requester, ToolCompensationStatus.OutcomeUnknown));
+        Assert.Empty(await service.ListAsync(Requester, ToolCompensationStatus.Completed));
         Assert.Equal(1, tool.CompensationCount);
+    }
+
+    [Fact]
+    public async Task CompensationBarrierRunsAfterExecutingAndBeforeReverseSideEffect()
+    {
+        var tool = new ReversibleTestTool();
+        var barrier = new RecordingExecutionBarrier();
+        var service = CreateService(tool, barrier: barrier);
+        var arguments = JsonSerializer.SerializeToElement(new { value = 2 });
+        var preparation = await service.PrepareForwardAsync(new string('E', 64), tool,
+            new ToolExecutionContext(Requester, "forward-run"), arguments);
+        await tool.ExecuteAsync(new ToolExecutionContext(Requester, "forward-run"), arguments);
+        await service.ActivateAsync(preparation);
+        var pending = await service.RequestApprovalAsync(preparation.Id, "验证反向执行屏障", Requester);
+        await service.DecideAsync(preparation.Id, pending.ApprovalId!, true, "独立批准", Approver);
+
+        var execution = service.ExecuteAsync(preparation.Id, pending.ApprovalId!, "barrier-reverse-key", Requester);
+        var signal = await barrier.Entered.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal("test.state.restore", signal.ToolName);
+        Assert.Equal(64, signal.ExecutionKey.Length);
+        Assert.Equal(ToolCompensationStatus.Executing,
+            Assert.Single(await service.ListAsync(Requester, ToolCompensationStatus.Executing)).Status);
+        Assert.Equal(0, tool.CompensationCount);
+
+        barrier.Release.TrySetResult();
+        Assert.Equal(ToolCompensationStatus.Completed, (await execution).Status);
+        Assert.Equal(1, tool.CompensationCount);
+    }
+
+    [Fact]
+    public async Task CompensationListRejectsUndefinedStatusFilter()
+    {
+        var invalid = await Assert.ThrowsAsync<ToolCompensationException>(() =>
+            CreateService(new ReversibleTestTool()).ListAsync(Requester, (ToolCompensationStatus)255));
+
+        Assert.Equal("TOOL_COMPENSATION_STATUS_INVALID", invalid.Code);
+        Assert.Equal(ToolCompensationErrorKind.Validation, invalid.Kind);
     }
 
     [Fact]
@@ -197,12 +237,28 @@ public sealed class ToolCompensationWorkflowTests
     }
 
     private static InMemoryToolCompensationService CreateService(IServerTool tool, TimeProvider? timeProvider = null,
-        ToolCompensationOptions? options = null)
+        ToolCompensationOptions? options = null, IToolExecutionBarrier? barrier = null)
     {
         var key = RandomNumberGenerator.GetBytes(32);
         var cipher = new AesGcmWorkflowStateCipher("v1", new Dictionary<string, byte[]> { ["v1"] = key });
         return new InMemoryToolCompensationService(new ServerToolRegistry([tool]), cipher, new InMemoryTraceSink(),
-            options ?? new ToolCompensationOptions(), timeProvider ?? TimeProvider.System);
+            options ?? new ToolCompensationOptions(), timeProvider ?? TimeProvider.System, barrier);
+    }
+
+    /// <summary>阻塞在反向副作用前，并向测试公开账本已经进入 Executing 的确定信号。</summary>
+    private sealed class RecordingExecutionBarrier : IToolExecutionBarrier
+    {
+        public TaskCompletionSource<(string ExecutionKey, string ToolName)> Entered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task WaitAfterExecutingAsync(string executionKey, string toolName,
+            CancellationToken cancellationToken = default)
+        {
+            Entered.TrySetResult((executionKey, toolName));
+            await Release.Task.WaitAsync(cancellationToken);
+        }
     }
 
     /// <summary>提供可观察状态的最小可逆工具，用于验证快照、审批、幂等和结果不确定边界。</summary>

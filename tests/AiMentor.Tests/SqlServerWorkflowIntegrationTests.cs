@@ -180,9 +180,10 @@ public sealed class SqlServerWorkflowIntegrationTests
 
             // 反向工具开始后让租约过期；第二实例只能冻结结果不确定，不能自动接管或重放。
             var blockingTool = new BlockingCompensableTool();
+            var compensationBarrier = new RecordingExecutionBarrier();
             var blockingRegistry = new ServerToolRegistry([blockingTool]);
             using var blockingServiceA = new SqlServerToolCompensationService(blockingRegistry, rotatedCipher,
-                trace, new ToolCompensationOptions(), sqlOptions, clock);
+                trace, new ToolCompensationOptions(), sqlOptions, clock, compensationBarrier);
             using var blockingServiceB = new SqlServerToolCompensationService(blockingRegistry, rotatedCipher,
                 trace, new ToolCompensationOptions(), sqlOptions, clock);
             var blockingArguments = JsonSerializer.SerializeToElement(new { value = "after" });
@@ -197,13 +198,18 @@ public sealed class SqlServerWorkflowIntegrationTests
                 "批准故障注入", approver);
             var blockedExecution = blockingServiceA.ExecuteAsync(blockingPreparation.Id,
                 blockingApproval.ApprovalId!, "blocking-reverse-key", requester);
-            await blockingTool.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var barrierSignal = await compensationBarrier.Entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal("test.blocking.restore", barrierSignal.ToolName);
+            Assert.Equal(0, blockingTool.CompensationCount);
             var concurrentExecution = await Assert.ThrowsAsync<ToolCompensationException>(() =>
                 blockingServiceB.ExecuteAsync(blockingPreparation.Id, blockingApproval.ApprovalId!,
                     "blocking-reverse-key", requester));
             clock.Advance(TimeSpan.FromSeconds(46));
-            var frozenSummary = Assert.Single(await blockingServiceB.ListAsync(requester),
+            var frozenSummary = Assert.Single(await blockingServiceB.ListAsync(
+                    requester, ToolCompensationStatus.OutcomeUnknown),
                 item => item.Id == blockingPreparation.Id);
+            compensationBarrier.Release.TrySetResult();
+            await blockingTool.Started.Task.WaitAsync(TimeSpan.FromSeconds(5));
             blockingTool.Release.TrySetResult();
             var lostLease = await Assert.ThrowsAsync<ToolCompensationException>(() => blockedExecution);
             var blockedRetry = await Assert.ThrowsAsync<ToolCompensationException>(() => blockingServiceB.ExecuteAsync(
@@ -462,6 +468,22 @@ public sealed class SqlServerWorkflowIntegrationTests
             Started.TrySetResult();
             await Release.Task.WaitAsync(cancellationToken);
             return JsonSerializer.SerializeToElement(new { restored = true });
+        }
+    }
+
+    /// <summary>在 SQL 已提交 Executing 后阻塞，证明反向工具调用前存在可观察的强杀窗口。</summary>
+    private sealed class RecordingExecutionBarrier : IToolExecutionBarrier
+    {
+        public TaskCompletionSource<(string ExecutionKey, string ToolName)> Entered { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task WaitAfterExecutingAsync(string executionKey, string toolName,
+            CancellationToken cancellationToken = default)
+        {
+            Entered.TrySetResult((executionKey, toolName));
+            await Release.Task.WaitAsync(cancellationToken);
         }
     }
 
