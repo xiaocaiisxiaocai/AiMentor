@@ -38,10 +38,29 @@ public sealed record IdempotencyAcquireResult(
     string? LeaseToken = null,
     ToolExecutionResult? ReplayResult = null);
 
+/// <summary>携带建立幂等占位所需的哈希标识和最小化租户审计元数据，不保存原始幂等键或工具参数。</summary>
+public sealed record ToolExecutionLedgerRequest(
+    string ExecutionKey,
+    string RequestFingerprint,
+    string RunId,
+    string TenantId,
+    string SubjectId,
+    string ToolName);
+
+/// <summary>公开给授权对账人员的结果不确定记录摘要，不包含工具参数、审批内容或执行结果。</summary>
+public sealed record OutcomeUnknownToolExecution(
+    string ExecutionKey,
+    string TenantId,
+    string SubjectId,
+    string ToolName,
+    string RunId,
+    DateTimeOffset CreatedAt,
+    DateTimeOffset UpdatedAt);
+
 /// <summary>在副作用执行前建立持久化占位，并区分可安全重试和结果不确定状态。</summary>
 public interface IToolExecutionLedger
 {
-    Task<IdempotencyAcquireResult> TryAcquireAsync(string executionKey, string requestFingerprint, string runId,
+    Task<IdempotencyAcquireResult> TryAcquireAsync(ToolExecutionLedgerRequest request,
         TimeSpan leaseDuration, TimeSpan retention, int maximumEntries,
         CancellationToken cancellationToken = default);
     Task MarkExecutingAsync(string executionKey, string leaseToken, CancellationToken cancellationToken = default);
@@ -50,6 +69,34 @@ public interface IToolExecutionLedger
     Task MarkOutcomeUnknownAsync(string executionKey, string leaseToken,
         CancellationToken cancellationToken = default);
     Task AbandonAsync(string executionKey, string leaseToken, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<OutcomeUnknownToolExecution>> ListOutcomeUnknownAsync(string tenantId, int limit,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>按当前访问者租户查询需要外部核验的工具执行，不提供自动重放或清除能力。</summary>
+public interface IToolExecutionReconciliationService
+{
+    Task<IReadOnlyList<OutcomeUnknownToolExecution>> ListOutcomeUnknownAsync(AccessContext access, int limit,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>配置工具执行对账角色和单次查询上限。</summary>
+public sealed class ToolExecutionReconciliationOptions
+{
+    public IReadOnlySet<string> ReconcilerGroups { get; init; } =
+        new HashSet<string>(["tool-reconcilers"], StringComparer.OrdinalIgnoreCase);
+    public int MaximumPageSize { get; init; } = 100;
+}
+
+/// <summary>区分工具执行对账请求的输入错误和授权失败。</summary>
+public enum ToolExecutionReconciliationErrorKind { Validation, Forbidden }
+
+/// <summary>携带可安全返回给 API 调用方的稳定对账错误代码。</summary>
+public sealed class ToolExecutionReconciliationException(
+    string code, string message, ToolExecutionReconciliationErrorKind kind) : Exception(message)
+{
+    public string Code { get; } = code;
+    public ToolExecutionReconciliationErrorKind Kind { get; } = kind;
 }
 
 /// <summary>执行有界 Agent 规划并返回可审计的工具步骤和终止状态。</summary>

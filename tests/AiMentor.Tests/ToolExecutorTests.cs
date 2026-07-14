@@ -166,14 +166,16 @@ public sealed class ToolExecutorTests
 
     private sealed class OutcomeUnknownLedger : IToolExecutionLedger
     {
-        public Task<IdempotencyAcquireResult> TryAcquireAsync(string executionKey, string requestFingerprint,
-            string runId, TimeSpan leaseDuration, TimeSpan retention, int maximumEntries,
+        public Task<IdempotencyAcquireResult> TryAcquireAsync(ToolExecutionLedgerRequest request,
+            TimeSpan leaseDuration, TimeSpan retention, int maximumEntries,
             CancellationToken cancellationToken = default) => Task.FromResult(
                 new IdempotencyAcquireResult(IdempotencyAcquireStatus.OutcomeUnknown));
         public Task MarkExecutingAsync(string executionKey, string leaseToken, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task CompleteAsync(string executionKey, string leaseToken, ToolExecutionResult result, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task MarkOutcomeUnknownAsync(string executionKey, string leaseToken, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task AbandonAsync(string executionKey, string leaseToken, CancellationToken cancellationToken = default) => throw new NotSupportedException();
+        public Task<IReadOnlyList<OutcomeUnknownToolExecution>> ListOutcomeUnknownAsync(string tenantId, int limit,
+            CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }
 
     private sealed class FakeTool(

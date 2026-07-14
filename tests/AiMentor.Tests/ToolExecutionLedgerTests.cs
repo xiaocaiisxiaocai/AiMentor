@@ -13,17 +13,17 @@ public sealed class ToolExecutionLedgerTests
     {
         var clock = new MutableTimeProvider(DateTimeOffset.UtcNow);
         var ledger = new InMemoryToolExecutionLedger(clock);
-        var reserved = await ledger.TryAcquireAsync(Key('A'), Fingerprint('A'), "run-1",
+        var reserved = await ledger.TryAcquireAsync(Request('A', 'A', "run-1", "tenant-a"),
             TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
         clock.Advance(TimeSpan.FromSeconds(31));
-        var safeTakeover = await ledger.TryAcquireAsync(Key('A'), Fingerprint('A'), "run-2",
+        var safeTakeover = await ledger.TryAcquireAsync(Request('A', 'A', "run-2", "tenant-a"),
             TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
 
-        var executing = await ledger.TryAcquireAsync(Key('B'), Fingerprint('B'), "run-3",
+        var executing = await ledger.TryAcquireAsync(Request('B', 'B', "run-3", "tenant-a"),
             TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
         await ledger.MarkExecutingAsync(Key('B'), executing.LeaseToken!);
         clock.Advance(TimeSpan.FromSeconds(31));
-        var uncertain = await ledger.TryAcquireAsync(Key('B'), Fingerprint('B'), "run-4",
+        var uncertain = await ledger.TryAcquireAsync(Request('B', 'B', "run-4", "tenant-a"),
             TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
 
         Assert.Equal(IdempotencyAcquireStatus.Acquired, reserved.Status);
@@ -36,15 +36,15 @@ public sealed class ToolExecutionLedgerTests
     public async Task CompletedResultShouldReplayAndFingerprintMismatchShouldRefuse()
     {
         var ledger = new InMemoryToolExecutionLedger(TimeProvider.System);
-        var acquired = await ledger.TryAcquireAsync(Key('C'), Fingerprint('C'), "run-1",
+        var acquired = await ledger.TryAcquireAsync(Request('C', 'C', "run-1", "tenant-a"),
             TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
         await ledger.MarkExecutingAsync(Key('C'), acquired.LeaseToken!);
         var result = Result("run-1");
         await ledger.CompleteAsync(Key('C'), acquired.LeaseToken!, result);
 
-        var replay = await ledger.TryAcquireAsync(Key('C'), Fingerprint('C'), "run-2",
+        var replay = await ledger.TryAcquireAsync(Request('C', 'C', "run-2", "tenant-a"),
             TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
-        var mismatch = await ledger.TryAcquireAsync(Key('C'), Fingerprint('D'), "run-3",
+        var mismatch = await ledger.TryAcquireAsync(Request('C', 'D', "run-3", "tenant-a"),
             TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
 
         Assert.Equal(IdempotencyAcquireStatus.Replay, replay.Status);
@@ -52,8 +52,31 @@ public sealed class ToolExecutionLedgerTests
         Assert.Equal(IdempotencyAcquireStatus.FingerprintMismatch, mismatch.Status);
     }
 
+    [Fact]
+    public async Task OutcomeUnknownQueryShouldBeTenantIsolatedAndMinimal()
+    {
+        var ledger = new InMemoryToolExecutionLedger(TimeProvider.System);
+        foreach (var (key, tenant) in new[] { ('D', "tenant-a"), ('E', "tenant-b") })
+        {
+            var acquired = await ledger.TryAcquireAsync(Request(key, key, $"run-{key}", tenant),
+                TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
+            await ledger.MarkExecutingAsync(Key(key), acquired.LeaseToken!);
+            await ledger.MarkOutcomeUnknownAsync(Key(key), acquired.LeaseToken!);
+        }
+
+        var records = await ledger.ListOutcomeUnknownAsync("tenant-a", 50);
+
+        var record = Assert.Single(records);
+        Assert.Equal("tenant-a", record.TenantId);
+        Assert.Equal("subject-a", record.SubjectId);
+        Assert.Equal("memory.delete", record.ToolName);
+        Assert.Equal(Key('D'), record.ExecutionKey);
+    }
+
     private static string Key(char value) => new(value, 64);
     private static string Fingerprint(char value) => new(value, 64);
+    private static ToolExecutionLedgerRequest Request(char key, char fingerprint, string runId, string tenantId) =>
+        new(Key(key), Fingerprint(fingerprint), runId, tenantId, "subject-a", "memory.delete");
     private static ToolExecutionResult Result(string runId) => new(runId, "memory.delete",
         ToolExecutionStatus.Completed, JsonSerializer.SerializeToElement(new { deleted = true }),
         SafetyDecision.Allowed, false, []);

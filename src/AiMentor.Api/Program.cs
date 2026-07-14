@@ -167,6 +167,8 @@ builder.Services.AddSingleton<IToolApprovalService>(services =>
         : ActivatorUtilities.CreateInstance<InMemoryToolApprovalService>(services));
 builder.Services.AddSingleton(new ToolExecutorOptions());
 builder.Services.AddSingleton<IToolExecutor, SafeToolExecutor>();
+builder.Services.AddSingleton(new ToolExecutionReconciliationOptions());
+builder.Services.AddSingleton<IToolExecutionReconciliationService, ToolExecutionReconciliationService>();
 builder.Services.AddSingleton(new AgentExecutionOptions());
 builder.Services.AddSingleton<IAgentRunner, AgentFrameworkToolRunner>();
 builder.Services.AddSingleton<IOutputSafetyService, RuleBasedOutputSafetyService>();
@@ -351,6 +353,15 @@ toolApprovals.MapPost("/{approvalId}/decision", DecideToolApprovalAsync)
     .ProducesProblem(StatusCodes.Status403Forbidden)
     .ProducesProblem(StatusCodes.Status404NotFound)
     .ProducesProblem(StatusCodes.Status409Conflict)
+    .RequireRateLimiting("questions");
+
+var toolExecutions = v1.MapGroup("/tool-executions").WithTags("AiMentor tool reconciliation v1");
+toolExecutions.MapGet("/outcome-unknown", ListOutcomeUnknownToolExecutionsAsync)
+    .WithName("ListOutcomeUnknownToolExecutionsV1")
+    .WithSummary("由当前租户的工具对账人员查看结果不确定执行摘要")
+    .Produces<IReadOnlyList<OutcomeUnknownToolExecution>>()
+    .ProducesValidationProblem()
+    .ProducesProblem(StatusCodes.Status403Forbidden)
     .RequireRateLimiting("questions");
 
 var agents = v1.MapGroup("/agents").WithTags("AiMentor agents v1");
@@ -588,6 +599,27 @@ static IResult ToolApprovalProblem(ToolApprovalException exception, HttpContext 
     return Results.Problem(statusCode: statusCode, title: "工具审批失败", detail: exception.Message,
         instance: context.Request.Path,
         extensions: new Dictionary<string, object?> { ["code"] = exception.Code });
+}
+
+static async Task<IResult> ListOutcomeUnknownToolExecutionsAsync(int? limit,
+    IToolExecutionReconciliationService service, IRequestAccessContextProvider accessProvider,
+    HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        var effectiveLimit = limit ?? 50;
+        return Results.Ok(await service.ListOutcomeUnknownAsync(
+            accessProvider.GetAccessContext(context.User), effectiveLimit, cancellationToken));
+    }
+    catch (ToolExecutionReconciliationException exception)
+    {
+        var status = exception.Kind == ToolExecutionReconciliationErrorKind.Forbidden
+            ? StatusCodes.Status403Forbidden
+            : StatusCodes.Status400BadRequest;
+        return Results.Problem(statusCode: status, title: "工具执行对账请求失败", detail: exception.Message,
+            instance: context.Request.Path,
+            extensions: new Dictionary<string, object?> { ["code"] = exception.Code });
+    }
 }
 
 static async Task<IResult> RunAgentAsync(RunAgentRequest request, IAgentRunner runner,

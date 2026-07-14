@@ -14,27 +14,29 @@ public sealed class InMemoryToolExecutionLedger(TimeProvider timeProvider) : ITo
     private readonly Dictionary<string, Entry> _entries = new(StringComparer.Ordinal);
 
     /// <inheritdoc />
-    public Task<IdempotencyAcquireResult> TryAcquireAsync(string executionKey, string requestFingerprint, string runId,
+    public Task<IdempotencyAcquireResult> TryAcquireAsync(ToolExecutionLedgerRequest request,
         TimeSpan leaseDuration, TimeSpan retention, int maximumEntries,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        ValidateRequest(request);
         lock (_gate)
         {
             var now = timeProvider.GetUtcNow();
             foreach (var stale in _entries.Where(pair => pair.Value.Status == LedgerStatus.Completed
                     && pair.Value.UpdatedAt.Add(retention) <= now).ToArray())
                 _entries.Remove(stale.Key);
-            if (!_entries.TryGetValue(executionKey, out var entry))
+            if (!_entries.TryGetValue(request.ExecutionKey, out var entry))
             {
                 if (_entries.Count >= maximumEntries)
                     return Task.FromResult(new IdempotencyAcquireResult(IdempotencyAcquireStatus.Capacity));
                 var token = Guid.NewGuid().ToString("N");
-                _entries.Add(executionKey, new Entry(requestFingerprint, runId, LedgerStatus.Reserved, token,
-                    now.Add(leaseDuration), now));
+                _entries.Add(request.ExecutionKey, new Entry(request.RequestFingerprint, request.RunId,
+                    request.TenantId, request.SubjectId, request.ToolName, LedgerStatus.Reserved, token,
+                    now.Add(leaseDuration), now, now));
                 return Task.FromResult(new IdempotencyAcquireResult(IdempotencyAcquireStatus.Acquired, token));
             }
-            if (!string.Equals(entry.RequestFingerprint, requestFingerprint, StringComparison.Ordinal))
+            if (!string.Equals(entry.RequestFingerprint, request.RequestFingerprint, StringComparison.Ordinal))
                 return Task.FromResult(new IdempotencyAcquireResult(IdempotencyAcquireStatus.FingerprintMismatch));
             if (entry.Status == LedgerStatus.Completed)
                 return Task.FromResult(new IdempotencyAcquireResult(IdempotencyAcquireStatus.Replay,
@@ -45,13 +47,13 @@ public sealed class InMemoryToolExecutionLedger(TimeProvider timeProvider) : ITo
                 return Task.FromResult(new IdempotencyAcquireResult(IdempotencyAcquireStatus.InProgress));
             if (entry.Status == LedgerStatus.Executing)
             {
-                _entries[executionKey] = entry with { Status = LedgerStatus.OutcomeUnknown, UpdatedAt = now };
+                _entries[request.ExecutionKey] = entry with { Status = LedgerStatus.OutcomeUnknown, UpdatedAt = now };
                 return Task.FromResult(new IdempotencyAcquireResult(IdempotencyAcquireStatus.OutcomeUnknown));
             }
             var renewedToken = Guid.NewGuid().ToString("N");
-            _entries[executionKey] = entry with
+            _entries[request.ExecutionKey] = entry with
             {
-                RunId = runId,
+                RunId = request.RunId,
                 LeaseToken = renewedToken,
                 LeaseExpiresAt = now.Add(leaseDuration),
                 UpdatedAt = now
@@ -89,6 +91,28 @@ public sealed class InMemoryToolExecutionLedger(TimeProvider timeProvider) : ITo
         return Task.CompletedTask;
     }
 
+    /// <inheritdoc />
+    public Task<IReadOnlyList<OutcomeUnknownToolExecution>> ListOutcomeUnknownAsync(string tenantId, int limit,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        ArgumentException.ThrowIfNullOrWhiteSpace(tenantId);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
+        lock (_gate)
+        {
+            IReadOnlyList<OutcomeUnknownToolExecution> result = _entries
+                .Where(pair => pair.Value.Status == LedgerStatus.OutcomeUnknown
+                    && string.Equals(pair.Value.TenantId, tenantId, StringComparison.Ordinal))
+                .OrderByDescending(pair => pair.Value.UpdatedAt)
+                .Take(limit)
+                .Select(pair => new OutcomeUnknownToolExecution(pair.Key, pair.Value.TenantId,
+                    pair.Value.SubjectId, pair.Value.ToolName, pair.Value.RunId,
+                    pair.Value.CreatedAt, pair.Value.UpdatedAt))
+                .ToArray();
+            return Task.FromResult(result);
+        }
+    }
+
     private Task TransitionAsync(string executionKey, string leaseToken, LedgerStatus expected, LedgerStatus next,
         ToolExecutionResult? result, CancellationToken cancellationToken)
     {
@@ -107,10 +131,21 @@ public sealed class InMemoryToolExecutionLedger(TimeProvider timeProvider) : ITo
         System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
             System.Text.Encoding.UTF8.GetBytes(left), System.Text.Encoding.UTF8.GetBytes(right));
 
+    private static void ValidateRequest(ToolExecutionLedgerRequest request)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.ExecutionKey);
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.RequestFingerprint);
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.RunId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.TenantId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.SubjectId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.ToolName);
+    }
+
     private enum LedgerStatus { Reserved, Executing, Completed, OutcomeUnknown }
 
-    private sealed record Entry(string RequestFingerprint, string RunId, LedgerStatus Status, string LeaseToken,
-        DateTimeOffset LeaseExpiresAt, DateTimeOffset UpdatedAt, ToolExecutionResult? Result = null);
+    private sealed record Entry(string RequestFingerprint, string RunId, string TenantId, string SubjectId,
+        string ToolName, LedgerStatus Status, string LeaseToken, DateTimeOffset LeaseExpiresAt,
+        DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, ToolExecutionResult? Result = null);
 }
 
 /// <summary>
@@ -126,10 +161,11 @@ public sealed class SqlServerToolExecutionLedger(
     private volatile bool _initialized;
 
     /// <inheritdoc />
-    public async Task<IdempotencyAcquireResult> TryAcquireAsync(string executionKey, string requestFingerprint,
-        string runId, TimeSpan leaseDuration, TimeSpan retention, int maximumEntries,
+    public async Task<IdempotencyAcquireResult> TryAcquireAsync(ToolExecutionLedgerRequest request,
+        TimeSpan leaseDuration, TimeSpan retention, int maximumEntries,
         CancellationToken cancellationToken = default)
     {
+        ValidateRequest(request);
         await EnsureInitializedAsync(cancellationToken);
         var now = timeProvider.GetUtcNow();
         await using var connection = await OpenAsync(cancellationToken);
@@ -142,7 +178,7 @@ public sealed class SqlServerToolExecutionLedger(
             AddDateTimeOffset(prune, "@cutoff", now.Subtract(retention));
             await prune.ExecuteNonQueryAsync(cancellationToken);
         }
-        var entry = await ReadForUpdateAsync(connection, transaction, executionKey, cancellationToken);
+        var entry = await ReadForUpdateAsync(connection, transaction, request.ExecutionKey, cancellationToken);
         if (entry is null)
         {
             await using var count = connection.CreateCommand();
@@ -157,35 +193,38 @@ public sealed class SqlServerToolExecutionLedger(
             insert.Transaction = transaction;
             insert.CommandText = $"""
                 INSERT dbo.{TableName}
-                  (ExecutionKey,RequestFingerprint,RunId,Status,LeaseToken,LeaseExpiresAt,CreatedAt,UpdatedAt)
-                VALUES (@key,@fingerprint,@runId,0,@token,@leaseExpires,@now,@now);
+                  (ExecutionKey,RequestFingerprint,RunId,TenantId,SubjectId,ToolName,Status,LeaseToken,LeaseExpiresAt,CreatedAt,UpdatedAt)
+                VALUES (@key,@fingerprint,@runId,@tenantId,@subjectId,@toolName,0,@token,@leaseExpires,@now,@now);
                 """;
-            AddAnsiString(insert, "@key", 64, executionKey); AddAnsiString(insert, "@fingerprint", 64, requestFingerprint);
-            AddString(insert, "@runId", 128, runId); AddString(insert, "@token", 64, token);
+            AddAnsiString(insert, "@key", 64, request.ExecutionKey);
+            AddAnsiString(insert, "@fingerprint", 64, request.RequestFingerprint);
+            AddString(insert, "@runId", 128, request.RunId); AddString(insert, "@tenantId", 128, request.TenantId);
+            AddString(insert, "@subjectId", 256, request.SubjectId); AddString(insert, "@toolName", 128, request.ToolName);
+            AddString(insert, "@token", 64, token);
             AddDateTimeOffset(insert, "@leaseExpires", now.Add(leaseDuration)); AddDateTimeOffset(insert, "@now", now);
             await insert.ExecuteNonQueryAsync(cancellationToken);
             return await CommitAsync(transaction,
                 new IdempotencyAcquireResult(IdempotencyAcquireStatus.Acquired, token), cancellationToken);
         }
-        if (!string.Equals(entry.RequestFingerprint, requestFingerprint, StringComparison.Ordinal))
+        if (!string.Equals(entry.RequestFingerprint, request.RequestFingerprint, StringComparison.Ordinal))
             return await CommitAsync(transaction,
                 new IdempotencyAcquireResult(IdempotencyAcquireStatus.FingerprintMismatch), cancellationToken);
         if (entry.Status == 2)
         {
             if (entry.ResultCipher is null)
                 throw new InvalidOperationException("已完成的幂等记录缺少结果密文。");
-            var json = cipher.Unprotect(entry.KeyVersion, entry.ResultCipher, Context(executionKey));
+            var json = cipher.Unprotect(entry.KeyVersion, entry.ResultCipher, Context(request.ExecutionKey));
             var result = JsonSerializer.Deserialize<ToolExecutionResult>(json)
                 ?? throw new InvalidOperationException("幂等执行结果密文无效。");
             if (cipher.RequiresReencryption(entry.KeyVersion))
             {
-                var reencrypted = cipher.Protect(json, Context(executionKey));
+                var reencrypted = cipher.Protect(json, Context(request.ExecutionKey));
                 await using var rotate = connection.CreateCommand();
                 rotate.Transaction = transaction;
                 rotate.CommandText = $"UPDATE dbo.{TableName} SET KeyVersion=@version,ResultCipher=@result,UpdatedAt=@now WHERE ExecutionKey=@key AND Status=2;";
                 AddString(rotate, "@version", 64, reencrypted.KeyVersion);
                 AddString(rotate, "@result", -1, reencrypted.Ciphertext);
-                AddDateTimeOffset(rotate, "@now", now); AddAnsiString(rotate, "@key", 64, executionKey);
+                AddDateTimeOffset(rotate, "@now", now); AddAnsiString(rotate, "@key", 64, request.ExecutionKey);
                 await rotate.ExecuteNonQueryAsync(cancellationToken);
             }
             return await CommitAsync(transaction,
@@ -199,7 +238,7 @@ public sealed class SqlServerToolExecutionLedger(
                 new IdempotencyAcquireResult(IdempotencyAcquireStatus.InProgress), cancellationToken);
         if (entry.Status == 1)
         {
-            await UpdateStatusAsync(connection, transaction, executionKey, entry.LeaseToken, 1, 3, now,
+            await UpdateStatusAsync(connection, transaction, request.ExecutionKey, entry.LeaseToken, 1, 3, now,
                 cancellationToken);
             return await CommitAsync(transaction,
                 new IdempotencyAcquireResult(IdempotencyAcquireStatus.OutcomeUnknown), cancellationToken);
@@ -209,9 +248,9 @@ public sealed class SqlServerToolExecutionLedger(
         {
             update.Transaction = transaction;
             update.CommandText = $"UPDATE dbo.{TableName} SET RunId=@runId,LeaseToken=@token,LeaseExpiresAt=@expires,UpdatedAt=@now WHERE ExecutionKey=@key AND Status=0;";
-            AddString(update, "@runId", 128, runId); AddString(update, "@token", 64, renewed);
+            AddString(update, "@runId", 128, request.RunId); AddString(update, "@token", 64, renewed);
             AddDateTimeOffset(update, "@expires", now.Add(leaseDuration)); AddDateTimeOffset(update, "@now", now);
-            AddAnsiString(update, "@key", 64, executionKey); await update.ExecuteNonQueryAsync(cancellationToken);
+            AddAnsiString(update, "@key", 64, request.ExecutionKey); await update.ExecuteNonQueryAsync(cancellationToken);
         }
         return await CommitAsync(transaction,
             new IdempotencyAcquireResult(IdempotencyAcquireStatus.Acquired, renewed), cancellationToken);
@@ -242,6 +281,32 @@ public sealed class SqlServerToolExecutionLedger(
         command.CommandText = $"DELETE FROM dbo.{TableName} WHERE ExecutionKey=@key AND Status=0 AND LeaseToken=@token;";
         AddAnsiString(command, "@key", 64, executionKey); AddString(command, "@token", 64, leaseToken);
         await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    /// <inheritdoc />
+    public async Task<IReadOnlyList<OutcomeUnknownToolExecution>> ListOutcomeUnknownAsync(string tenantId, int limit,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(tenantId);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = await OpenAsync(cancellationToken);
+        await using var command = connection.CreateCommand();
+        command.CommandText = $"""
+            SELECT TOP (@limit) ExecutionKey,TenantId,SubjectId,ToolName,RunId,CreatedAt,UpdatedAt
+            FROM dbo.{TableName}
+            WHERE TenantId=@tenantId AND Status=3
+            ORDER BY UpdatedAt DESC;
+            """;
+        AddInt(command, "@limit", limit);
+        AddString(command, "@tenantId", 128, tenantId);
+        var records = new List<OutcomeUnknownToolExecution>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        while (await reader.ReadAsync(cancellationToken))
+            records.Add(new OutcomeUnknownToolExecution(reader.GetString(0), reader.GetString(1), reader.GetString(2),
+                reader.GetString(3), reader.GetString(4), reader.GetFieldValue<DateTimeOffset>(5),
+                reader.GetFieldValue<DateTimeOffset>(6)));
+        return records;
     }
 
     private async Task TransitionAsync(string executionKey, string leaseToken, int expected, int next,
@@ -279,11 +344,22 @@ public sealed class SqlServerToolExecutionLedger(
                   CREATE TABLE dbo.{TableName}(
                     ExecutionKey char(64) NOT NULL CONSTRAINT PK_{TableName} PRIMARY KEY,
                     RequestFingerprint char(64) NOT NULL,RunId nvarchar(128) NOT NULL,Status tinyint NOT NULL,
+                    TenantId nvarchar(128) NULL,SubjectId nvarchar(256) NULL,ToolName nvarchar(128) NULL,
                     LeaseToken nvarchar(64) NOT NULL,LeaseExpiresAt datetimeoffset(7) NOT NULL,
                     KeyVersion nvarchar(64) NULL,ResultCipher nvarchar(max) NULL,
                     CreatedAt datetimeoffset(7) NOT NULL,UpdatedAt datetimeoffset(7) NOT NULL,RowVersion rowversion NOT NULL);
                   CREATE INDEX IX_{TableName}_StatusUpdated ON dbo.{TableName}(Status,UpdatedAt);
                 END;
+                IF COL_LENGTH(N'dbo.{TableName}',N'TenantId') IS NULL
+                    ALTER TABLE dbo.{TableName} ADD TenantId nvarchar(128) NULL;
+                IF COL_LENGTH(N'dbo.{TableName}',N'SubjectId') IS NULL
+                    ALTER TABLE dbo.{TableName} ADD SubjectId nvarchar(256) NULL;
+                IF COL_LENGTH(N'dbo.{TableName}',N'ToolName') IS NULL
+                    ALTER TABLE dbo.{TableName} ADD ToolName nvarchar(128) NULL;
+                IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.{TableName}')
+                    AND name=N'IX_{TableName}_TenantStatusUpdated')
+                    CREATE INDEX IX_{TableName}_TenantStatusUpdated
+                        ON dbo.{TableName}(TenantId,Status,UpdatedAt DESC);
                 """;
             await command.ExecuteNonQueryAsync(cancellationToken); _initialized = true;
         }
@@ -319,6 +395,15 @@ public sealed class SqlServerToolExecutionLedger(
     private async Task<SqlConnection> OpenAsync(CancellationToken cancellationToken)
     { var connection = new SqlConnection(options.ConnectionString); await connection.OpenAsync(cancellationToken); return connection; }
     private static string Context(string key) => $"tool-execution:{key}";
+    private static void ValidateRequest(ToolExecutionLedgerRequest request)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.ExecutionKey);
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.RequestFingerprint);
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.RunId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.TenantId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.SubjectId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(request.ToolName);
+    }
     private static void AddString(SqlCommand command, string name, int size, string value) => command.Parameters.Add(name, SqlDbType.NVarChar, size).Value = value;
     private static void AddNullableString(SqlCommand command, string name, int size, string? value) => command.Parameters.Add(name, SqlDbType.NVarChar, size).Value = value is null ? DBNull.Value : value;
     private static void AddAnsiString(SqlCommand command, string name, int size, string value) => command.Parameters.Add(name, SqlDbType.Char, size).Value = value;

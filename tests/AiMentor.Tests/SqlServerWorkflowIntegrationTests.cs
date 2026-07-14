@@ -34,6 +34,7 @@ public sealed class SqlServerWorkflowIntegrationTests
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "001_workflow.sql"));
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "002_workflow_key_version.sql"));
             await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "003_tool_execution_ledger.sql"));
+            await ExecuteScriptAsync(testConnection, Path.Combine(repositoryRoot, "deploy", "sql", "004_tool_execution_reconciliation.sql"));
             var clock = new MutableTimeProvider(new DateTimeOffset(2026, 7, 14, 1, 0, 0, TimeSpan.Zero));
             var trace = new InMemoryTraceSink();
             var tool = new MutationTool();
@@ -91,16 +92,21 @@ public sealed class SqlServerWorkflowIntegrationTests
             using var executionLedger = new SqlServerToolExecutionLedger(sqlOptions, rotatedCipher, clock);
             var executionKey = new string('A', 64);
             var fingerprint = new string('B', 64);
-            var executing = await executionLedger.TryAcquireAsync(executionKey, fingerprint, "tool-run-1",
+            var executing = await executionLedger.TryAcquireAsync(new ToolExecutionLedgerRequest(executionKey,
+                    fingerprint, "tool-run-1", "tenant-a", "requester-a", "memory.delete"),
                 TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
             await executionLedger.MarkExecutingAsync(executionKey, executing.LeaseToken!);
             clock.Advance(TimeSpan.FromSeconds(31));
-            var outcomeUnknown = await executionLedger.TryAcquireAsync(executionKey, fingerprint, "tool-run-2",
+            var outcomeUnknown = await executionLedger.TryAcquireAsync(new ToolExecutionLedgerRequest(executionKey,
+                    fingerprint, "tool-run-2", "tenant-a", "requester-a", "memory.delete"),
                 TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
+            var tenantUnknown = await executionLedger.ListOutcomeUnknownAsync("tenant-a", 50);
+            var otherTenantUnknown = await executionLedger.ListOutcomeUnknownAsync("tenant-b", 50);
 
             var completedKey = new string('C', 64);
             using var oldExecutionLedger = new SqlServerToolExecutionLedger(sqlOptions, workflowCipher, clock);
-            var completed = await oldExecutionLedger.TryAcquireAsync(completedKey, new string('D', 64), "tool-run-3",
+            var completed = await oldExecutionLedger.TryAcquireAsync(new ToolExecutionLedgerRequest(completedKey,
+                    new string('D', 64), "tool-run-3", "tenant-a", "requester-a", "memory.delete"),
                 TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
             await oldExecutionLedger.MarkExecutingAsync(completedKey, completed.LeaseToken!);
             await oldExecutionLedger.CompleteAsync(completedKey, completed.LeaseToken!, new ToolExecutionResult(
@@ -110,11 +116,13 @@ public sealed class SqlServerWorkflowIntegrationTests
                 [new TraceStep("tool.completed", "ok", clock.GetUtcNow(),
                     new Dictionary<string, object?> { ["code"] = "TOOL_EXECUTION_SAFE" })]));
             using var rotatingReplayLedger = new SqlServerToolExecutionLedger(sqlOptions, rotatedCipher, clock);
-            var rotatingReplay = await rotatingReplayLedger.TryAcquireAsync(completedKey, new string('D', 64), "tool-run-4",
+            var rotatingReplay = await rotatingReplayLedger.TryAcquireAsync(new ToolExecutionLedgerRequest(completedKey,
+                    new string('D', 64), "tool-run-4", "tenant-a", "requester-a", "memory.delete"),
                 TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
             using var replayLedger = new SqlServerToolExecutionLedger(sqlOptions,
                 new AesGcmWorkflowStateCipher("v2", new Dictionary<string, byte[]> { ["v2"] = nextKey }), clock);
-            var replay = await replayLedger.TryAcquireAsync(completedKey, new string('D', 64), "tool-run-5",
+            var replay = await replayLedger.TryAcquireAsync(new ToolExecutionLedgerRequest(completedKey,
+                    new string('D', 64), "tool-run-5", "tenant-a", "requester-a", "memory.delete"),
                 TimeSpan.FromSeconds(30), TimeSpan.FromHours(1), 100);
             var rawExecutionResult = await ReadExecutionResultAsync(testConnection, completedKey);
 
@@ -131,6 +139,8 @@ public sealed class SqlServerWorkflowIntegrationTests
             Assert.DoesNotContain("secret-memory-id", afterRotation.Payload, StringComparison.Ordinal);
             Assert.DoesNotContain("memoryId", afterRotation.Payload, StringComparison.Ordinal);
             Assert.Equal(IdempotencyAcquireStatus.OutcomeUnknown, outcomeUnknown.Status);
+            Assert.Equal("tenant-a", Assert.Single(tenantUnknown).TenantId);
+            Assert.Empty(otherTenantUnknown);
             Assert.Equal(IdempotencyAcquireStatus.Replay, rotatingReplay.Status);
             Assert.Equal(IdempotencyAcquireStatus.Replay, replay.Status);
             Assert.Equal("tool-run-3", replay.ReplayResult!.RunId);

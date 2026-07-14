@@ -77,7 +77,8 @@ public sealed class SafeToolExecutor(
 
         var requestFingerprint = JsonArgumentFingerprint.Create(tool.Descriptor.Name, normalizedArguments, access);
         var executionKey = CreateExecutionKey(access, tool.Descriptor.Name, normalizedIdempotencyKey!);
-        var acquired = await _executionLedger.TryAcquireAsync(executionKey, requestFingerprint, runId,
+        var acquired = await _executionLedger.TryAcquireAsync(new ToolExecutionLedgerRequest(
+                executionKey, requestFingerprint, runId, access.TenantId, access.SubjectId, tool.Descriptor.Name),
             options.IdempotencyLeaseDuration, options.IdempotencyRetention, options.MaximumIdempotencyEntries,
             cancellationToken);
         if (acquired.Status == IdempotencyAcquireStatus.Replay && acquired.ReplayResult is not null)
