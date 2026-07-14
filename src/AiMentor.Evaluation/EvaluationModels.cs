@@ -64,6 +64,7 @@ public sealed record RetrievedEvidenceObservation(
     string Title,
     string Section,
     string Quote,
+    string ContentSha256,
     double Score,
     string TenantId,
     IReadOnlySet<string> AllowedGroups);

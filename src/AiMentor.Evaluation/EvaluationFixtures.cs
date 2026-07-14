@@ -1,5 +1,7 @@
 using AiMentor.Application;
 using AiMentor.Domain;
+using System.Security.Cryptography;
+using System.Text;
 
 namespace AiMentor.Evaluation;
 
@@ -7,6 +9,28 @@ public interface IEvaluationFixtureRegistry
 {
     Task<EvaluationObservation> ExecuteAsync(EvaluationInput input, IEvaluationTarget target,
         CancellationToken cancellationToken = default);
+}
+
+/// <summary>按受控 Fixture ID 路由到对应执行环境，并对未知 ID 失败关闭。</summary>
+public sealed class RoutingEvaluationFixtureRegistry(
+    IReadOnlyDictionary<string, IEvaluationFixtureRegistry> routes) : IEvaluationFixtureRegistry
+{
+    public async Task<EvaluationObservation> ExecuteAsync(EvaluationInput input, IEvaluationTarget target,
+        CancellationToken cancellationToken = default)
+    {
+        var fixtureId = input.Case.Oracle?.FixtureId;
+        if (fixtureId is null)
+            return (await target.ExecuteAsync(input, cancellationToken)) with { Fixture = null };
+        if (routes.TryGetValue(fixtureId, out var registry))
+            return await registry.ExecuteAsync(input, target, cancellationToken);
+
+        var observation = await target.ExecuteAsync(input, cancellationToken);
+        return observation with
+        {
+            Fixture = new EvaluationFixtureObservation(fixtureId, EvaluationFixtureStatus.VerificationFailed, [],
+                "FIXTURE_NOT_REGISTERED")
+        };
+    }
 }
 
 public sealed record KnowledgeSearchObservation(
@@ -34,7 +58,7 @@ public sealed class RecordingKnowledgeRepository(IKnowledgeRepository inner) : I
         var evidence = await inner.SearchAsync(query, access, limit, cancellationToken);
         capture?.Add(new KnowledgeSearchObservation(query, Snapshot(access), evidence.Count,
             evidence.Select(item => new ExpectedCitation(item.Chunk.DocumentId, item.Chunk.Version))
-                .Distinct().ToArray(), evidence.Select(ToRetrievedEvidence).ToArray()));
+                .Distinct().ToArray(), evidence.Select(ProjectEvidence).ToArray()));
         return evidence;
     }
 
@@ -51,15 +75,18 @@ public sealed class RecordingKnowledgeRepository(IKnowledgeRepository inner) : I
     private static AccessContext Snapshot(AccessContext access) =>
         AccessContext.Create(access.TenantId, access.SubjectId, access.Groups);
 
-    private static RetrievedEvidenceObservation ToRetrievedEvidence(Evidence evidence)
+    internal static RetrievedEvidenceObservation ProjectEvidence(Evidence evidence)
     {
         var chunk = evidence.Chunk;
-        var normalized = string.Join(' ', chunk.Content.Split((char[]?)null,
-            StringSplitOptions.RemoveEmptyEntries));
+        var normalized = NormalizeContent(chunk.Content);
         return new RetrievedEvidenceObservation(chunk.Id, chunk.DocumentId, chunk.Version, chunk.Title, chunk.Section,
-            normalized[..Math.Min(normalized.Length, 220)], Math.Round(evidence.RetrievalScore ?? evidence.Score, 4),
-            chunk.TenantId, new HashSet<string>(chunk.AllowedGroups, StringComparer.OrdinalIgnoreCase));
+            normalized[..Math.Min(normalized.Length, 220)], Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized))),
+            Math.Round(evidence.RetrievalScore ?? evidence.Score, 4), chunk.TenantId,
+            new HashSet<string>(chunk.AllowedGroups, StringComparer.OrdinalIgnoreCase));
     }
+
+    internal static string NormalizeContent(string content) =>
+        string.Join(' ', content.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
 
     internal sealed class CaptureState
     {

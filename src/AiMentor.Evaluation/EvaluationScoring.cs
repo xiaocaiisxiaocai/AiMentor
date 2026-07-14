@@ -133,12 +133,12 @@ public static class EvaluationScorer
         var normalizedAnswer = NormalizeLiteral(observation.Answer);
         var missing = oracle.RequiredClaims.Where(claim => !ClaimMatches(claim, normalizedAnswer)).ToArray();
         var forbidden = oracle.ForbiddenClaims.Where(claim => ClaimMatches(claim, normalizedAnswer)).ToArray();
-        if (missing.Length > 0)
-            return Fail("claims", "REQUIRED_CLAIMS_MISSING",
-                $"缺少必需声明：{string.Join(", ", missing.Select(claim => claim.ClaimId))}。");
         if (forbidden.Length > 0)
             return Fail("claims", "FORBIDDEN_CLAIMS_FOUND",
                 $"命中禁止声明：{string.Join(", ", forbidden.Select(claim => claim.ClaimId))}。");
+        if (missing.Length > 0)
+            return Fail("claims", "REQUIRED_CLAIMS_MISSING",
+                $"缺少必需声明：{string.Join(", ", missing.Select(claim => claim.ClaimId))}。");
         return Pass("claims", "CLAIMS_MATCHED", "必需声明均存在，且未命中禁止声明。");
     }
 

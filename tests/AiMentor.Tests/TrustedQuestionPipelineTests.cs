@@ -46,13 +46,44 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
             Path.Combine(evaluationRoot, "evaluation-critical-v2.jsonl"),
             Path.Combine(evaluationRoot, "evaluation-suite-v2.json"));
 
-        var registry = new KnowledgeAclEvaluationFixtureRegistry(_recordingRepository, _repository, _queryNormalizer,
+        var retrievalRoot = Path.Combine(evaluationRoot, "fixtures", "retrieval-safety", "knowledge");
+        using var retrievalRepository = new MarkdownKnowledgeRepository(retrievalRoot);
+        await retrievalRepository.InitializeAsync();
+        using var retrievalChatClient = new DeterministicGroundedChatClient();
+        var retrievalDefinitions = BuiltInRetrievedContentFixtures.Create();
+        var retrievalSubjects = retrievalDefinitions.Select(item => $"{item.TenantId}\u001f{item.SubjectId}")
+            .ToHashSet(StringComparer.Ordinal);
+        var routingRepository = new EvaluationRoutingKnowledgeRepository(_repository, retrievalRepository,
+            retrievalSubjects);
+        var recordingRepository = new RecordingKnowledgeRepository(routingRepository);
+        var recordingRetrievalSafety = new RecordingRetrievedContentSafetyService(
+            new RuleBasedRetrievedContentSafetyService());
+        var recordingReranker = new RecordingEvidenceReranker(new LexicalEvidenceReranker());
+        var recordingComposer = new RecordingAnswerComposer(new AgentFrameworkAnswerComposer(retrievalChatClient));
+        var targetService = new TrustedQuestionService(recordingRepository, _queryNormalizer,
+            new RuleBasedInputSafetyService(), recordingRetrievalSafety, recordingReranker,
+            new RuleBasedEvidenceSufficiencyEvaluator(), recordingComposer, new RuleBasedOutputSafetyService(),
+            new InMemoryTraceSink(), new TrustedQuestionOptions(), new EmptyMemoryContextProvider());
+        var target = new TrustedQuestionEvaluationTarget(targetService);
+        var aclRegistry = new KnowledgeAclEvaluationFixtureRegistry(recordingRepository, _repository, _queryNormalizer,
             BuiltInEvaluationFixtures.Create());
-        var results = await new EvaluationRunner(new TrustedQuestionEvaluationTarget(_service), registry).RunAsync(cases);
+        var retrievalRegistry = new RetrievedContentSafetyEvaluationFixtureRegistry(
+            recordingRepository, retrievalRepository, _queryNormalizer, recordingRetrievalSafety, recordingReranker,
+            recordingComposer, retrievalDefinitions);
+        var routes = new Dictionary<string, IEvaluationFixtureRegistry>(StringComparer.Ordinal)
+        {
+            [BuiltInEvaluationFixtures.AclRestrictedWebPolicyAllowed] = aclRegistry,
+            [BuiltInEvaluationFixtures.AclRestrictedWebPolicyDenied] = aclRegistry,
+            [BuiltInRetrievedContentFixtures.CleanFixtureId] = retrievalRegistry,
+            [BuiltInRetrievedContentFixtures.MixedFixtureId] = retrievalRegistry
+        };
+
+        var results = await new EvaluationRunner(target,
+            new RoutingEvaluationFixtureRegistry(routes)).RunAsync(cases);
         var report = EvaluationReportBuilder.Build(results);
 
-        Assert.Equal(4, report.Total);
-        Assert.Equal(4, report.Passed);
+        Assert.Equal(6, report.Total);
+        Assert.Equal(6, report.Passed);
         Assert.Equal(1, report.OracleCoverage);
         Assert.True(report.QualityGate.Passed);
     }

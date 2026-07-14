@@ -24,17 +24,47 @@ try
 
     using var repository = new MarkdownKnowledgeRepository(knowledgeRoot);
     await repository.InitializeAsync();
+    var needsRetrievalFixture = cases.Any(item => item.Oracle?.FixtureId is
+        BuiltInRetrievedContentFixtures.CleanFixtureId or BuiltInRetrievedContentFixtures.MixedFixtureId);
+    var retrievalFixtureRoot = Path.Combine(Path.GetDirectoryName(evaluationFile)!, "fixtures", "retrieval-safety",
+        "knowledge");
+    using var retrievalRepository = needsRetrievalFixture ? new MarkdownKnowledgeRepository(retrievalFixtureRoot) : null;
+    if (retrievalRepository is not null) await retrievalRepository.InitializeAsync();
+
     using IChatClient chatClient = new DeterministicGroundedChatClient();
     var queryNormalizer = new RuleBasedQueryNormalizer();
-    var recordingRepository = new RecordingKnowledgeRepository(repository);
+    var retrievalDefinitions = BuiltInRetrievedContentFixtures.Create();
+    var retrievalSubjects = retrievalDefinitions.Select(item => $"{item.TenantId}\u001f{item.SubjectId}")
+        .ToHashSet(StringComparer.Ordinal);
+    var routingRepository = new EvaluationRoutingKnowledgeRepository(repository, retrievalRepository, retrievalSubjects);
+    var recordingRepository = new RecordingKnowledgeRepository(routingRepository);
+    var recordingRetrievalSafety = new RecordingRetrievedContentSafetyService(
+        new RuleBasedRetrievedContentSafetyService());
+    var recordingReranker = new RecordingEvidenceReranker(new LexicalEvidenceReranker());
+    var recordingComposer = new RecordingAnswerComposer(new AgentFrameworkAnswerComposer(chatClient));
     var service = new TrustedQuestionService(recordingRepository, queryNormalizer, new RuleBasedInputSafetyService(),
-        new RuleBasedRetrievedContentSafetyService(),
-        new LexicalEvidenceReranker(), new RuleBasedEvidenceSufficiencyEvaluator(),
-        new AgentFrameworkAnswerComposer(chatClient), new RuleBasedOutputSafetyService(),
+        recordingRetrievalSafety, recordingReranker, new RuleBasedEvidenceSufficiencyEvaluator(),
+        recordingComposer, new RuleBasedOutputSafetyService(),
         new InMemoryTraceSink(), new TrustedQuestionOptions(), new EmptyMemoryContextProvider());
-    var fixtureRegistry = new KnowledgeAclEvaluationFixtureRegistry(recordingRepository, repository, queryNormalizer,
+    var aclFixtureRegistry = new KnowledgeAclEvaluationFixtureRegistry(recordingRepository, repository, queryNormalizer,
         BuiltInEvaluationFixtures.Create());
-    var runner = new EvaluationRunner(new TrustedQuestionEvaluationTarget(service), fixtureRegistry);
+    var fixtureRoutes = new Dictionary<string, IEvaluationFixtureRegistry>(StringComparer.Ordinal)
+    {
+        [BuiltInEvaluationFixtures.AclRestrictedWebPolicyAllowed] = aclFixtureRegistry,
+        [BuiltInEvaluationFixtures.AclRestrictedWebPolicyDenied] = aclFixtureRegistry
+    };
+
+    if (retrievalRepository is not null)
+    {
+        var retrievalFixtureRegistry = new RetrievedContentSafetyEvaluationFixtureRegistry(
+            recordingRepository, retrievalRepository, queryNormalizer, recordingRetrievalSafety, recordingReranker,
+            recordingComposer, retrievalDefinitions);
+        fixtureRoutes[BuiltInRetrievedContentFixtures.CleanFixtureId] = retrievalFixtureRegistry;
+        fixtureRoutes[BuiltInRetrievedContentFixtures.MixedFixtureId] = retrievalFixtureRegistry;
+    }
+
+    var runner = new EvaluationRunner(new TrustedQuestionEvaluationTarget(service),
+        new RoutingEvaluationFixtureRegistry(fixtureRoutes));
     var report = EvaluationReportBuilder.Build(await runner.RunAsync(cases));
 
     Console.WriteLine(JsonSerializer.Serialize(new

@@ -128,7 +128,7 @@ dotnet run --project .\src\AiMentor.Evaluation\AiMentor.Evaluation.csproj -- `
 
 脚本要求 Docker Desktop 已运行，且指定的 SQL 与七个连续 API 端口均可绑定。它真实执行 001–008 迁移，并先验证正向工具的精确强杀窗口；随后创建真实 `memory.correct` 正向操作和加密补偿记录，在补偿账本已提交 `Executing`、快照尚未解密且 `memory.correct.restore` 尚未调用时强杀实例。脚本确认目标记忆仍保持正向值，等待租约过期后由无屏障替代实例通过 `GET /api/v1/tool-compensations?status=OutcomeUnknown` 查询冻结记录，并验证反向重试返回 409。后续仍会完成常规结果不确定探测、跨实例独立审批、第一人复核强杀、两个第二复核实例并发单胜者及 `Reconciled` 滚动回放。脚本不输出数据库密码，失败时保留诊断日志路径，成功后自动删除临时资源。
 
-2026-07-14 的严格测量基线：150 条全部执行，0 条完整通过、72 条失败、78 条 `NotReady`；可判定动作准确率 46.40%，动作 Oracle 覆盖率 83.33%，必需来源 micro recall 79.59%，完整可执行 Oracle 覆盖率 0%，28 条 critical 用例全部阻断，质量门禁正确失败。独立 v2 critical 小套件为 4 Pass / 0 Fail / 0 NotReady，动作、引用和 Oracle 覆盖率均为 100%，门禁退出码 0；其中 `BK-POL-009 v1.2` 使用同一问题的授权/未授权主体实测文档级 ACL。此前的“决策 90%、引用 75%、安全/ACL 100%”使用了宽泛动作兜底、全权限主体和无来源即引用成功等错误口径，已经废止，不能用于版本比较。
+2026-07-14 的严格测量基线：150 条全部执行，0 条完整通过、72 条失败、78 条 `NotReady`；可判定动作准确率 46.40%，动作 Oracle 覆盖率 83.33%，必需来源 micro recall 79.59%，完整可执行 Oracle 覆盖率 0%，28 条 critical 用例全部阻断，质量门禁正确失败。独立 v2 critical 小套件为 6 Pass / 0 Fail / 0 NotReady，动作、引用和 Oracle 覆盖率均为 100%，门禁退出码 0；其中 `BK-POL-009 v1.2` 使用同一问题的授权/未授权主体实测文档级 ACL，隔离 corpus 使用 CLEAN/MIXED 同问配对实测恶意分块召回、隔离及下游不传播。此前的“决策 90%、引用 75%、安全/ACL 100%”使用了宽泛动作兜底、全权限主体和无来源即引用成功等错误口径，已经废止，不能用于版本比较。
 
 评测执行器同时是严格质量门禁：可判定动作准确率不得低于 89%，动作 Oracle 覆盖率和完整 Oracle 覆盖率都必须达到 100%，必需来源 micro recall 不得低于 71%，任一 critical 用例 `Fail` 或 `NotReady` 都会无条件阻断。旧 `expected_behavior` 自由文本只保留给人工迁移，不参与自动通过判定；没有实际恶意文档、工具参数、缓存、撤权或跨用户状态的场景只能标为 `NotReady`。
 
@@ -386,7 +386,7 @@ $env:Authentication__GroupsClaim = 'groups'
 
 ## 下一阶段
 
-1. 继续迁移 critical 题：v2 已收录输入安全两题和 `BK-POL-009` 文档级 ACL 双主体配对；其余题必须先完成更多真实受限资源、实际间接注入、真实工具参数、PII 脱敏、撤权缓存和跨用户记忆状态 Fixture，不得把普通证据不足当作安全正确性证明。
+1. 继续迁移 critical 题：v2 已收录输入安全、`BK-POL-009` 文档级 ACL 双主体及间接注入 CLEAN/MIXED 配对；其余题必须先完成更多真实受限资源、真实工具参数与调用记录、PII 脱敏、撤权缓存和跨用户记忆状态 Fixture，不得把普通证据不足或缺少工具能力当作安全正确性证明。
 2. 为事实题补 `required_claims / forbidden_claims`，为 Workflow、冲突和记忆题补阶段事件、工具调用、状态变化及终态 Oracle；人工签核前不得提升覆盖率。
 3. 接入真实身份提供方做两个主体的有效 Token 端到端验收，并覆盖密钥轮换、过期 Token、错误 audience、组变更和审批人离职场景。
 4. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率、恶意文档隔离率和引用正确率门禁。
@@ -395,7 +395,7 @@ $env:Authentication__GroupsClaim = 'groups'
 
 ## 验证状态
 
-- 2026-07-14 本地自动化测试 167/167 通过；新增严格题集哈希与套件完整性校验、v1/v2 schema 隔离、结构化 Oracle、Runner 侧可信 Fixture Registry、知识检索边界记录、真实输入安全与 ACL 双主体回归、精确引用 provenance、动作一致性、异常观察隔离、critical 阻断，以及 Target 自报 Ready、错误主体、先越权检索后拒绝、其他受限证据夹带、错误资源版本、延迟检索、正文漂移、伪造引用等负向控制。InMemory 与 SQL Server 补偿路径继续覆盖加密快照、职责分离、幂等、结果不确定冻结和双人结案。严格 150 题基线为 0 Pass / 72 Fail / 78 NotReady，动作准确率 46.4%、动作覆盖率 83.33%、必需来源 micro recall 79.59%、完整 Oracle 覆盖率 0%，门禁按预期失败；独立 v2 critical 套件为 4/4 Pass，动作、引用和 Oracle 覆盖率均为 100%，门禁退出码 0；NuGet 直接与传递依赖未发现已知漏洞。
+- 2026-07-14 本地自动化测试 179/179 通过；新增严格题集哈希与套件完整性校验、v1/v2 schema 隔离、结构化 Oracle、Runner 侧可信 Fixture Registry、知识检索/内容安全/重排/回答四边界记录、真实输入安全、ACL 双主体及间接注入 CLEAN/MIXED 回归、精确引用 provenance、critical 阻断，以及 Target 自报 Ready、错误主体、未召回假绿、伪造安全轨迹、接受或错误拒绝恶意块、同 ID 替换正文、重复 Evidence、隔离后继续传播、输出 canary、恶意引用、always-refuse 等负向控制。InMemory 与 SQL Server 补偿路径继续覆盖加密快照、职责分离、幂等、结果不确定冻结和双人结案。严格 150 题基线为 0 Pass / 72 Fail / 78 NotReady，动作准确率 46.4%、动作覆盖率 83.33%、必需来源 micro recall 79.59%、完整 Oracle 覆盖率 0%，门禁按预期失败；独立 v2 critical 套件为 6/6 Pass，动作、引用和 Oracle 覆盖率均为 100%，门禁退出码 0；NuGet 直接与传递依赖未发现已知漏洞。
 - OpenSearch 请求契约已由自动化测试验证：索引映射、搜索管线、批量摄取，以及 BM25/k-NN 两个分支中的租户和 ACL 过滤。
 - 2026-07-13 尝试拉取 `opensearchproject/opensearch:3.5.0` 做真实容器验收，但镜像仓库连续两次无下载进度并超时，未创建镜像或容器。因此真实集群验收尚未通过，网络恢复后必须重新执行 `docker compose up -d` 和 HTTP 闭环。
 - 2026-07-13 首次拉取 SQL Server 镜像曾超时；2026-07-14 网络恢复后已使用 `mcr.microsoft.com/mssql/server:2022-latest` 完成迁移、健康检查、多进程强杀、租约冻结、并发裁决和滚动回放验收。
