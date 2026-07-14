@@ -29,6 +29,16 @@ public interface IToolExecutor
         string? idempotencyKey = null, string? approvalId = null, CancellationToken cancellationToken = default);
 }
 
+/// <summary>
+/// 在持久化账本进入 Executing 后、真实工具产生副作用前提供执行边界。
+/// 默认实现必须立即返回；阻塞实现仅用于受控故障验收，不能承载业务逻辑。
+/// </summary>
+public interface IToolExecutionBarrier
+{
+    Task WaitAfterExecutingAsync(string executionKey, string toolName,
+        CancellationToken cancellationToken = default);
+}
+
 /// <summary>表示幂等执行账本的占位、回放、冲突、忙碌或结果不确定结论。</summary>
 public enum IdempotencyAcquireStatus
 {

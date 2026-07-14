@@ -166,6 +166,27 @@ builder.Services.AddSingleton<IToolApprovalService>(services =>
         ? ActivatorUtilities.CreateInstance<SqlServerToolApprovalService>(services)
         : ActivatorUtilities.CreateInstance<InMemoryToolApprovalService>(services));
 builder.Services.AddSingleton(new ToolExecutorOptions());
+var barrierSignalPath = builder.Configuration["Testing:ToolExecutionBarrier:SignalPath"];
+var barrierReleasePath = builder.Configuration["Testing:ToolExecutionBarrier:ReleasePath"];
+if (builder.Environment.IsEnvironment("Testing")
+    && string.IsNullOrWhiteSpace(barrierSignalPath) != string.IsNullOrWhiteSpace(barrierReleasePath))
+    throw new InvalidOperationException("Testing 工具执行屏障必须同时配置信号文件和释放文件。");
+if (builder.Environment.IsEnvironment("Testing")
+    && !string.IsNullOrWhiteSpace(barrierSignalPath)
+    && !string.IsNullOrWhiteSpace(barrierReleasePath))
+{
+    // 故障注入只能由 Testing 环境显式开启；生产和普通开发环境始终走空屏障。
+    builder.Services.AddSingleton<IToolExecutionBarrier>(new FileToolExecutionBarrier(
+        new FileToolExecutionBarrierOptions
+        {
+            SignalPath = barrierSignalPath,
+            ReleasePath = barrierReleasePath
+        }));
+}
+else
+{
+    builder.Services.AddSingleton<IToolExecutionBarrier>(NoOpToolExecutionBarrier.Instance);
+}
 builder.Services.AddSingleton<IToolExecutor, SafeToolExecutor>();
 builder.Services.AddSingleton(new ToolExecutionReconciliationOptions());
 builder.Services.AddSingleton<IToolOutcomeProbe, MemoryDeleteOutcomeProbe>();

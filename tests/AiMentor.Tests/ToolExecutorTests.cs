@@ -105,6 +105,56 @@ public sealed class ToolExecutorTests
     }
 
     [Fact]
+    public async Task ExecutionBarrierShouldRunAfterLedgerTransitionAndBeforeToolImplementation()
+    {
+        var barrier = new RecordingExecutionBarrier();
+        var executedBeforeBarrier = false;
+        var tool = new FakeTool("stable.barrier-read", ToolOperationRisk.ReadOnly, requiresIdempotencyKey: true,
+            execute: _ =>
+            {
+                executedBeforeBarrier = !barrier.WasReached;
+                return Task.FromResult(JsonSerializer.SerializeToElement(new { ok = true }));
+            });
+
+        var result = await CreateExecutor(tool, barrier: barrier).ExecuteAsync(
+            tool.Descriptor.Name, EmptyArguments, Access, "barrier-order-001");
+
+        Assert.Equal(ToolExecutionStatus.Completed, result.Status);
+        Assert.True(barrier.WasReached);
+        Assert.False(executedBeforeBarrier);
+    }
+
+    [Fact]
+    public async Task FileExecutionBarrierShouldPublishSignalAndWaitForExplicitRelease()
+    {
+        var directory = Path.Combine(Path.GetTempPath(), "aimentor-barrier-" + Guid.NewGuid().ToString("N"));
+        var signalPath = Path.Combine(directory, "executing.signal");
+        var releasePath = Path.Combine(directory, "executing.release");
+        var barrier = new FileToolExecutionBarrier(new FileToolExecutionBarrierOptions
+        {
+            SignalPath = signalPath,
+            ReleasePath = releasePath,
+            PollInterval = TimeSpan.FromMilliseconds(10)
+        });
+
+        try
+        {
+            var waiting = barrier.WaitAfterExecutingAsync(new string('A', 64), "memory.delete");
+            await WaitUntilAsync(() => File.Exists(signalPath), TimeSpan.FromSeconds(2));
+
+            Assert.False(waiting.IsCompleted);
+            Assert.Equal($"{new string('A', 64)}|memory.delete", await File.ReadAllTextAsync(signalPath));
+
+            await File.WriteAllTextAsync(releasePath, string.Empty);
+            await waiting.WaitAsync(TimeSpan.FromSeconds(2));
+        }
+        finally
+        {
+            Directory.Delete(directory, true);
+        }
+    }
+
+    [Fact]
     public async Task IdempotencyKeyShouldRejectDifferentArgumentsInsteadOfReplayingWrongResult()
     {
         var tool = new FakeTool("stable.read", ToolOperationRisk.ReadOnly, requiresIdempotencyKey: true);
@@ -198,14 +248,36 @@ public sealed class ToolExecutorTests
         Assert.Equal(0, tool.ExecutionCount);
     }
 
-    private static SafeToolExecutor CreateExecutor(IServerTool tool, IToolExecutionLedger? ledger = null)
+    private static SafeToolExecutor CreateExecutor(IServerTool tool, IToolExecutionLedger? ledger = null,
+        IToolExecutionBarrier? barrier = null)
     {
         var safety = new RuleBasedToolInvocationSafetyService(new ToolSafetyOptions
         {
             AllowedTools = new HashSet<string>([tool.Descriptor.Name], StringComparer.OrdinalIgnoreCase)
         });
         return new SafeToolExecutor(new ServerToolRegistry([tool]), safety, new InMemoryTraceSink(),
-            new ToolExecutorOptions(), TimeProvider.System, executionLedger: ledger);
+            new ToolExecutorOptions(), TimeProvider.System, executionLedger: ledger, executionBarrier: barrier);
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        using var timeoutSource = new CancellationTokenSource(timeout);
+        while (!condition())
+            await Task.Delay(10, timeoutSource.Token);
+    }
+
+    private sealed class RecordingExecutionBarrier : IToolExecutionBarrier
+    {
+        public bool WasReached { get; private set; }
+
+        public Task WaitAfterExecutingAsync(string executionKey, string toolName,
+            CancellationToken cancellationToken = default)
+        {
+            _ = executionKey;
+            _ = toolName;
+            WasReached = true;
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class OutcomeUnknownLedger : IToolExecutionLedger

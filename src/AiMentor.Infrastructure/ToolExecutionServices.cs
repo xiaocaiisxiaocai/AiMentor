@@ -42,9 +42,11 @@ public sealed class SafeToolExecutor(
     ToolExecutorOptions options,
     TimeProvider timeProvider,
     IToolApprovalService? approvalService = null,
-    IToolExecutionLedger? executionLedger = null) : IToolExecutor
+    IToolExecutionLedger? executionLedger = null,
+    IToolExecutionBarrier? executionBarrier = null) : IToolExecutor
 {
     private readonly IToolExecutionLedger _executionLedger = executionLedger ?? new InMemoryToolExecutionLedger(timeProvider);
+    private readonly IToolExecutionBarrier _executionBarrier = executionBarrier ?? NoOpToolExecutionBarrier.Instance;
 
     public async Task<ToolExecutionResult> ExecuteAsync(string toolName, JsonElement arguments, AccessContext access,
         string? idempotencyKey = null, string? approvalId = null, CancellationToken cancellationToken = default)
@@ -108,6 +110,8 @@ public sealed class SafeToolExecutor(
                 {
                     await _executionLedger.MarkExecutingAsync(executionKey, acquired.LeaseToken, token);
                     sideEffectStarted = true;
+                    // 屏障位于持久化状态变更和真实副作用之间，使进程强杀验收拥有精确窗口。
+                    await _executionBarrier.WaitAfterExecutingAsync(executionKey, tool.Descriptor.Name, token);
                 }, cancellationToken);
             if (!sideEffectStarted)
             {

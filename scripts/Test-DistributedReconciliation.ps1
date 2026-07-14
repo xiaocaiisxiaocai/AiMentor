@@ -55,8 +55,17 @@ function Invoke-Sql([string]$Query, [string]$DatabaseName = 'master') {
     if ($LASTEXITCODE -ne 0) { throw "SQL 命令执行失败，数据库：$DatabaseName" }
 }
 
-function Start-Api([string]$Name, [int]$Port, [string]$SubjectId, [string[]]$Groups) {
-    $env:ASPNETCORE_ENVIRONMENT = 'Development'
+function Invoke-SqlScalar([string]$Query, [string]$DatabaseName = $database) {
+    $output = docker exec -e "SQLCMDPASSWORD=$password" $SqlContainer /opt/mssql-tools18/bin/sqlcmd `
+        -S localhost -U sa -C -b -h -1 -W -d $DatabaseName -Q "SET NOCOUNT ON; $Query"
+    if ($LASTEXITCODE -ne 0) { throw "SQL 标量查询失败，数据库：$DatabaseName" }
+    return (($output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join '').Trim()
+}
+
+function Start-Api([string]$Name, [int]$Port, [string]$SubjectId, [string[]]$Groups,
+    [string]$Environment = 'Development', [string]$BarrierSignalPath = '',
+    [string]$BarrierReleasePath = '') {
+    $env:ASPNETCORE_ENVIRONMENT = $Environment
     $env:Workflow__Provider = 'SqlServer'
     $env:Workflow__InitializeSchema = 'false'
     # 使用构造器处理密码中的分号、引号等保留字符，避免测试脚本产生错误连接字符串。
@@ -77,6 +86,12 @@ function Start-Api([string]$Name, [int]$Port, [string]$SubjectId, [string[]]$Gro
     Remove-Item Env:Authentication__Development__Groups__1 -ErrorAction SilentlyContinue
     for ($index = 0; $index -lt $Groups.Count; $index++) {
         Set-Item "Env:Authentication__Development__Groups__$index" $Groups[$index]
+    }
+    Remove-Item Env:Testing__ToolExecutionBarrier__SignalPath -ErrorAction SilentlyContinue
+    Remove-Item Env:Testing__ToolExecutionBarrier__ReleasePath -ErrorAction SilentlyContinue
+    if (-not [string]::IsNullOrWhiteSpace($BarrierSignalPath)) {
+        $env:Testing__ToolExecutionBarrier__SignalPath = $BarrierSignalPath
+        $env:Testing__ToolExecutionBarrier__ReleasePath = $BarrierReleasePath
     }
     $instanceDirectory = Join-Path $temporaryRoot $Name
     New-Item -ItemType Directory -Path $instanceDirectory -Force | Out-Null
@@ -153,6 +168,60 @@ try {
     $reviewerB = Start-Api 'reviewer-b' ($BasePort + 3) 'reviewer-b' @('tool-reconcilers')
     $reviewerC = Start-Api 'reviewer-c' ($BasePort + 4) 'reviewer-c' @('tool-reconcilers')
 
+    # 仅 Testing 实例启用执行屏障，在 SQL 已持久化 Executing 后、真实工具调用前暴露确定窗口。
+    $barrierDirectory = Join-Path $temporaryRoot 'executing-kill-barrier'
+    New-Item -ItemType Directory -Path $barrierDirectory -Force | Out-Null
+    $barrierSignal = Join-Path $barrierDirectory 'executing.signal'
+    $barrierRelease = Join-Path $barrierDirectory 'executing.release'
+    $crashRequester = Start-Api 'executing-kill-requester' ($BasePort + 5) 'crash-requester-a' @('users') `
+        'Testing' $barrierSignal $barrierRelease
+    $crashArguments = @{ memoryId = 'must-not-run-during-executing-kill'; expectedVersion = 1 }
+    $crashApproval = Send-Request 'POST' "http://127.0.0.1:$($BasePort + 5)/api/v1/tool-approvals" @{
+        toolName = 'memory.delete'; arguments = $crashArguments; justification = '精确 Executing 窗口强杀验收'
+    }
+    Assert-Equal 202 $crashApproval.StatusCode '强杀场景审批申请失败'
+    $crashDecision = Send-Request 'POST' "http://127.0.0.1:$($BasePort + 1)/api/v1/tool-approvals/$($crashApproval.Json.id)/decision" @{
+        approved = $true; reason = '独立批准精确强杀验收'
+    }
+    Assert-Equal 200 $crashDecision.StatusCode '强杀场景审批裁决失败'
+
+    $crashBody = @{
+        arguments = $crashArguments; approvalId = $crashApproval.Json.id
+    } | ConvertTo-Json -Depth 8 -Compress
+    $crashRequest = [System.Net.Http.HttpRequestMessage]::new(
+        [System.Net.Http.HttpMethod]::Post,
+        "http://127.0.0.1:$($BasePort + 5)/api/v1/tools/memory.delete/execute")
+    $null = $crashRequest.Headers.TryAddWithoutValidation('Idempotency-Key', 'distributed-executing-kill-001')
+    $crashRequest.Content = [System.Net.Http.StringContent]::new(
+        $crashBody, [Text.Encoding]::UTF8, 'application/json')
+    $crashTask = $client.SendAsync($crashRequest)
+
+    $signalObserved = $false
+    for ($attempt = 0; $attempt -lt 200; $attempt++) {
+        if (Test-Path -LiteralPath $barrierSignal) { $signalObserved = $true; break }
+        Start-Sleep -Milliseconds 25
+    }
+    if (-not $signalObserved) { throw '未观察到 Executing 屏障信号。' }
+    $signalParts = (Get-Content -LiteralPath $barrierSignal -Raw).Split('|', 2)
+    $crashExecutionKey = $signalParts[0]
+    if ($crashExecutionKey -notmatch '^[A-F0-9]{64}$') { throw '屏障返回的执行键格式无效。' }
+    Assert-Equal '1' (Invoke-SqlScalar "SELECT Status FROM dbo.AiMentorToolExecutions WHERE ExecutionKey='$crashExecutionKey';") `
+        '强杀前 SQL 账本尚未进入 Executing'
+
+    # 不写释放文件，直接终止进程，模拟副作用边界上的节点掉电。
+    Stop-Api $crashRequester
+    $crashRequest.Dispose()
+    Start-Sleep -Seconds 46
+
+    # 替代实例没有故障屏障；过期 Executing 必须被冻结，禁止自动调用 memory.delete。
+    $crashReplacement = Start-Api 'executing-kill-replacement' ($BasePort + 5) 'crash-requester-a' @('users')
+    $crashReplay = Send-Request 'POST' "http://127.0.0.1:$($BasePort + 5)/api/v1/tools/memory.delete/execute" @{
+        arguments = $crashArguments
+    } @{ 'Idempotency-Key' = 'distributed-executing-kill-001' }
+    Assert-Equal 'OutcomeUnknown' $crashReplay.Json.status '过期 Executing 被错误地自动重放'
+    Assert-Equal '3' (Invoke-SqlScalar "SELECT Status FROM dbo.AiMentorToolExecutions WHERE ExecutionKey='$crashExecutionKey';") `
+        '过期 Executing 未冻结为 OutcomeUnknown'
+
     $arguments = @{ memoryId = 'missing-memory-for-distributed-test'; expectedVersion = 1 }
     $approval = Send-Request 'POST' "http://127.0.0.1:$BasePort/api/v1/tool-approvals" @{
         toolName = 'memory.delete'; arguments = $arguments; justification = '分布式故障验收'
@@ -172,8 +241,9 @@ try {
     Stop-Api $requester
     $unknown = Send-Request 'GET' "http://127.0.0.1:$($BasePort + 2)/api/v1/tool-executions/outcome-unknown?limit=10"
     Assert-Equal 200 $unknown.StatusCode '对账列表查询失败'
-    if ($unknown.Json.Count -ne 1) { throw "结果不确定记录数量异常：$($unknown.Json.Count)" }
-    $executionKey = $unknown.Json[0].executionKey
+    $standardUnknown = @($unknown.Json | Where-Object { $_.executionKey -ne $crashExecutionKey })
+    if ($standardUnknown.Count -ne 1) { throw "常规结果不确定记录数量异常：$($standardUnknown.Count)" }
+    $executionKey = $standardUnknown[0].executionKey
 
     $firstReview = Send-Request 'POST' "http://127.0.0.1:$($BasePort + 2)/api/v1/tool-executions/$executionKey/reviews" @{
         arguments = $arguments; confirmed = $true; reason = '第一人确认目标确实不存在'
@@ -210,7 +280,10 @@ try {
 
     [pscustomobject]@{
         Database = $database
-        ApiInstances = 5
+        ConcurrentApiInstances = 6
+        ApiProcessesStarted = 7
+        ExecutingSignalObserved = $signalObserved
+        ExecutingLeaseRecovery = $crashReplay.Json.status
         InitialOutcome = $execution.Json.status
         FirstReview = $firstReview.Json.status
         ConcurrentSecondReviewWinners = $resolved.Count
