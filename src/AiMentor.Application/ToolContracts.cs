@@ -12,6 +12,25 @@ public interface IServerTool
         CancellationToken cancellationToken = default);
 }
 
+/// <summary>
+/// 由明确可逆的修改工具实现补偿契约。补偿状态可能包含敏感旧值，只能进入加密补偿账本，禁止返回 API 或 Trace。
+/// </summary>
+public interface ICompensableServerTool : IServerTool
+{
+    string CompensationToolName { get; }
+    Task<JsonElement> CaptureCompensationStateAsync(ToolExecutionContext context, JsonElement arguments,
+        CancellationToken cancellationToken = default);
+    Task<JsonElement> CompensateAsync(ToolExecutionContext context, JsonElement compensationState,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>由必须人工核对且当前缺少安全反向材料的修改工具显式声明，不允许按名称猜测可逆性。</summary>
+public interface IManualReconciliationServerTool : IServerTool
+{
+    string CompensationUnavailableCode { get; }
+    string CompensationUnavailableExplanation { get; }
+}
+
 /// <summary>向工具传递已验证身份和审计运行标识。</summary>
 public sealed record ToolExecutionContext(AccessContext Access, string RunId);
 
@@ -20,6 +39,23 @@ public interface IToolRegistry
 {
     IReadOnlyList<ToolDescriptor> Descriptors { get; }
     bool TryGet(string toolName, out IServerTool? tool);
+}
+
+/// <summary>区分无需补偿、不可补偿、只能人工核对和已具备完整补偿契约的工具。</summary>
+public enum ToolCompensationCapability { NotApplicable, NotSupported, ManualReconciliation, Compensable }
+
+/// <summary>公开不含工具参数和补偿快照的补偿能力说明。</summary>
+public sealed record ToolCompensationDescriptor(
+    string ToolName,
+    ToolCompensationCapability Capability,
+    string Code,
+    string Explanation,
+    string? CompensationToolName = null);
+
+/// <summary>按服务器工具实现和风险分类给出失败关闭的补偿能力结论。</summary>
+public interface IToolCompensationCatalog
+{
+    bool TryDescribe(string toolName, out ToolCompensationDescriptor? descriptor);
 }
 
 /// <summary>在超时、参数、授权、审批和结果预算门禁内执行注册工具。</summary>

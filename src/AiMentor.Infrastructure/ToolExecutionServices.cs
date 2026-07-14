@@ -21,6 +21,25 @@ public sealed class ServerToolRegistry : IToolRegistry
             // 修改性工具一旦允许重试就可能重复产生副作用，因此注册阶段即强制幂等键约束。
             if (tool.Descriptor.Risk != ToolOperationRisk.ReadOnly && !tool.Descriptor.RequiresIdempotencyKey)
                 throw new InvalidOperationException($"修改性工具必须要求幂等键：{tool.Descriptor.Name}");
+            if (tool is ICompensableServerTool compensable)
+            {
+                if (tool.Descriptor.Risk == ToolOperationRisk.ReadOnly)
+                    throw new InvalidOperationException($"只读工具不得声明补偿契约：{tool.Descriptor.Name}");
+                if (string.IsNullOrWhiteSpace(compensable.CompensationToolName)
+                    || string.Equals(compensable.CompensationToolName, tool.Descriptor.Name,
+                        StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException($"补偿工具必须使用独立且非空的服务器工具名：{tool.Descriptor.Name}");
+            }
+            if (tool is IManualReconciliationServerTool manual)
+            {
+                if (tool.Descriptor.Risk == ToolOperationRisk.ReadOnly)
+                    throw new InvalidOperationException($"只读工具不得声明人工补偿对账：{tool.Descriptor.Name}");
+                if (tool is ICompensableServerTool)
+                    throw new InvalidOperationException($"工具不能同时声明自动补偿和人工补偿对账：{tool.Descriptor.Name}");
+                if (string.IsNullOrWhiteSpace(manual.CompensationUnavailableCode)
+                    || string.IsNullOrWhiteSpace(manual.CompensationUnavailableExplanation))
+                    throw new InvalidOperationException($"人工补偿对账必须提供稳定原因码和说明：{tool.Descriptor.Name}");
+            }
             if (!registered.TryAdd(tool.Descriptor.Name, tool))
                 throw new InvalidOperationException($"服务器工具名称重复：{tool.Descriptor.Name}");
         }
@@ -32,6 +51,47 @@ public sealed class ServerToolRegistry : IToolRegistry
     public IReadOnlyList<ToolDescriptor> Descriptors { get; }
 
     public bool TryGet(string toolName, out IServerTool? tool) => _tools.TryGetValue(toolName, out tool);
+}
+
+/// <summary>
+/// 只发布服务器实现显式声明的补偿能力；未实现任何补偿契约的修改工具默认失败关闭。
+/// </summary>
+public sealed class ToolCompensationCatalog(IToolRegistry registry) : IToolCompensationCatalog
+{
+    public bool TryDescribe(string toolName, out ToolCompensationDescriptor? descriptor)
+    {
+        descriptor = null;
+        if (string.IsNullOrWhiteSpace(toolName) || !registry.TryGet(toolName.Trim(), out var tool) || tool is null)
+            return false;
+
+        if (tool.Descriptor.Risk == ToolOperationRisk.ReadOnly)
+        {
+            descriptor = new ToolCompensationDescriptor(tool.Descriptor.Name,
+                ToolCompensationCapability.NotApplicable, "TOOL_COMPENSATION_NOT_APPLICABLE",
+                "只读工具不产生需要反向补偿的业务副作用。");
+            return true;
+        }
+        if (tool is ICompensableServerTool compensable)
+        {
+            descriptor = new ToolCompensationDescriptor(tool.Descriptor.Name,
+                ToolCompensationCapability.Compensable, "TOOL_COMPENSATION_CONTRACT_AVAILABLE",
+                "工具声明了补偿快照和反向执行契约；实际补偿仍必须经过加密账本、独立审批和幂等执行。",
+                compensable.CompensationToolName);
+            return true;
+        }
+        if (tool is IManualReconciliationServerTool manual)
+        {
+            descriptor = new ToolCompensationDescriptor(tool.Descriptor.Name,
+                ToolCompensationCapability.ManualReconciliation, manual.CompensationUnavailableCode,
+                manual.CompensationUnavailableExplanation);
+            return true;
+        }
+
+        descriptor = new ToolCompensationDescriptor(tool.Descriptor.Name,
+            ToolCompensationCapability.NotSupported, "TOOL_COMPENSATION_NOT_SUPPORTED",
+            "该修改工具尚未实现服务器补偿契约，系统不会提供通用回滚入口。");
+        return true;
+    }
 }
 
 /// <summary>在工具实现运行前后执行身份、风险、参数、超时、幂等和结果大小门禁。</summary>
@@ -324,10 +384,15 @@ public sealed class KnowledgeStatisticsTool(IKnowledgeRepository repository) : I
 /// <summary>
 /// 通过既有记忆工作流删除当前用户的记忆；真正执行前仍需安全执行器消费独立审批。
 /// </summary>
-public sealed class MemoryDeleteTool(IMemoryWorkflowService memoryWorkflow) : IServerTool
+public sealed class MemoryDeleteTool(IMemoryWorkflowService memoryWorkflow) : IManualReconciliationServerTool
 {
     public ToolDescriptor Descriptor { get; } = new("memory.delete", "按标识和预期版本删除当前用户的记忆。",
         ToolOperationRisk.Mutation, TimeSpan.FromSeconds(3), 2 * 1024, true);
+
+    public string CompensationUnavailableCode => "TOOL_COMPENSATION_SOURCE_NOT_RETAINED";
+
+    public string CompensationUnavailableExplanation =>
+        "删除前记忆正文、版本和有效期未进入补偿快照，不能安全自动恢复；必须核对目标状态并人工处置。";
 
     public SafetyDecision ValidateArguments(JsonElement arguments)
     {

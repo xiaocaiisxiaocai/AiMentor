@@ -160,6 +160,7 @@ builder.Services.AddSingleton<IToolInvocationSafetyService, RuleBasedToolInvocat
 builder.Services.AddSingleton<IServerTool, KnowledgeStatisticsTool>();
 builder.Services.AddSingleton<IServerTool, MemoryDeleteTool>();
 builder.Services.AddSingleton<IToolRegistry, ServerToolRegistry>();
+builder.Services.AddSingleton<IToolCompensationCatalog, ToolCompensationCatalog>();
 builder.Services.AddSingleton(new ToolApprovalOptions());
 builder.Services.AddSingleton<IToolApprovalService>(services =>
     string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase)
@@ -346,6 +347,17 @@ tools.MapGet("/", (IToolRegistry registry) => Results.Ok(registry.Descriptors))
     .WithName("ListToolsV1")
     .WithSummary("列出服务器注册的工具及其服务端风险配置")
     .Produces<IReadOnlyList<ToolDescriptor>>()
+    .RequireRateLimiting("questions");
+tools.MapGet("/{toolName}/compensation", (string toolName, IToolCompensationCatalog catalog) =>
+        catalog.TryDescribe(toolName, out var descriptor)
+            ? Results.Ok(descriptor)
+            : Results.Problem(statusCode: StatusCodes.Status404NotFound, title: "工具不存在",
+                detail: "请求的工具未在服务器注册表中。",
+                extensions: new Dictionary<string, object?> { ["code"] = "TOOL_NOT_REGISTERED" }))
+    .WithName("DescribeToolCompensationV1")
+    .WithSummary("查询服务器对指定工具可证明的补偿能力和安全边界")
+    .Produces<ToolCompensationDescriptor>()
+    .ProducesProblem(StatusCodes.Status404NotFound)
     .RequireRateLimiting("questions");
 tools.MapPost("/{toolName}/execute", ExecuteToolAsync)
     .WithName("ExecuteToolV1")
