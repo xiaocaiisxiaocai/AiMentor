@@ -7,6 +7,7 @@ using Xunit.Sdk;
 
 namespace AiMentor.Tests;
 
+[Trait("Category", "RequiresSqlServer")]
 public sealed class SqlServerOperationsActionStoreTests
 {
     [Fact]

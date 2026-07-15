@@ -16,6 +16,7 @@ public sealed class LinuxContainerCiTests
         Assert.Contains("job.services.sqlserver.id", workflow, StringComparison.Ordinal);
         Assert.Contains("SqlServerAtlasIncidentStoreTests", workflow, StringComparison.Ordinal);
         Assert.Contains("SqlServerOperationsActionStoreTests", workflow, StringComparison.Ordinal);
+        Assert.Contains("Category!=RequiresSqlServer", workflow, StringComparison.Ordinal);
         Assert.Contains("Test-DistributedReconciliation.ps1", workflow, StringComparison.Ordinal);
         Assert.Contains("-Configuration Release", workflow, StringComparison.Ordinal);
         Assert.Contains("Test-OpenSearchContainerAcceptance.ps1 -PullImage", workflow, StringComparison.Ordinal);

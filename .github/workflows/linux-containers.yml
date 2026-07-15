@@ -34,7 +34,10 @@ jobs:
       - name: Build
         run: dotnet build AiMentor.slnx --configuration Release --no-restore
       - name: Test
-        run: dotnet test AiMentor.slnx --configuration Release --no-build --logger "console;verbosity=normal"
+        run: >-
+          dotnet test AiMentor.slnx --configuration Release --no-build
+          --filter "Category!=RequiresSqlServer"
+          --logger "console;verbosity=normal"
       - name: Verify critical quality gate
         run: >-
           dotnet run --project src/AiMentor.Evaluation/AiMentor.Evaluation.csproj

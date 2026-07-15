@@ -456,11 +456,11 @@ $env:AIMENTOR_OIDC_TOKEN_B = '<subject-b-token>'
 
 Linux 容器门禁位于 `.github/workflows/linux-containers.yml`，在 PR、`main` 推送和手工触发时执行三个独立任务：
 
-- Ubuntu Release 构建和全量自动化测试；
+- Ubuntu Release 构建和除外部 SQL 分类外的 266 条自动化测试；
 - SQL Server 2022 service container 上的 Atlas 加密、租约强杀恢复、多实例补偿审批/执行单胜者、对账、Atlas 持久恢复和运营任务队列脱敏验收；
 - OpenSearch 3.5.0 真实容器上的双物理索引、Alias 发布/查询/切换和回滚验收。
 
-SQL job 使用 GitHub Actions 的动态宿主端口和 service container ID，不依赖 Windows LocalDB。`SqlServerAtlasIncidentStoreTests` 仅在显式提供 `AIMENTOR_SQLSERVER_TEST_CONNECTION` 时使用外部 SQL；一旦显式配置，连接、迁移或断言失败都会让门禁失败，不会退回跳过。分布式入口支持 Release：
+SQL job 使用 GitHub Actions 的动态宿主端口和 service container ID，不依赖 Windows LocalDB。三个 `RequiresSqlServer` 测试从通用 Linux job 显式排除，再在 SQL job 中通过 `AIMENTOR_SQLSERVER_TEST_CONNECTION` 全部真实执行；一旦显式配置，连接、迁移或断言失败都会让门禁失败，不会退回跳过。分布式入口支持 Release：
 
 ```powershell
 ./scripts/Test-DistributedReconciliation.ps1 `
@@ -476,7 +476,7 @@ SQL job 使用 GitHub Actions 的动态宿主端口和 service container ID，�
 ## 验证状态
 
 - 2026-07-15 本地自动化测试 269/269 通过；独立 v2 critical 套件为 16/16 Pass，动作、引用和 Oracle 覆盖率均为 100%。OIDC discovery/JWKS 与 Provider Chat/Embedding/Reranker 均有独立进程网络验收；运营动作的双人复核、SLA 升级、最小权限审计、SQL 持久化、并发单胜者和硬崩溃冻结已加入回归。真实 SQL Server 2022 分布式验收通过 Atlas 恢复、运营队列脱敏以及补偿审批/执行并发单胜者。
-- 2026-07-15 已恢复 Docker Desktop Linux Engine，并修复“只启动 OpenSearch 也被 SQL profile 密码插值阻断”的 Compose 回归；`opensearchproject/opensearch:3.5.0` 经官方仓库及官方 Public ECR 拉取仍遭遇有界超时，未产生镜像和容器，真实集群验收保持 `NotReady`。拉取超时现在会树级终止进程，且不落盘或回显 Registry/代理错误；事后无残留进程、临时日志或容器。
+- 2026-07-15 本机从官方仓库及 Public ECR 拉取 `opensearchproject/opensearch:3.5.0` 仍有界超时，因此本机路径保持 `NotReady`；同日 GitHub Ubuntu 容器门禁运行 `29391464970` 已真实通过固定 3.5.0 的 mapping、bulk、count、Alias 发布/查询/切换和回滚。拉取超时会树级终止进程，且不落盘或回显 Registry/代理错误；本机事后无残留进程、临时日志或容器。
 
 - 2026-07-14 本地自动化测试 179/179 通过；新增严格题集哈希与套件完整性校验、v1/v2 schema 隔离、结构化 Oracle、Runner 侧可信 Fixture Registry、知识检索/内容安全/重排/回答四边界记录、真实输入安全、ACL 双主体及间接注入 CLEAN/MIXED 回归、精确引用 provenance、critical 阻断，以及 Target 自报 Ready、错误主体、未召回假绿、伪造安全轨迹、接受或错误拒绝恶意块、同 ID 替换正文、重复 Evidence、隔离后继续传播、输出 canary、恶意引用、always-refuse 等负向控制。InMemory 与 SQL Server 补偿路径继续覆盖加密快照、职责分离、幂等、结果不确定冻结和双人结案。严格 150 题基线为 0 Pass / 72 Fail / 78 NotReady，动作准确率 46.4%、动作覆盖率 83.33%、必需来源 micro recall 79.59%、完整 Oracle 覆盖率 0%，门禁按预期失败；独立 v2 critical 套件为 6/6 Pass，动作、引用和 Oracle 覆盖率均为 100%，门禁退出码 0；NuGet 直接与传递依赖未发现已知漏洞。
 - OpenSearch 请求契约已由自动化测试验证：索引映射、搜索管线、批量摄取，以及 BM25/k-NN 两个分支中的租户和 ACL 过滤。
