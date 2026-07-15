@@ -5,16 +5,18 @@ param(
     [Parameter(Mandatory = $true)][int]$ExpectedDimensions,
     [string]$CurrentAlias = 'aimentor-knowledge-current',
     [string]$PreviousAlias = 'aimentor-knowledge-previous',
-    [string]$ManifestPath = 'opensearch-index-manifest.json'
+    [string]$ManifestPath = 'opensearch-index-manifest.json',
+    [ValidateRange(1, 300)][int]$HttpTimeoutSeconds = 30
 )
 $ErrorActionPreference = 'Stop'
 $base = $Endpoint.TrimEnd('/')
-$count = Invoke-RestMethod "$base/$PhysicalIndex/_count"
+$http = @{ TimeoutSec = $HttpTimeoutSeconds }
+$count = Invoke-RestMethod "$base/$PhysicalIndex/_count" @http
 if ($count.count -ne $ExpectedChunks) { throw 'OPENSEARCH_PUBLISH_COUNT_MISMATCH' }
-$mapping = Invoke-RestMethod "$base/$PhysicalIndex/_mapping"
+$mapping = Invoke-RestMethod "$base/$PhysicalIndex/_mapping" @http
 $dimensions = $mapping.$PhysicalIndex.mappings.properties.embedding.dimension
 if ($dimensions -ne $ExpectedDimensions) { throw 'OPENSEARCH_PUBLISH_DIMENSION_MISMATCH' }
-try { $aliases = Invoke-RestMethod "$base/_alias" } catch {
+try { $aliases = Invoke-RestMethod "$base/_alias" @http } catch {
     if ($_.Exception.Response.StatusCode.value__ -ne 404) { throw }
     $aliases = [pscustomobject]@{}
 }
@@ -30,7 +32,7 @@ foreach ($property in $aliases.psobject.Properties) {
 }
 $actions.Add(@{ add = @{ index = $PhysicalIndex; alias = $CurrentAlias } })
 # OpenSearch 在一次 _aliases 请求中原子提交全部 remove/add，失败时旧读路径保持不变。
-Invoke-RestMethod "$base/_aliases" -Method Post -ContentType 'application/json' `
+Invoke-RestMethod "$base/_aliases" -Method Post -ContentType 'application/json' @http `
     -Body (@{ actions = $actions } | ConvertTo-Json -Depth 8) | Out-Null
 @{
     schemaVersion = '1'; physicalIndex = $PhysicalIndex; expectedChunks = $ExpectedChunks

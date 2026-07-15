@@ -8,6 +8,8 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/AiMentor.AtlasCrashHelper/AiMentor.AtlasCrashHelper.csproj" />
+    <Project Path="tests/AiMentor.OidcHttpFixture/AiMentor.OidcHttpFixture.csproj" />
+    <Project Path="tests/AiMentor.ProviderHttpFixture/AiMentor.ProviderHttpFixture.csproj" />
     <Project Path="tests/AiMentor.Tests/AiMentor.Tests.csproj" />
   </Folder>
 </Solution>

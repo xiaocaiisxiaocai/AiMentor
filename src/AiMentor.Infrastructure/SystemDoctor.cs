@@ -9,6 +9,7 @@ public record SystemDoctorOptions
     public bool LegacyApiEnabled { get; init; }
     public string AuthenticationMode { get; init; } = "Development";
     public string? AuthenticationAuthority { get; init; }
+    public bool AuthenticationRequireHttpsMetadata { get; init; } = true;
     public bool AuthenticationAudienceConfigured { get; init; }
     public bool SubjectClaimConfigured { get; init; }
     public bool TenantClaimConfigured { get; init; }
@@ -71,11 +72,13 @@ public sealed class SystemDoctor(SystemDoctorOptions options, TimeProvider timeP
         if (oidc)
         {
             var validAuthority = Uri.TryCreate(options.AuthenticationAuthority, UriKind.Absolute, out var authority)
-                && authority.Scheme == Uri.UriSchemeHttps;
+                && (authority.Scheme == Uri.UriSchemeHttps || authority.Scheme == Uri.UriSchemeHttp)
+                && (authority.Scheme == Uri.UriSchemeHttps
+                    || !options.IsProduction && !options.AuthenticationRequireHttpsMetadata && authority.IsLoopback);
             AddBoolean(checks, "authentication.oidc", validAuthority && options.AuthenticationAudienceConfigured
                 && options.SubjectClaimConfigured && options.TenantClaimConfigured,
-                "AUTH_OIDC_VALID", "AUTH_OIDC_CONFIGURATION_INVALID", "OIDC 配置完整且使用 HTTPS。",
-                "OIDC Authority、Audience 或必要身份 Claim 配置无效。");
+                "AUTH_OIDC_VALID", "AUTH_OIDC_CONFIGURATION_INVALID", "OIDC 配置完整且传输策略满足环境要求。",
+                "OIDC Authority、metadata HTTPS/loopback 策略、Audience 或必要身份 Claim 配置无效。");
         }
         if (options.IsProduction && options.LegacyApiEnabled)
             AddFailure(checks, "api.legacy", "LEGACY_API_PRODUCTION_ENABLED", "生产环境不得启用旧版 API。");

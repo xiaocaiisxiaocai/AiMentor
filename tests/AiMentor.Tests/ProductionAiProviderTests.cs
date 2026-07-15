@@ -27,6 +27,30 @@ public sealed class ProductionAiProviderTests
     }
 
     [Fact]
+    public void InsecureProtocolAcceptanceMustBeExplicitAndLoopbackOnly()
+    {
+        var missingOptIn = Assert.Throws<AiProviderConfigurationException>(() => AiProviderFactory.CreateChat(new()
+        {
+            Provider = AiProviderKind.OpenAI, Endpoint = "http://127.0.0.1:5123", ApiKey = "secret", Model = "model"
+        }));
+        Assert.Equal("AI_ENDPOINT_HTTPS_REQUIRED", missingOptIn.Code);
+
+        var nonLoopback = Assert.Throws<AiProviderConfigurationException>(() => AiProviderFactory.CreateChat(new()
+        {
+            Provider = AiProviderKind.OpenAI, Endpoint = "http://api.example", ApiKey = "secret", Model = "model",
+            AllowInsecureLoopback = true
+        }));
+        Assert.Equal("AI_ENDPOINT_HTTPS_REQUIRED", nonLoopback.Code);
+
+        using var accepted = AiProviderFactory.CreateChat(new ModelProviderOptions
+        {
+            Provider = AiProviderKind.OpenAI, Endpoint = "http://127.0.0.1:5123", ApiKey = "secret", Model = "model",
+            AllowInsecureLoopback = true
+        }, new StaticHandler("{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"));
+        Assert.NotNull(accepted);
+    }
+
+    [Fact]
     public async Task ChatRetriesBounded429AndDoesNotExposeApiKeyInBody()
     {
         var handler = new SequenceHandler(HttpStatusCode.TooManyRequests, HttpStatusCode.InternalServerError,

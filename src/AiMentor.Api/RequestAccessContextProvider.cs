@@ -10,6 +10,8 @@ public sealed class AiMentorAuthenticationOptions
     public string Mode { get; init; } = "Development";
     public string? Authority { get; init; }
     public string? Audience { get; init; }
+    public bool RequireHttpsMetadata { get; init; } = true;
+    public int RefreshIntervalSeconds { get; init; } = 300;
     public string SubjectClaim { get; init; } = "sub";
     public string TenantClaim { get; init; } = "tenant_id";
     public string GroupsClaim { get; init; } = "groups";

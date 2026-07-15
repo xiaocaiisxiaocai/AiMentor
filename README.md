@@ -119,6 +119,24 @@ dotnet run --project .\src\AiMentor.Evaluation\AiMentor.Evaluation.csproj -- `
 `AIMENTOR_EVALUATION_MODEL_ID` 和 `AIMENTOR_EVALUATION_MODEL_API_KEY` 显式启用同题集真实模型对比。
 启用真实提供方但缺少密钥时评测返回 `NotReady` 和退出码 `2`，不会回退确定性模型制造伪成功。
 
+在没有供应商凭据时，可以先运行独立进程 HTTP 协议验收：
+
+```powershell
+.\scripts\Test-ProviderHttpAcceptance.ps1
+```
+
+脚本真实监听 OpenAI-compatible Chat、Embedding 和 HTTP Reranker 端点，再以子进程运行同一
+`AiMentor.Evaluation --compare`。成功路径会让三个端点各返回一次 `429` 后恢复；永久 `503` 路径必须将
+16 条候选结果全部报告为 `NotReady`，不得回退沙箱。两份 JSON 报告只包含 CaseId、判定、延迟和提供方
+元数据，脚本还会检查密钥、PII、Credential 及注入 Canary 不在报告中。Fixture 只证明生产适配器经过
+真实网络和序列化边界，不代表任何真实供应商的回答、Embedding 或 Reranker 质量。
+Chat 与 Embedding 的字段按官方 [Chat Completions](https://developers.openai.com/api/reference/resources/chat)
+和 [Embeddings](https://developers.openai.com/api/reference/resources/embeddings) 契约实现；`429` 使用有界退避，
+遵循官方 [Rate limits](https://developers.openai.com/api/docs/guides/rate-limits) 的有限重试建议。
+
+`AIMENTOR_EVALUATION_ALLOW_INSECURE_LOOPBACK=true` 仅用于该本机进程验收；实现同时要求 Endpoint 是
+回环地址。真实供应商和非回环地址仍强制 HTTPS，不能用此开关放宽生产传输安全。
+
 API 的 `Model`、`Embedding`、`Reranker` 配置分别选择 `Deterministic/OpenAI/AzureOpenAI`、
 `Deterministic/OpenAI/AzureOpenAI` 和 `Lexical/HttpSemantic`。真实提供方要求 HTTPS Endpoint、模型标识和
 仅由环境变量或 Secret 配置源提供的 API Key。Embedding 的 `Dimensions` 与 `IndexVersion` 必须和
@@ -159,6 +177,16 @@ dotnet run --project .\src\AiMentor.Api\AiMentor.Api.csproj --urls http://127.0.
 ```
 
 首次启动会创建 `aimentor-knowledge-v1` 索引、`aimentor-hybrid-v1` 搜索管线，并幂等写入 74 个分块。默认权重为 BM25 0.45、向量 0.55。开发环境使用确定性特征哈希嵌入，只用于打通链路；生产环境必须将 `ITextEmbeddingGenerator` 替换为经过评测的中文/多语言嵌入模型。
+
+可用以下入口对固定版本 OpenSearch 3.5.0 执行真实容器闭环：
+
+```powershell
+.\scripts\Test-OpenSearchContainerAcceptance.ps1 -PullImage
+```
+
+脚本以两个不可变物理索引真实验证 mapping、count、bulk、Alias 发布/查询/切换和回滚；退出码 `0` 为通过，
+`2` 为 Docker、镜像或集群未就绪，`1` 为协议或生命周期失败。镜像拉取与所有 HTTP 请求都有界超时，失败输出
+不包含 Registry、代理或认证错误正文。
 
 若 OpenSearch 开启安全插件，通过 `AIMENTOR_OPENSEARCH_USERNAME` 和 `AIMENTOR_OPENSEARCH_PASSWORD` 注入凭证，不应把密码写入 `appsettings.json`。客户端不允许关闭 TLS 证书校验。
 
@@ -386,6 +414,8 @@ OIDC/JWT 生产配置应通过环境变量或机密配置注入：
 $env:Authentication__Mode = 'OidcJwt'
 $env:Authentication__Authority = 'https://identity.example.com'
 $env:Authentication__Audience = 'aimentor-api'
+$env:Authentication__RequireHttpsMetadata = 'true'
+$env:Authentication__RefreshIntervalSeconds = '300'
 $env:Authentication__SubjectClaim = 'sub'
 $env:Authentication__TenantClaim = 'tenant_id'
 $env:Authentication__GroupsClaim = 'groups'
@@ -394,6 +424,14 @@ $env:Authentication__GroupsClaim = 'groups'
 调用时添加 `Authorization: Bearer <access-token>`。OIDC JWT 模式生成的 OpenAPI 会声明 Bearer 安全方案，并只给受保护的 v1 端点添加安全要求；健康检查保持匿名可用。
 
 OIDC 使用方必须明确自包含 JWT 的撤权窗口：服务校验签名、Issuer、Audience、有效期和唯一的主体/租户声明，并在未知 `kid` 时请求刷新 JWKS；但已经签发且仍在有效期内的 Token 不会因用户撤组或禁用而被本服务即时撤销。默认承诺是新 Token 立即反映权限变化，旧 Token 最长仍可使用其剩余 TTL 加 1 分钟 `ClockSkew`。需要即时撤权时必须由身份提供方提供 introspection、CAE 或等价机制，并在接入前另行实现和验收。
+
+无需外部账号即可先运行独立进程 OIDC 协议验收：
+
+```powershell
+.\scripts\Test-OidcHttpAcceptance.ps1
+```
+
+脚本分别启动临时 OIDC Provider 和真实 API 进程，让 JwtBearer 通过网络读取 discovery/JWKS，验证双主体隔离、Issuer/Audience/有效期、歧义主体、撤组新旧 Token 边界和 `kid` 轮换刷新。临时 HTTP metadata 只允许在非生产环境同时显式设置 `RequireHttpsMetadata=false` 且 Authority 为 loopback；Production 和所有非回环地址始终强制 HTTPS。Fixture 证明协议链和安全边界，不代表外部 IdP 已完成上线验收。
 
 真实双主体 OIDC 验收是显式 opt-in，不把缺少凭据算作成功：
 
@@ -424,8 +462,8 @@ $env:AIMENTOR_OIDC_TOKEN_B = '<subject-b-token>'
 
 ## 验证状态
 
-- 2026-07-15 本地自动化测试 249/249 通过；独立 v2 critical 套件扩展为 16/16 Pass，动作、引用和 Oracle 覆盖率均为 100%。PII Transform、跨用户记忆、工具精确参数/重放/过期、SQL Atlas 强杀恢复、OIDC/JWKS、Provider 配对、OpenSearch Alias 生命周期及运营任务脱敏均有自动化回归。
-- 2026-07-15 已恢复 Docker Desktop Linux Engine，并修复“只启动 OpenSearch 也被 SQL profile 密码插值阻断”的 Compose 回归；随后 `opensearchproject/opensearch:3.5.0` 镜像拉取持续无进度，真实集群验收仍为 `NotReady`。没有把 HTTP 契约测试描述为真实集群通过。
+- 2026-07-15 本地自动化测试 256/256 通过；独立 v2 critical 套件为 16/16 Pass，动作、引用和 Oracle 覆盖率均为 100%。OIDC discovery/JWKS 与 Provider Chat/Embedding/Reranker 均增加独立进程网络验收；PII Transform、跨用户记忆、工具精确参数/重放/过期、SQL Atlas 强杀恢复、OpenSearch Alias 生命周期及运营任务脱敏均有自动化回归。
+- 2026-07-15 已恢复 Docker Desktop Linux Engine，并修复“只启动 OpenSearch 也被 SQL profile 密码插值阻断”的 Compose 回归；`opensearchproject/opensearch:3.5.0` 经官方仓库及备用入口拉取仍遭遇超时、EOF、TLS 或限流，未产生镜像和容器，真实集群验收保持 `NotReady`。缺镜像负向入口已验证稳定返回退出码 `2`，没有把 HTTP 契约测试描述为真实集群通过。
 
 - 2026-07-14 本地自动化测试 179/179 通过；新增严格题集哈希与套件完整性校验、v1/v2 schema 隔离、结构化 Oracle、Runner 侧可信 Fixture Registry、知识检索/内容安全/重排/回答四边界记录、真实输入安全、ACL 双主体及间接注入 CLEAN/MIXED 回归、精确引用 provenance、critical 阻断，以及 Target 自报 Ready、错误主体、未召回假绿、伪造安全轨迹、接受或错误拒绝恶意块、同 ID 替换正文、重复 Evidence、隔离后继续传播、输出 canary、恶意引用、always-refuse 等负向控制。InMemory 与 SQL Server 补偿路径继续覆盖加密快照、职责分离、幂等、结果不确定冻结和双人结案。严格 150 题基线为 0 Pass / 72 Fail / 78 NotReady，动作准确率 46.4%、动作覆盖率 83.33%、必需来源 micro recall 79.59%、完整 Oracle 覆盖率 0%，门禁按预期失败；独立 v2 critical 套件为 6/6 Pass，动作、引用和 Oracle 覆盖率均为 100%，门禁退出码 0；NuGet 直接与传递依赖未发现已知漏洞。
 - OpenSearch 请求契约已由自动化测试验证：索引映射、搜索管线、批量摄取，以及 BM25/k-NN 两个分支中的租户和 ACL 过滤。

@@ -125,6 +125,26 @@ public sealed class SystemDoctorTests
         Assert.Contains(report.Checks, item => item.Status == SystemCheckStatus.Warning);
     }
 
+    [Fact]
+    public async Task LoopbackHttpOidcIsAcceptedOnlyOutsideProductionWithExplicitOptIn()
+    {
+        var development = ProductionOptions() with
+        {
+            IsProduction = false,
+            AuthenticationAuthority = "http://127.0.0.1:5100",
+            AuthenticationRequireHttpsMetadata = false
+        };
+        Assert.True((await RunAsync(development)).IsReady);
+
+        var production = development with { IsProduction = true };
+        var report = await RunAsync(production);
+        Assert.False(report.IsReady);
+        Assert.Contains(report.Checks, item => item.Code == "AUTH_OIDC_CONFIGURATION_INVALID");
+
+        var remoteHttp = development with { AuthenticationAuthority = "http://identity.internal:5100" };
+        Assert.False((await RunAsync(remoteHttp)).IsReady);
+    }
+
     private static Task<SystemDiagnosticReport> RunAsync(SystemDoctorOptions options) =>
         new SystemDoctor(options, TimeProvider.System).RunAsync();
 
@@ -133,6 +153,7 @@ public sealed class SystemDoctorTests
         IsProduction = true,
         AuthenticationMode = "OidcJwt",
         AuthenticationAuthority = "https://identity.example",
+        AuthenticationRequireHttpsMetadata = true,
         AuthenticationAudienceConfigured = true,
         SubjectClaimConfigured = true,
         TenantClaimConfigured = true,

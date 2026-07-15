@@ -1,11 +1,13 @@
 param(
     [Parameter(Mandatory = $true)][string]$Endpoint,
     [string]$CurrentAlias = 'aimentor-knowledge-current',
-    [string]$PreviousAlias = 'aimentor-knowledge-previous'
+    [string]$PreviousAlias = 'aimentor-knowledge-previous',
+    [ValidateRange(1, 300)][int]$HttpTimeoutSeconds = 30
 )
 $ErrorActionPreference = 'Stop'
 $base = $Endpoint.TrimEnd('/')
-$aliases = Invoke-RestMethod "$base/_alias"
+$http = @{ TimeoutSec = $HttpTimeoutSeconds }
+$aliases = Invoke-RestMethod "$base/_alias" @http
 $current = $null
 $previous = $null
 foreach ($property in $aliases.psobject.Properties) {
@@ -19,5 +21,5 @@ $actions = @(
     @{ add = @{ index = $previous; alias = $CurrentAlias } }
     @{ add = @{ index = $current; alias = $PreviousAlias } }
 )
-Invoke-RestMethod "$base/_aliases" -Method Post -ContentType 'application/json' `
+Invoke-RestMethod "$base/_aliases" -Method Post -ContentType 'application/json' @http `
     -Body (@{ actions = $actions } | ConvertTo-Json -Depth 8) | Out-Null

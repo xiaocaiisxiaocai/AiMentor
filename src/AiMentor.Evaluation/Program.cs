@@ -124,7 +124,10 @@ static ModelProviderOptions RemoteOptions(string component)
     {
         Provider = provider, Endpoint = Environment.GetEnvironmentVariable(prefix + "ENDPOINT"),
         ApiKey = Environment.GetEnvironmentVariable(prefix + "API_KEY"),
-        Model = Environment.GetEnvironmentVariable(prefix + "ID"), TimeoutSeconds = 30, MaximumRetries = 2
+        Model = Environment.GetEnvironmentVariable(prefix + "ID"), TimeoutSeconds = 30, MaximumRetries = 2,
+        AllowInsecureLoopback = string.Equals(
+            Environment.GetEnvironmentVariable("AIMENTOR_EVALUATION_ALLOW_INSECURE_LOOPBACK"), "true",
+            StringComparison.OrdinalIgnoreCase)
     };
 }
 
@@ -135,6 +138,7 @@ static EmbeddingProviderOptions RemoteEmbeddingOptions()
     {
         Provider = raw.Provider, Endpoint = raw.Endpoint, ApiKey = raw.ApiKey, Model = raw.Model,
         TimeoutSeconds = raw.TimeoutSeconds, MaximumRetries = raw.MaximumRetries,
+        AllowInsecureLoopback = raw.AllowInsecureLoopback,
         Dimensions = ParsePositiveInt("AIMENTOR_EVALUATION_EMBEDDING_DIMENSIONS"),
         IndexVersion = Environment.GetEnvironmentVariable("AIMENTOR_EVALUATION_EMBEDDING_INDEX_VERSION")
                        ?? throw new AiProviderConfigurationException("EVALUATION_PROVIDER_CONFIGURATION_MISSING",
@@ -148,7 +152,8 @@ static RerankerProviderOptions RemoteRerankerOptions()
     return new RerankerProviderOptions
     {
         Provider = raw.Provider, Endpoint = raw.Endpoint, ApiKey = raw.ApiKey, Model = raw.Model,
-        TimeoutSeconds = raw.TimeoutSeconds, MaximumRetries = raw.MaximumRetries
+        TimeoutSeconds = raw.TimeoutSeconds, MaximumRetries = raw.MaximumRetries,
+        AllowInsecureLoopback = raw.AllowInsecureLoopback
     };
 }
 

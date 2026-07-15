@@ -29,6 +29,8 @@ var authenticationOptions = new AiMentorAuthenticationOptions
     Mode = builder.Configuration["Authentication:Mode"] ?? "Development",
     Authority = builder.Configuration["Authentication:Authority"],
     Audience = builder.Configuration["Authentication:Audience"],
+    RequireHttpsMetadata = builder.Configuration.GetValue("Authentication:RequireHttpsMetadata", true),
+    RefreshIntervalSeconds = builder.Configuration.GetValue("Authentication:RefreshIntervalSeconds", 300),
     SubjectClaim = builder.Configuration["Authentication:SubjectClaim"] ?? "sub",
     TenantClaim = builder.Configuration["Authentication:TenantClaim"] ?? "tenant_id",
     GroupsClaim = builder.Configuration["Authentication:GroupsClaim"] ?? "groups",
@@ -43,17 +45,23 @@ if (builder.Environment.IsProduction()
     throw new InvalidOperationException("Production 环境必须启用 OIDC JWT、禁用 V0，并使用 Workflow:Provider=SqlServer。");
 if (jwtAuthenticationEnabled)
 {
-    if (!Uri.TryCreate(authenticationOptions.Authority, UriKind.Absolute, out var authorityUri) || authorityUri.Scheme != Uri.UriSchemeHttps)
-        throw new InvalidOperationException("OIDC JWT 模式要求 Authentication:Authority 为有效的 HTTPS 地址。");
+    if (!Uri.TryCreate(authenticationOptions.Authority, UriKind.Absolute, out var authorityUri)
+        || (authorityUri.Scheme != Uri.UriSchemeHttps && authorityUri.Scheme != Uri.UriSchemeHttp)
+        || (authorityUri.Scheme == Uri.UriSchemeHttp
+            && (builder.Environment.IsProduction() || authenticationOptions.RequireHttpsMetadata
+                || !authorityUri.IsLoopback)))
+        throw new InvalidOperationException("OIDC JWT Authority 无效；仅非生产环境可显式允许 loopback HTTP。");
     if (string.IsNullOrWhiteSpace(authenticationOptions.Audience))
         throw new InvalidOperationException("OIDC JWT 模式要求配置 Authentication:Audience。");
+    if (authenticationOptions.RefreshIntervalSeconds is < 1 or > 86_400)
+        throw new InvalidOperationException("Authentication:RefreshIntervalSeconds 必须在 1 到 86400 秒之间。");
     builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer(jwtOptions =>
     {
         jwtOptions.Authority = authenticationOptions.Authority;
         jwtOptions.Audience = authenticationOptions.Audience;
-        jwtOptions.RequireHttpsMetadata = true;
+        jwtOptions.RequireHttpsMetadata = authenticationOptions.RequireHttpsMetadata;
         jwtOptions.RefreshOnIssuerKeyNotFound = true;
-        jwtOptions.RefreshInterval = TimeSpan.FromMinutes(5);
+        jwtOptions.RefreshInterval = TimeSpan.FromSeconds(authenticationOptions.RefreshIntervalSeconds);
         jwtOptions.AutomaticRefreshInterval = TimeSpan.FromHours(12);
         jwtOptions.MapInboundClaims = false;
         jwtOptions.IncludeErrorDetails = false;
@@ -353,6 +361,7 @@ builder.Services.AddSingleton(new SystemDoctorOptions
     LegacyApiEnabled = enableLegacyV0,
     AuthenticationMode = authenticationOptions.Mode,
     AuthenticationAuthority = authenticationOptions.Authority,
+    AuthenticationRequireHttpsMetadata = authenticationOptions.RequireHttpsMetadata,
     AuthenticationAudienceConfigured = !string.IsNullOrWhiteSpace(authenticationOptions.Audience),
     SubjectClaimConfigured = !string.IsNullOrWhiteSpace(authenticationOptions.SubjectClaim),
     TenantClaimConfigured = !string.IsNullOrWhiteSpace(authenticationOptions.TenantClaim),

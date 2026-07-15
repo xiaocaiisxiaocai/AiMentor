@@ -19,6 +19,8 @@ public record ModelProviderOptions
     public string? Model { get; init; }
     public int TimeoutSeconds { get; init; } = 30;
     public int MaximumRetries { get; init; } = 2;
+    /// <summary>仅供独立进程协议验收显式开启；即使开启也只接受本机回环 HTTP。</summary>
+    public bool AllowInsecureLoopback { get; init; }
 }
 
 public sealed record EmbeddingProviderOptions : ModelProviderOptions
@@ -80,7 +82,9 @@ public static class AiProviderFactory
     {
         if (options.Provider is not (AiProviderKind.OpenAI or AiProviderKind.AzureOpenAI or AiProviderKind.HttpSemantic))
             throw new AiProviderConfigurationException("AI_PROVIDER_UNSUPPORTED", "AI 提供方不受支持。");
-        if (!Uri.TryCreate(options.Endpoint, UriKind.Absolute, out var endpoint) || endpoint.Scheme != Uri.UriSchemeHttps)
+        if (!Uri.TryCreate(options.Endpoint, UriKind.Absolute, out var endpoint)
+            || (endpoint.Scheme != Uri.UriSchemeHttps
+                && !(options.AllowInsecureLoopback && endpoint.Scheme == Uri.UriSchemeHttp && endpoint.IsLoopback)))
             throw new AiProviderConfigurationException("AI_ENDPOINT_HTTPS_REQUIRED", "真实 AI 提供方 Endpoint 必须使用 HTTPS。");
         if (string.IsNullOrWhiteSpace(options.ApiKey) || string.IsNullOrWhiteSpace(options.Model))
             throw new AiProviderConfigurationException("AI_PROVIDER_CREDENTIALS_MISSING", "真实 AI 提供方缺少密钥或模型标识。");
@@ -102,6 +106,8 @@ public static class AiProviderFactory
 
 internal static class AiHttpRetry
 {
+    private static readonly TimeSpan MaximumServerRetryDelay = TimeSpan.FromSeconds(5);
+
     public static async Task<JsonDocument> PostAsync(HttpClient client, string path, object payload, int retries,
         CancellationToken cancellationToken)
     {
@@ -120,8 +126,20 @@ internal static class AiHttpRetry
             var retryable = response.StatusCode == HttpStatusCode.TooManyRequests || (int)response.StatusCode >= 500;
             if (!retryable || attempt >= retries)
                 throw new HttpRequestException($"AI_PROVIDER_HTTP_{(int)response.StatusCode}", null, response.StatusCode);
-            await Task.Delay(TimeSpan.FromMilliseconds(50 * (attempt + 1)), cancellationToken);
+            await Task.Delay(RetryDelay(response, attempt), cancellationToken);
         }
+    }
+
+    private static TimeSpan RetryDelay(HttpResponseMessage response, int attempt)
+    {
+        var fallback = TimeSpan.FromMilliseconds(50 * Math.Pow(2, attempt));
+        var retryAfter = response.Headers.RetryAfter;
+        if (retryAfter is null) return fallback;
+        var requested = retryAfter.Delta
+                        ?? retryAfter.Date - DateTimeOffset.UtcNow;
+        if (requested is null || requested <= TimeSpan.Zero) return fallback;
+        // 供应商可建议退避，但不能用异常 Retry-After 绕过调用方的有界等待预算。
+        return requested > MaximumServerRetryDelay ? MaximumServerRetryDelay : requested.Value;
     }
 }
 

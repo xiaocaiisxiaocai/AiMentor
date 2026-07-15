@@ -12,6 +12,10 @@
     <ProjectReference Include="..\..\src\AiMentor.Infrastructure\AiMentor.Infrastructure.csproj" />
     <ProjectReference Include="..\AiMentor.AtlasCrashHelper\AiMentor.AtlasCrashHelper.csproj"
                       ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\AiMentor.ProviderHttpFixture\AiMentor.ProviderHttpFixture.csproj"
+                      ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\AiMentor.OidcHttpFixture\AiMentor.OidcHttpFixture.csproj"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
