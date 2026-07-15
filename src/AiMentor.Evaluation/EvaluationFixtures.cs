@@ -80,7 +80,7 @@ public sealed class RecordingKnowledgeRepository(IKnowledgeRepository inner) : I
         var chunk = evidence.Chunk;
         var normalized = NormalizeContent(chunk.Content);
         return new RetrievedEvidenceObservation(chunk.Id, chunk.DocumentId, chunk.Version, chunk.Title, chunk.Section,
-            normalized[..Math.Min(normalized.Length, 220)], Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized))),
+            normalized, Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(normalized))),
             Math.Round(evidence.RetrievalScore ?? evidence.Score, 4), chunk.TenantId,
             new HashSet<string>(chunk.AllowedGroups, StringComparer.OrdinalIgnoreCase));
     }

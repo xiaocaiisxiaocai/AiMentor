@@ -186,7 +186,8 @@ public static class EvaluationScorer
                 && string.Equals(citation.Version, evidence.Version, StringComparison.Ordinal)
                 && string.Equals(citation.Title, evidence.Title, StringComparison.Ordinal)
                 && string.Equals(citation.Section, evidence.Section, StringComparison.Ordinal)
-                && string.Equals(citation.Quote, evidence.Quote, StringComparison.Ordinal)
+                && evidence.Quote.Contains(citation.Quote, StringComparison.Ordinal)
+                && (citation.ChunkId is null || string.Equals(citation.ChunkId, evidence.ChunkId, StringComparison.Ordinal))
                 && citation.Score.Equals(evidence.Score)))
             ? Pass("citation_provenance", "CITATION_PROVENANCE_VERIFIED", "所有引用均精确来自本次实际检索证据。")
             : Fail("citation_provenance", "CITATION_PROVENANCE_INVALID", "观察结果包含未在本次检索中出现或内容不一致的引用。");

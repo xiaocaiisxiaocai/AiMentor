@@ -22,6 +22,43 @@ public interface IKnowledgeChunkSource
     Task<IReadOnlyList<KnowledgeChunk>> ReadAllChunksAsync(CancellationToken cancellationToken = default);
 }
 
+/// <summary>解析后的统一文档及发布所需元数据。</summary>
+public sealed record ParsedKnowledgeDocument(
+    string Id,
+    string Version,
+    string Title,
+    string TenantId,
+    IReadOnlySet<string> AllowedGroups,
+    string Status,
+    string SourcePath,
+    IReadOnlyList<DocumentElement> Elements);
+
+/// <summary>按文件类型选择解析器；不支持的格式必须明确拒绝。</summary>
+public interface IDocumentParserRouter
+{
+    IDocumentParser Resolve(string path);
+}
+
+/// <summary>把来源转换为统一元素，不直接产生检索分块。</summary>
+public interface IDocumentParser
+{
+    Task<ParsedKnowledgeDocument> ParseAsync(string path, string sourcePath, CancellationToken cancellationToken = default);
+}
+
+/// <summary>独立地将统一元素转换为检索分块。</summary>
+public interface IDocumentChunker
+{
+    IReadOnlyList<KnowledgeChunk> Chunk(ParsedKnowledgeDocument document);
+}
+
+/// <summary>解析质量门禁结论；失败文档不得进入发布统计或索引。</summary>
+public sealed record ParseQualityDecision(bool CanPublish, string Code, string Message);
+
+public interface IParseQualityGate
+{
+    ParseQualityDecision Evaluate(ParsedKnowledgeDocument document);
+}
+
 /// <summary>抽象文本向量生成，使沙箱与生产嵌入模型可替换。</summary>
 public interface ITextEmbeddingGenerator
 {
@@ -92,6 +129,26 @@ public interface IEvidenceReranker
 public interface IEvidenceSufficiencyEvaluator
 {
     EvidenceAssessment Evaluate(string question, IReadOnlyList<Evidence> evidence, double minimumScore);
+}
+
+/// <summary>把回答中的事实句映射到本次证据里的精确原句。</summary>
+public interface ICitationMapper
+{
+    IReadOnlyList<Citation> Map(string answer, IReadOnlyList<Evidence> evidence);
+}
+
+/// <summary>独立验证句索引、分块来源、摘录和 claim 的落地关系。</summary>
+public interface ICitationVerifier
+{
+    CitationVerificationResult Verify(string answer, IReadOnlyList<Evidence> evidence, IReadOnlyList<Citation> citations);
+}
+
+public sealed record CitationVerificationResult(bool IsValid, string Code, string Message);
+
+/// <summary>在生成前检测模型不得自行裁决的证据冲突。</summary>
+public interface IEvidenceConflictDetector
+{
+    IReadOnlyList<EvidenceConflict> Detect(IReadOnlyList<Evidence> evidence);
 }
 
 /// <summary>提供可解释的证据充分性结论和置信度。</summary>

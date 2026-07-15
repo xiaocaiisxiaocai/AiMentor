@@ -16,6 +16,8 @@ using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Validation;
 using Microsoft.IdentityModel.Tokens;
+using OpenTelemetry.Resources;
+using OpenTelemetry.Trace;
 
 var builder = WebApplication.CreateBuilder(args);
 var questionRateLimit = builder.Configuration.GetValue("Api:QuestionRateLimitPerMinute", 60);
@@ -122,7 +124,21 @@ var knowledgeRoot = WorkspacePathLocator.FindKnowledgeRoot(
     builder.Configuration["Knowledge:RootPath"] ?? Environment.GetEnvironmentVariable("AIMENTOR_KNOWLEDGE_ROOT"));
 builder.Services.AddSingleton(new MarkdownKnowledgeRepository(knowledgeRoot));
 builder.Services.AddSingleton<IKnowledgeChunkSource>(services => services.GetRequiredService<MarkdownKnowledgeRepository>());
-builder.Services.AddSingleton<ITextEmbeddingGenerator, DeterministicEmbeddingGenerator>();
+var modelProviderOptions = ReadModelProviderOptions(builder.Configuration, "Model", "AIMENTOR_MODEL_API_KEY",
+    AiProviderKind.Deterministic);
+var embeddingProviderOptions = ReadEmbeddingProviderOptions(builder.Configuration);
+var rerankerProviderOptions = ReadRerankerProviderOptions(builder.Configuration);
+var baseChatClient = AiProviderFactory.CreateChat(modelProviderOptions);
+var embeddingGenerator = AiProviderFactory.CreateEmbedding(embeddingProviderOptions);
+var evidenceReranker = AiProviderFactory.CreateReranker(rerankerProviderOptions);
+var aiRuntime = new AiRuntimeDescriptor(modelProviderOptions.Provider.ToString(),
+    embeddingProviderOptions.Provider.ToString(), rerankerProviderOptions.Provider.ToString(),
+    modelProviderOptions.Provider == AiProviderKind.Deterministic,
+    embeddingProviderOptions.Provider == AiProviderKind.Deterministic,
+    rerankerProviderOptions.Provider == AiProviderKind.Lexical,
+    embeddingGenerator.Dimensions, embeddingProviderOptions.IndexVersion, true);
+builder.Services.AddSingleton(aiRuntime);
+builder.Services.AddSingleton<ITextEmbeddingGenerator>(embeddingGenerator);
 
 var ragProvider = builder.Configuration["Rag:Provider"] ?? "Local";
 if (string.Equals(ragProvider, "OpenSearch", StringComparison.OrdinalIgnoreCase))
@@ -210,20 +226,30 @@ builder.Services.AddSingleton(new ToolExecutionReconciliationOptions());
 builder.Services.AddSingleton<IToolOutcomeProbe, MemoryDeleteOutcomeProbe>();
 builder.Services.AddSingleton<IToolExecutionReconciliationService, ToolExecutionReconciliationService>();
 builder.Services.AddSingleton<IToolCompensationOutcomeProbe, MemoryCorrectRestoreOutcomeProbe>();
-builder.Services.AddSingleton(new AgentExecutionOptions
+var agentExecutionOptions = new AgentExecutionOptions
 {
     // 最大运行时间可长于租约；活动恢复实例通过短租约心跳维持独占权。
     MaximumRunTime = TimeSpan.FromSeconds(builder.Configuration.GetValue("Agent:MaximumRunTimeSeconds", 10)),
     ResumeLeaseDuration = TimeSpan.FromSeconds(builder.Configuration.GetValue("Agent:ResumeLeaseDurationSeconds", 30)),
     ResumeLeaseRenewalInterval = TimeSpan.FromSeconds(
         builder.Configuration.GetValue("Agent:ResumeLeaseRenewalIntervalSeconds", 10))
-});
+};
+builder.Services.AddSingleton(agentExecutionOptions);
 builder.Services.AddSingleton<IAgentRunner, AgentFrameworkToolRunner>();
 builder.Services.AddSingleton<IOutputSafetyService, RuleBasedOutputSafetyService>();
-builder.Services.AddSingleton<IEvidenceReranker, LexicalEvidenceReranker>();
+builder.Services.AddSingleton<IEvidenceReranker>(evidenceReranker);
+builder.Services.AddSingleton<ICitationMapper, RuleBasedCitationMapper>();
+builder.Services.AddSingleton<ICitationVerifier, RuleBasedCitationVerifier>();
+builder.Services.AddSingleton<IEvidenceConflictDetector, RuleBasedEvidenceConflictDetector>();
 builder.Services.AddSingleton<IEvidenceSufficiencyEvaluator, RuleBasedEvidenceSufficiencyEvaluator>();
-builder.Services.AddSingleton<ITraceSink, InMemoryTraceSink>();
-builder.Services.AddSingleton<IChatClient, DeterministicGroundedChatClient>();
+builder.Services.AddSingleton<InMemoryTraceSink>();
+builder.Services.AddSingleton<OpenTelemetryTraceSink>();
+builder.Services.AddSingleton<ITraceSink>(services => new CompositeTraceSink(
+    services.GetRequiredService<InMemoryTraceSink>(), services.GetRequiredService<OpenTelemetryTraceSink>()));
+builder.Services.AddSingleton<IChatClient>(services => new ChatClientBuilder(baseChatClient)
+    .UseOpenTelemetry(services.GetRequiredService<ILoggerFactory>(), "AiMentor.Model",
+        telemetry => telemetry.EnableSensitiveData = false)
+    .Build(services));
 builder.Services.AddSingleton<IAnswerComposer, AgentFrameworkAnswerComposer>();
 builder.Services.AddSingleton(new TrustedQuestionOptions());
 builder.Services.AddSingleton<ITrustedQuestionService, TrustedQuestionService>();
@@ -232,8 +258,10 @@ builder.Services.AddSingleton(new MemoryWorkflowOptions());
 var memoryDataDirectory = Path.Combine(builder.Environment.ContentRootPath, "data");
 var memoryStorePath = builder.Configuration["Memory:StorePath"]
     ?? Path.Combine(memoryDataDirectory, "aimentor-memory.json");
+var configuredMemoryKey = builder.Configuration["Memory:EncryptionKey"]
+    ?? Environment.GetEnvironmentVariable("AIMENTOR_MEMORY_ENCRYPTION_KEY");
 var memoryKey = ResolveMemoryMasterKey(
-    builder.Configuration["Memory:EncryptionKey"] ?? Environment.GetEnvironmentVariable("AIMENTOR_MEMORY_ENCRYPTION_KEY"),
+    configuredMemoryKey,
     Path.Combine(memoryDataDirectory, "memory.key"), builder.Environment.IsProduction());
 var memoryCipher = new AesGcmMemoryCipher(memoryKey);
 builder.Services.AddSingleton<IMemoryCipher>(memoryCipher);
@@ -242,6 +270,9 @@ var workflowKeys = ResolveWorkflowKeys(builder.Configuration, workflowKeyVersion
     builder.Environment.IsProduction() && string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase));
 builder.Services.AddSingleton<IWorkflowStateCipher>(
     new AesGcmWorkflowStateCipher(workflowKeyVersion, workflowKeys, memoryCipher));
+var sqlConnectionConfigured = false;
+var sqlEncrypt = false;
+var sqlTrustServerCertificate = false;
 if (string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase))
 {
     var connectionString = builder.Configuration.GetConnectionString("WorkflowSqlServer")
@@ -249,6 +280,9 @@ if (string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreC
     if (string.IsNullOrWhiteSpace(connectionString))
         throw new InvalidOperationException("Workflow:Provider=SqlServer 时必须配置 ConnectionStrings:WorkflowSqlServer。");
     var sqlConnection = new Microsoft.Data.SqlClient.SqlConnectionStringBuilder(connectionString);
+    sqlConnectionConfigured = true;
+    sqlEncrypt = sqlConnection.Encrypt;
+    sqlTrustServerCertificate = sqlConnection.TrustServerCertificate;
     if (builder.Environment.IsProduction() && (!sqlConnection.Encrypt || sqlConnection.TrustServerCertificate))
         throw new InvalidOperationException("Production SQL Server 连接必须启用 Encrypt 且禁用 TrustServerCertificate。");
     builder.Services.AddSingleton(new SqlServerWorkflowOptions
@@ -281,6 +315,69 @@ builder.Services.AddSingleton<IMemoryContentSafetyService, RuleBasedMemoryConten
 builder.Services.AddSingleton<IMemoryWorkflowService, MemoryWorkflowService>();
 builder.Services.AddSingleton(new MemoryContextOptions());
 builder.Services.AddSingleton<IMemoryContextProvider, SafeMemoryContextProvider>();
+builder.Services.AddSingleton(new AtlasIncidentWorkflowOptions());
+// 当前仅提供单进程并发安全恢复；接口可替换为 SQL Store，但此实现不宣称跨重启耐久。
+builder.Services.AddSingleton<IAtlasIncidentStore, InMemoryAtlasIncidentStore>();
+builder.Services.AddSingleton<IAtlasIncidentWorkflow, AtlasIncidentWorkflow>();
+
+var configuredWorkflowKeys = builder.Configuration.GetSection("Workflow:Encryption:Keys").GetChildren().ToArray();
+var openSearchUsername = builder.Configuration["OpenSearch:Username"]
+    ?? Environment.GetEnvironmentVariable("AIMENTOR_OPENSEARCH_USERNAME");
+var openSearchPassword = builder.Configuration["OpenSearch:Password"]
+    ?? Environment.GetEnvironmentVariable("AIMENTOR_OPENSEARCH_PASSWORD");
+builder.Services.AddSingleton(new SystemDoctorOptions
+{
+    IsProduction = builder.Environment.IsProduction(),
+    LegacyApiEnabled = enableLegacyV0,
+    AuthenticationMode = authenticationOptions.Mode,
+    AuthenticationAuthority = authenticationOptions.Authority,
+    AuthenticationAudienceConfigured = !string.IsNullOrWhiteSpace(authenticationOptions.Audience),
+    SubjectClaimConfigured = !string.IsNullOrWhiteSpace(authenticationOptions.SubjectClaim),
+    TenantClaimConfigured = !string.IsNullOrWhiteSpace(authenticationOptions.TenantClaim),
+    WorkflowProvider = workflowProvider,
+    MemoryKeyConfigured = !string.IsNullOrWhiteSpace(configuredMemoryKey),
+    MemoryKeyValid = memoryKey.Length == 32,
+    WorkflowKeyRingConfigured = configuredWorkflowKeys.Length > 0,
+    WorkflowActiveKeyPresent = workflowKeys.ContainsKey(workflowKeyVersion),
+    WorkflowUsesIndependentKey = workflowKeys.TryGetValue(workflowKeyVersion, out var activeWorkflowKey)
+        && !activeWorkflowKey.AsSpan().SequenceEqual(memoryKey),
+    SqlConnectionConfigured = sqlConnectionConfigured,
+    SqlEncrypt = sqlEncrypt,
+    SqlTrustServerCertificate = sqlTrustServerCertificate,
+    RagProvider = ragProvider,
+    OpenSearchEndpoint = builder.Configuration["OpenSearch:Endpoint"] ?? "http://127.0.0.1:9200",
+    OpenSearchAuthenticationConfigured = !string.IsNullOrWhiteSpace(openSearchUsername)
+        && !string.IsNullOrWhiteSpace(openSearchPassword),
+    // 当前注册类型是沙箱实现；不能仅凭配置名称把它误报为生产供应商。
+    ModelProvider = aiRuntime.ModelProvider,
+    EmbeddingProvider = aiRuntime.EmbeddingProvider,
+    RerankerProvider = aiRuntime.RerankerProvider,
+    EmbeddingDimensions = embeddingGenerator.Dimensions,
+    ExpectedEmbeddingDimensions = builder.Configuration.GetValue("OpenSearch:VectorDimensions",
+        embeddingGenerator.Dimensions),
+    EmbeddingIndexVersion = aiRuntime.EmbeddingIndexVersion,
+    ExpectedEmbeddingIndexVersion = builder.Configuration["OpenSearch:IndexName"] ?? "aimentor-knowledge-v1",
+    AgentMaximumRunTime = agentExecutionOptions.MaximumRunTime,
+    AgentResumeLeaseDuration = agentExecutionOptions.ResumeLeaseDuration,
+    AgentResumeLeaseRenewalInterval = agentExecutionOptions.ResumeLeaseRenewalInterval
+});
+builder.Services.AddSingleton<ISystemDoctor, SystemDoctor>();
+
+var telemetryBuilder = builder.Services.AddOpenTelemetry()
+    .ConfigureResource(resource => resource.AddService(builder.Environment.ApplicationName))
+    .WithTracing(tracing => tracing
+        .AddAspNetCoreInstrumentation()
+        .AddHttpClientInstrumentation()
+        .AddSource(OpenTelemetryTraceSink.SourceName)
+        .AddSource("AiMentor.Model"));
+var otlpEndpoint = builder.Configuration["Telemetry:OtlpEndpoint"];
+if (!string.IsNullOrWhiteSpace(otlpEndpoint))
+{
+    if (!Uri.TryCreate(otlpEndpoint, UriKind.Absolute, out var otlpUri)
+        || (builder.Environment.IsProduction() && otlpUri.Scheme != Uri.UriSchemeHttps))
+        throw new InvalidOperationException("Telemetry:OtlpEndpoint 无效，生产环境必须使用 HTTPS。");
+    telemetryBuilder.WithTracing(tracing => tracing.AddOtlpExporter(options => options.Endpoint = otlpUri));
+}
 
 var app = builder.Build();
 app.UseExceptionHandler();
@@ -291,18 +388,36 @@ if (jwtAuthenticationEnabled)
 }
 app.UseRateLimiter();
 app.MapOpenApi();
+var systemDoctor = app.Services.GetRequiredService<ISystemDoctor>();
+var startupDiagnostic = await systemDoctor.RunAsync();
+if (builder.Environment.IsProduction() && !startupDiagnostic.IsReady)
+{
+    // 生产关键配置失败时必须在接收流量前关闭，且只输出稳定代码，避免泄漏密钥和连接信息。
+    var codes = string.Join(",", startupDiagnostic.Checks
+        .Where(item => item.Status == SystemCheckStatus.Failed).Select(item => item.Code));
+    throw new InvalidOperationException($"SystemDoctor 生产配置检查失败：{codes}");
+}
 var repository = app.Services.GetRequiredService<IKnowledgeRepository>();
 await repository.InitializeAsync();
 
-app.MapGet("/health", () => Results.Ok(new
+app.MapGet("/health/live", () => Results.Ok(new { status = "alive" }))
+    .WithName("Liveness").WithTags("System").DisableRateLimiting();
+app.MapGet("/health/ready", ReadyAsync)
+    .WithName("Readiness").WithTags("System").DisableRateLimiting();
+app.MapGet("/health", async (ISystemDoctor doctor, CancellationToken cancellationToken) =>
 {
-    status = "healthy",
-    ragProvider,
-    workflowProvider,
-    workflowKeyVersion,
-    authenticationMode = authenticationOptions.Mode,
-    knowledge = repository.Statistics
-}))
+    var report = await doctor.RunAsync(cancellationToken);
+    return Results.Json(new
+    {
+        status = report.IsReady ? "healthy" : "unready",
+        ragProvider,
+        workflowProvider,
+        workflowKeyVersion,
+        authenticationMode = authenticationOptions.Mode,
+        knowledge = repository.Statistics,
+        diagnostics = report
+    }, statusCode: report.IsReady ? StatusCodes.Status200OK : StatusCodes.Status503ServiceUnavailable);
+})
     .WithName("Health").WithTags("System").DisableRateLimiting();
 
 var v1 = app.MapGroup("/api/v1").WithTags("AiMentor v1");
@@ -524,6 +639,21 @@ agents.MapPost("/runs/{runId}/cancel", CancelAgentRunAsync)
     .ProducesProblem(StatusCodes.Status403Forbidden)
     .ProducesProblem(StatusCodes.Status404NotFound)
     .RequireRateLimiting("questions");
+
+var atlasIncidents = v1.MapGroup("/incidents/atlasid").WithTags("AiMentor AtlasID incidents v1");
+atlasIncidents.MapPost("/runs", StartAtlasIncidentAsync)
+    .WithName("StartAtlasIncidentV1").Produces<AtlasIncidentCheckpoint>(StatusCodes.Status201Created)
+    .ProducesValidationProblem().RequireRateLimiting("questions");
+atlasIncidents.MapGet("/runs/{runId}", GetAtlasIncidentAsync)
+    .WithName("GetAtlasIncidentV1").Produces<AtlasIncidentCheckpoint>()
+    .ProducesProblem(StatusCodes.Status403Forbidden).ProducesProblem(StatusCodes.Status404NotFound)
+    .RequireRateLimiting("questions");
+atlasIncidents.MapPost("/runs/{runId}/resume", ResumeAtlasIncidentAsync)
+    .WithName("ResumeAtlasIncidentV1").Produces<AtlasIncidentCheckpoint>()
+    .ProducesProblem(StatusCodes.Status409Conflict).RequireRateLimiting("questions");
+atlasIncidents.MapPost("/runs/{runId}/cancel", CancelAtlasIncidentAsync)
+    .WithName("CancelAtlasIncidentV1").Produces<AtlasIncidentCheckpoint>()
+    .ProducesProblem(StatusCodes.Status409Conflict).RequireRateLimiting("questions");
 
 // V0 仅用于短期迁移，默认关闭，Production 环境禁止启用。
 if (enableLegacyV0)
@@ -995,11 +1125,77 @@ static IResult AgentRunProblem(AgentRunWorkflowException exception, HttpContext 
         extensions: new Dictionary<string, object?> { ["code"] = exception.Code });
 }
 
+static async Task<IResult> StartAtlasIncidentAsync(AtlasIncidentInput input, IAtlasIncidentWorkflow workflow,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        var result = await workflow.StartAsync(input, accessProvider.GetAccessContext(context.User), cancellationToken);
+        return Results.Created($"/api/v1/incidents/atlasid/runs/{result.RunId}", result);
+    }
+    catch (AtlasIncidentWorkflowException exception) { return AtlasIncidentProblem(exception, context); }
+}
+
+static async Task<IResult> GetAtlasIncidentAsync(string runId, IAtlasIncidentWorkflow workflow,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        return Results.Ok(await workflow.GetAsync(runId, accessProvider.GetAccessContext(context.User), cancellationToken));
+    }
+    catch (AtlasIncidentWorkflowException exception) { return AtlasIncidentProblem(exception, context); }
+}
+
+static async Task<IResult> ResumeAtlasIncidentAsync(string runId, ResumeAtlasIncidentCommand command,
+    IAtlasIncidentWorkflow workflow, IRequestAccessContextProvider accessProvider, HttpContext context,
+    CancellationToken cancellationToken)
+{
+    try
+    {
+        return Results.Ok(await workflow.ResumeAsync(runId, command.ExpectedVersion, command.Input,
+            accessProvider.GetAccessContext(context.User), cancellationToken));
+    }
+    catch (AtlasIncidentWorkflowException exception) { return AtlasIncidentProblem(exception, context); }
+}
+
+static async Task<IResult> CancelAtlasIncidentAsync(string runId, CancelAtlasIncidentCommand command,
+    IAtlasIncidentWorkflow workflow, IRequestAccessContextProvider accessProvider, HttpContext context,
+    CancellationToken cancellationToken)
+{
+    try
+    {
+        return Results.Ok(await workflow.CancelAsync(runId, command.ExpectedVersion,
+            accessProvider.GetAccessContext(context.User), cancellationToken));
+    }
+    catch (AtlasIncidentWorkflowException exception) { return AtlasIncidentProblem(exception, context); }
+}
+
+static IResult AtlasIncidentProblem(AtlasIncidentWorkflowException exception, HttpContext context)
+{
+    var status = exception.Kind switch
+    {
+        AtlasIncidentErrorKind.Validation => StatusCodes.Status400BadRequest,
+        AtlasIncidentErrorKind.Forbidden => StatusCodes.Status403Forbidden,
+        AtlasIncidentErrorKind.NotFound => StatusCodes.Status404NotFound,
+        AtlasIncidentErrorKind.Conflict => StatusCodes.Status409Conflict,
+        _ => StatusCodes.Status500InternalServerError
+    };
+    return Results.Problem(statusCode: status, title: "AtlasID 排查工作流失败", detail: exception.Message,
+        instance: context.Request.Path, extensions: new Dictionary<string, object?> { ["code"] = exception.Code });
+}
+
 static async Task WriteEventAsync(HttpResponse response, string eventName, object payload, JsonSerializerOptions options,
     CancellationToken cancellationToken)
 {
     await response.WriteAsync($"event: {eventName}\ndata: {JsonSerializer.Serialize(payload, options)}\n\n", cancellationToken);
     await response.Body.FlushAsync(cancellationToken);
+}
+
+static async Task<IResult> ReadyAsync(ISystemDoctor doctor, CancellationToken cancellationToken)
+{
+    var report = await doctor.RunAsync(cancellationToken);
+    return Results.Json(report, statusCode: report.IsReady
+        ? StatusCodes.Status200OK : StatusCodes.Status503ServiceUnavailable);
 }
 
 static string GetCorrelationId(HttpContext context)
@@ -1066,4 +1262,60 @@ static IReadOnlyDictionary<string, byte[]> ResolveWorkflowKeys(IConfiguration co
     if (!keys.ContainsKey(activeVersion))
         throw new InvalidOperationException("Workflow:Encryption:ActiveKeyVersion 必须存在于密钥环中。");
     return keys;
+}
+
+static ModelProviderOptions ReadModelProviderOptions(IConfiguration configuration, string sectionName,
+    string apiKeyEnvironmentVariable, AiProviderKind defaultProvider)
+{
+    var section = configuration.GetSection(sectionName);
+    var provider = ParseProvider(section["Provider"], defaultProvider, sectionName);
+    return new ModelProviderOptions
+    {
+        Provider = provider,
+        Endpoint = section["Endpoint"],
+        ApiKey = section["ApiKey"] ?? Environment.GetEnvironmentVariable(apiKeyEnvironmentVariable),
+        Model = section["Model"],
+        TimeoutSeconds = section.GetValue("TimeoutSeconds", 30),
+        MaximumRetries = section.GetValue("MaximumRetries", 2)
+    };
+}
+
+static EmbeddingProviderOptions ReadEmbeddingProviderOptions(IConfiguration configuration)
+{
+    var section = configuration.GetSection("Embedding");
+    var common = ReadModelProviderOptions(configuration, "Embedding", "AIMENTOR_EMBEDDING_API_KEY",
+        AiProviderKind.Deterministic);
+    return new EmbeddingProviderOptions
+    {
+        Provider = common.Provider,
+        Endpoint = common.Endpoint,
+        ApiKey = common.ApiKey,
+        Model = common.Model,
+        TimeoutSeconds = common.TimeoutSeconds,
+        MaximumRetries = common.MaximumRetries,
+        Dimensions = section.GetValue("Dimensions", 256),
+        IndexVersion = section["IndexVersion"] ?? "aimentor-knowledge-v1"
+    };
+}
+
+static RerankerProviderOptions ReadRerankerProviderOptions(IConfiguration configuration)
+{
+    var common = ReadModelProviderOptions(configuration, "Reranker", "AIMENTOR_RERANKER_API_KEY",
+        AiProviderKind.Lexical);
+    return new RerankerProviderOptions
+    {
+        Provider = common.Provider,
+        Endpoint = common.Endpoint,
+        ApiKey = common.ApiKey,
+        Model = common.Model,
+        TimeoutSeconds = common.TimeoutSeconds,
+        MaximumRetries = common.MaximumRetries
+    };
+}
+
+static AiProviderKind ParseProvider(string? value, AiProviderKind fallback, string sectionName)
+{
+    if (string.IsNullOrWhiteSpace(value)) return fallback;
+    if (Enum.TryParse<AiProviderKind>(value, true, out var provider)) return provider;
+    throw new InvalidOperationException($"{sectionName}:Provider 不受支持。");
 }

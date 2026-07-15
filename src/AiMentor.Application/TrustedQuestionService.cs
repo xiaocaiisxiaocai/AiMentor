@@ -14,7 +14,10 @@ public sealed class TrustedQuestionService(
     IOutputSafetyService outputSafety,
     ITraceSink traceSink,
     TrustedQuestionOptions options,
-    IMemoryContextProvider memoryContext) : ITrustedQuestionService
+    IMemoryContextProvider memoryContext,
+    ICitationMapper citationMapper,
+    ICitationVerifier citationVerifier,
+    IEvidenceConflictDetector conflictDetector) : ITrustedQuestionService
 {
     public async Task<TrustedAnswer> AskAsync(TrustedQuestion question, CancellationToken cancellationToken = default)
     {
@@ -83,6 +86,21 @@ public sealed class TrustedQuestionService(
             ["code"] = assessment.Code,
             ["confidence"] = assessment.Confidence
         });
+        var conflicts = conflictDetector.Detect(evidence);
+        Trace("evidence.conflict", conflicts.Count == 0 ? "none" : "expert_review_required",
+            new Dictionary<string, object?>
+            {
+                ["conflictCount"] = conflicts.Count,
+                ["kinds"] = string.Join(',', conflicts.Select(conflict => conflict.Kind).Distinct(StringComparer.Ordinal))
+            });
+        if (conflicts.Count > 0)
+        {
+            var conflictDecision = new SafetyDecision(SafetyAction.RequireApproval, "EVIDENCE_CONFLICT_REQUIRES_EXPERT",
+                "可访问证据存在无法自动裁决的冲突，需要领域专家处理。");
+            return await CompleteAsync(AnswerDecision.Refused,
+                "可访问证据存在版本或同权来源冲突，我不能自行选择结论；请交由领域专家复核。", false,
+                conflictDecision, [], trace, conflicts);
+        }
         try
         {
             var memories = await memoryContext.GetRelevantAsync(question.Question, question.Access, question.SessionId,
@@ -93,15 +111,33 @@ public sealed class TrustedQuestionService(
                 ["scopes"] = string.Join(',', memories.Select(item => item.Scope).Distinct())
             });
             var answer = await composer.ComposeAsync(question.Question, evidence, memories, cancellationToken);
-            var citationRanking = evidence.OrderByDescending(item => item.RetrievalScore ?? item.Score).ToArray();
-            var topRetrievalScore = citationRanking[0].RetrievalScore ?? citationRanking[0].Score;
-            var citationThreshold = Math.Max(options.MinimumTopScore, topRetrievalScore * 0.6);
-            var citations = citationRanking
-                .Where(item => (item.RetrievalScore ?? item.Score) >= citationThreshold)
-                .Take(3)
-                .Select(ToCitation)
-                .ToArray();
-            Trace("answer.composed", "ok", new Dictionary<string, object?> { ["citationCount"] = citations.Length });
+            var preflight = outputSafety.Review(answer, evidence, []);
+            if (preflight.Code != "OUTPUT_WITHOUT_CITATION")
+            {
+                Trace("output.safety", preflight.Action.ToString(), new Dictionary<string, object?>
+                {
+                    ["code"] = preflight.Code,
+                    ["policyVersion"] = outputSafety.PolicyVersion
+                });
+                return await CompleteAsync(AnswerDecision.Refused, preflight.Message, false, preflight, [], trace);
+            }
+            var citations = citationMapper.Map(answer, evidence);
+            Trace("citation.mapping", citations.Count > 0 ? "mapped" : "empty", new Dictionary<string, object?>
+            {
+                ["citationCount"] = citations.Count,
+                ["claimCount"] = citations.Select(citation => citation.SentenceIndex).Distinct().Count()
+            });
+            var verification = citationVerifier.Verify(answer, evidence, citations);
+            Trace("citation.verification", verification.IsValid ? "passed" : "failed", new Dictionary<string, object?>
+            {
+                ["code"] = verification.Code
+            });
+            if (!verification.IsValid)
+            {
+                var invalidCitation = new SafetyDecision(SafetyAction.Refuse, verification.Code, verification.Message);
+                return await CompleteAsync(AnswerDecision.Refused, verification.Message, false, invalidCitation, [], trace);
+            }
+            Trace("answer.composed", "ok", new Dictionary<string, object?> { ["citationCount"] = citations.Count });
             var outputDecision = outputSafety.Review(answer, evidence, citations);
             Trace("output.safety", outputDecision.Action.ToString(), new Dictionary<string, object?>
             {
@@ -119,20 +155,15 @@ public sealed class TrustedQuestionService(
             return await CompleteAsync(AnswerDecision.Failed, "回答生成失败，请稍后重试。", true, safetyDecision, [], trace);
         }
 
-        Citation ToCitation(Evidence item)
-        {
-            var normalized = string.Join(' ', item.Chunk.Content.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
-            return new Citation(item.Chunk.DocumentId, item.Chunk.Version, item.Chunk.Title, item.Chunk.Section,
-                normalized[..Math.Min(normalized.Length, 220)], Math.Round(item.RetrievalScore ?? item.Score, 4));
-        }
-
         void Trace(string name, string outcome, IReadOnlyDictionary<string, object?> details) =>
             trace.Add(new TraceStep(name, outcome, DateTimeOffset.UtcNow, details));
 
         async Task<TrustedAnswer> CompleteAsync(AnswerDecision decision, string answer, bool hasEvidence, SafetyDecision safetyResult,
-            IReadOnlyList<Citation> citations, IReadOnlyList<TraceStep> steps)
+            IReadOnlyList<Citation> citations, IReadOnlyList<TraceStep> steps,
+            IReadOnlyList<EvidenceConflict>? answerConflicts = null)
         {
-            var result = new TrustedAnswer(runId, decision, answer, hasEvidence, safetyResult, citations, steps);
+            var result = new TrustedAnswer(runId, decision, answer, hasEvidence, safetyResult, citations, steps,
+                answerConflicts ?? []);
             await traceSink.WriteAsync(runId, steps, cancellationToken);
             return result;
         }

@@ -1,5 +1,3 @@
-using System.Collections.Concurrent;
-using System.Text;
 using System.Text.RegularExpressions;
 using AiMentor.Application;
 using AiMentor.Domain;
@@ -7,14 +5,30 @@ using AiMentor.Domain;
 namespace AiMentor.Infrastructure;
 
 /// <summary>加载本地 Markdown 知识并在内存中执行租户与 ACL 前置过滤检索。</summary>
-public sealed class MarkdownKnowledgeRepository(string rootPath) : IKnowledgeRepository, IKnowledgeChunkSource, IDisposable
+public sealed class MarkdownKnowledgeRepository : IKnowledgeRepository, IKnowledgeChunkSource, IDisposable
 {
-    private readonly string _rootPath = Path.GetFullPath(rootPath);
+    private readonly string _rootPath;
+    private readonly IDocumentParserRouter _parserRouter;
+    private readonly IDocumentChunker _chunker;
+    private readonly IParseQualityGate _qualityGate;
     private KnowledgeDocument[] _documents = [];
     private readonly SemaphoreSlim _initializationLock = new(1, 1);
     private int _disposed;
 
     public KnowledgeStatistics Statistics { get; private set; } = new(0, 0);
+
+    public MarkdownKnowledgeRepository(string rootPath)
+        : this(rootPath, new DocumentParserRouter(new MarkdownDocumentParser()), new StructuredDocumentChunker(),
+            new RuleBasedParseQualityGate()) { }
+
+    public MarkdownKnowledgeRepository(string rootPath, IDocumentParserRouter parserRouter, IDocumentChunker chunker,
+        IParseQualityGate qualityGate)
+    {
+        _rootPath = Path.GetFullPath(rootPath);
+        _parserRouter = parserRouter;
+        _chunker = chunker;
+        _qualityGate = qualityGate;
+    }
 
     public async Task InitializeAsync(CancellationToken cancellationToken = default)
     {
@@ -25,14 +39,29 @@ public sealed class MarkdownKnowledgeRepository(string rootPath) : IKnowledgeRep
             if (_documents.Length > 0) return;
             if (!Directory.Exists(_rootPath)) throw new DirectoryNotFoundException($"知识目录不存在：{_rootPath}");
 
-            var documents = new ConcurrentBag<KnowledgeDocument>();
-            await Parallel.ForEachAsync(Directory.EnumerateFiles(_rootPath, "*.md", SearchOption.AllDirectories), cancellationToken,
-                async (path, token) =>
+            var documents = new List<KnowledgeDocument>();
+            var paths = Directory.EnumerateFiles(_rootPath, "*", SearchOption.AllDirectories)
+                .Where(path => Path.GetExtension(path).Equals(".md", StringComparison.OrdinalIgnoreCase)
+                    || Path.GetExtension(path).Equals(".txt", StringComparison.OrdinalIgnoreCase))
+                .OrderBy(path => path, StringComparer.Ordinal)
+                .ToArray();
+            foreach (var path in paths)
+            {
+                var parser = _parserRouter.Resolve(path);
+                var parsed = await parser.ParseAsync(path, Path.GetRelativePath(_rootPath, path), cancellationToken);
+                if (!string.Equals(parsed.Status, "published", StringComparison.OrdinalIgnoreCase)) continue;
+                var quality = _qualityGate.Evaluate(parsed);
+                if (!quality.CanPublish)
                 {
-                    var text = await File.ReadAllTextAsync(path, token);
-                    var document = Parse(path, Path.GetRelativePath(_rootPath, path), text);
-                    if (document is { Status: "published" }) documents.Add(document);
-                });
+                    // 已声明发布的文档若被静默忽略，运维侧会误以为知识已经可用，因此必须失败关闭。
+                    throw new InvalidDataException($"{path} 未通过解析质量门禁：{quality.Code}；{quality.Message}");
+                }
+                var chunks = _chunker.Chunk(parsed);
+                if (chunks.Count == 0)
+                    throw new InvalidDataException($"{path} 切分后没有可发布分块，禁止计入知识统计。");
+                documents.Add(new KnowledgeDocument(parsed.Id, parsed.Version, parsed.Title, parsed.TenantId,
+                    parsed.AllowedGroups, parsed.Status, parsed.SourcePath, chunks));
+            }
 
             _documents = documents.OrderBy(x => x.Id, StringComparer.Ordinal).ToArray();
             Statistics = new KnowledgeStatistics(_documents.Length, _documents.Sum(x => x.Chunks.Count));
@@ -71,71 +100,6 @@ public sealed class MarkdownKnowledgeRepository(string rootPath) : IKnowledgeRep
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 0) _initializationLock.Dispose();
-    }
-
-    private static KnowledgeDocument? Parse(string path, string sourcePath, string text)
-    {
-        var frontMatter = Regex.Match(text, @"\A---\s*\r?\n(?<yaml>.*?)\r?\n---\s*\r?\n(?<body>.*)\z", RegexOptions.Singleline);
-        if (!frontMatter.Success) return null;
-        var metadata = ParseMetadata(frontMatter.Groups["yaml"].Value);
-        if (!metadata.TryGetValue("synthetic", out var synthetic) || !string.Equals(synthetic, "true", StringComparison.OrdinalIgnoreCase)) return null;
-
-        var id = Required("id");
-        var version = Required("version").Trim('"', '\'');
-        var title = Required("title");
-        var tenant = Required("tenant_id");
-        var groups = ParseList(metadata.GetValueOrDefault("acl_allow_groups"));
-        var chunks = SplitIntoChunks(id, version, title, tenant, groups, sourcePath, frontMatter.Groups["body"].Value);
-        return new KnowledgeDocument(id, version, title, tenant, groups, metadata.GetValueOrDefault("status", "draft"), sourcePath, chunks);
-
-        string Required(string key) => metadata.TryGetValue(key, out var value) && !string.IsNullOrWhiteSpace(value)
-            ? value : throw new InvalidDataException($"{path} 缺少必需元数据 {key}。");
-    }
-
-    private static Dictionary<string, string> ParseMetadata(string yaml) => yaml.Split('\n')
-        .Select(line => line.Trim())
-        .Where(line => line.Length > 0 && !line.StartsWith('#'))
-        .Select(line => line.Split(':', 2))
-        .Where(parts => parts.Length == 2)
-        .ToDictionary(parts => parts[0].Trim(), parts => parts[1].Trim(), StringComparer.OrdinalIgnoreCase);
-
-    private static HashSet<string> ParseList(string? value)
-    {
-        if (string.IsNullOrWhiteSpace(value)) return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        return new HashSet<string>(value.Trim('[', ']').Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-            .Select(x => x.Trim('"', '\'')), StringComparer.OrdinalIgnoreCase);
-    }
-
-    private static List<KnowledgeChunk> SplitIntoChunks(string documentId, string version, string title, string tenant,
-        IReadOnlySet<string> groups, string path, string body)
-    {
-        var chunks = new List<KnowledgeChunk>();
-        var section = title;
-        var buffer = new StringBuilder();
-        var index = 0;
-
-        void Flush()
-        {
-            var content = buffer.ToString().Trim();
-            buffer.Clear();
-            if (content.Length == 0) return;
-            chunks.Add(new KnowledgeChunk($"{documentId}:{index++}", documentId, version, title, section, content, tenant, groups, path));
-        }
-
-        foreach (var line in body.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n'))
-        {
-            if (line.StartsWith("## ", StringComparison.Ordinal))
-            {
-                Flush();
-                section = line[3..].Trim();
-            }
-            else if (!line.StartsWith("# ", StringComparison.Ordinal))
-            {
-                buffer.AppendLine(line);
-            }
-        }
-        Flush();
-        return chunks;
     }
 
     private static HashSet<string> Tokenize(string value)

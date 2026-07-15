@@ -25,7 +25,8 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
             new RuleBasedRetrievedContentSafetyService(),
             new LexicalEvidenceReranker(), new RuleBasedEvidenceSufficiencyEvaluator(),
             new AgentFrameworkAnswerComposer(_chatClient), new RuleBasedOutputSafetyService(),
-            new InMemoryTraceSink(), new TrustedQuestionOptions(), new EmptyMemoryContextProvider());
+            new InMemoryTraceSink(), new TrustedQuestionOptions(), new EmptyMemoryContextProvider(),
+            new RuleBasedCitationMapper(), new RuleBasedCitationVerifier(), new RuleBasedEvidenceConflictDetector());
     }
 
     public Task DisposeAsync() => Task.CompletedTask;
@@ -63,7 +64,8 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
         var targetService = new TrustedQuestionService(recordingRepository, _queryNormalizer,
             new RuleBasedInputSafetyService(), recordingRetrievalSafety, recordingReranker,
             new RuleBasedEvidenceSufficiencyEvaluator(), recordingComposer, new RuleBasedOutputSafetyService(),
-            new InMemoryTraceSink(), new TrustedQuestionOptions(), new EmptyMemoryContextProvider());
+            new InMemoryTraceSink(), new TrustedQuestionOptions(), new EmptyMemoryContextProvider(),
+            new RuleBasedCitationMapper(), new RuleBasedCitationVerifier(), new RuleBasedEvidenceConflictDetector());
         var target = new TrustedQuestionEvaluationTarget(targetService);
         var aclRegistry = new KnowledgeAclEvaluationFixtureRegistry(recordingRepository, _repository, _queryNormalizer,
             BuiltInEvaluationFixtures.Create());
@@ -77,13 +79,16 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
             [BuiltInRetrievedContentFixtures.CleanFixtureId] = retrievalRegistry,
             [BuiltInRetrievedContentFixtures.MixedFixtureId] = retrievalRegistry
         };
+        var operationalDefinitions = BuiltInOperationalEvaluationFixtures.Create();
+        var operationalRegistry = new OperationalEvaluationFixtureRegistry(operationalDefinitions);
+        foreach (var definition in operationalDefinitions) routes[definition.FixtureId] = operationalRegistry;
 
         var results = await new EvaluationRunner(target,
             new RoutingEvaluationFixtureRegistry(routes)).RunAsync(cases);
         var report = EvaluationReportBuilder.Build(results);
 
-        Assert.Equal(6, report.Total);
-        Assert.Equal(6, report.Passed);
+        Assert.Equal(12, report.Total);
+        Assert.Equal(12, report.Passed);
         Assert.Equal(1, report.OracleCoverage);
         Assert.True(report.QualityGate.Passed);
     }

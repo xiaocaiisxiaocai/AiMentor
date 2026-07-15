@@ -29,6 +29,20 @@ public sealed record KnowledgeDocument(
     string SourcePath,
     IReadOnlyList<KnowledgeChunk> Chunks);
 
+/// <summary>解析器输出的统一结构元素；切分策略只能消费该模型，不能依赖具体解析器。</summary>
+public sealed record DocumentElement(
+    string Id,
+    string ElementType,
+    IReadOnlyList<string> SectionPath,
+    string Text,
+    int ReadingOrder,
+    string? SourceAnchor,
+    string? ParentElementId = null,
+    int? PageNumber = null,
+    string? BoundingBox = null,
+    string? TableHeader = null,
+    string? ImageCaption = null);
+
 /// <summary>保留来源和 ACL 的最小检索单元。</summary>
 public sealed record KnowledgeChunk(
     string Id,
@@ -51,7 +65,18 @@ public sealed record Citation(
     string Title,
     string Section,
     string Quote,
-    double Score);
+    double Score,
+    string? ChunkId = null,
+    string? SourceAnchor = null,
+    int? SentenceIndex = null,
+    string? ClaimText = null);
+
+/// <summary>表示不能由模型静默裁决的版本或同权来源冲突。</summary>
+public sealed record EvidenceConflict(
+    string Kind,
+    IReadOnlyList<string> DocumentIds,
+    string Summary,
+    bool RequiresExpertReview = true);
 
 /// <summary>表示已绑定服务端身份、追踪标识和可选会话的问答请求。</summary>
 public sealed record TrustedQuestion(
@@ -71,4 +96,5 @@ public sealed record TrustedAnswer(
     bool EvidenceSufficient,
     SafetyDecision Safety,
     IReadOnlyList<Citation> Citations,
-    IReadOnlyList<TraceStep> Trace);
+    IReadOnlyList<TraceStep> Trace,
+    IReadOnlyList<EvidenceConflict>? Conflicts = null);

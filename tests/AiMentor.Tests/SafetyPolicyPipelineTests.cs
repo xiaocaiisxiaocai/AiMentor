@@ -130,7 +130,8 @@ public sealed class SafetyPolicyPipelineTests
         new(new StaticKnowledgeRepository(evidence), new RuleBasedQueryNormalizer(), new RuleBasedInputSafetyService(),
             new RuleBasedRetrievedContentSafetyService(), new LexicalEvidenceReranker(),
             new RuleBasedEvidenceSufficiencyEvaluator(), composer, new RuleBasedOutputSafetyService(),
-        new InMemoryTraceSink(), new TrustedQuestionOptions(), new EmptyMemoryContextProvider());
+            new InMemoryTraceSink(), new TrustedQuestionOptions(), new EmptyMemoryContextProvider(),
+            new RuleBasedCitationMapper(), new RuleBasedCitationVerifier(), new RuleBasedEvidenceConflictDetector());
 
     private static Evidence CreateEvidence(string content) => new(new KnowledgeChunk(
         "BK-POL-002#token", "BK-POL-002", "v1", "身份认证策略", "Token 生命周期", content,

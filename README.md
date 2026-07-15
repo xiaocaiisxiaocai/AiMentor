@@ -115,6 +115,17 @@ dotnet run --project .\src\AiMentor.Evaluation\AiMentor.Evaluation.csproj -- `
   .\AI-Agent-V1合成数据包\evaluation\evaluation-suite-v2.json
 ```
 
+可通过 `AIMENTOR_EVALUATION_MODEL_PROVIDER`、`AIMENTOR_EVALUATION_MODEL_ENDPOINT`、
+`AIMENTOR_EVALUATION_MODEL_ID` 和 `AIMENTOR_EVALUATION_MODEL_API_KEY` 显式启用同题集真实模型对比。
+启用真实提供方但缺少密钥时评测返回 `NotReady` 和退出码 `2`，不会回退确定性模型制造伪成功。
+
+API 的 `Model`、`Embedding`、`Reranker` 配置分别选择 `Deterministic/OpenAI/AzureOpenAI`、
+`Deterministic/OpenAI/AzureOpenAI` 和 `Lexical/HttpSemantic`。真实提供方要求 HTTPS Endpoint、模型标识和
+仅由环境变量或 Secret 配置源提供的 API Key。Embedding 的 `Dimensions` 与 `IndexVersion` 必须和
+OpenSearch 的 `VectorDimensions`、`IndexName` 一致；模型或维度变化必须发布新索引，禁止混用旧向量。
+`Telemetry:OtlpEndpoint` 可选启用 OTLP，生产环境要求 HTTPS；遥测默认不记录 prompt、证据正文、记忆、
+工具参数和 Token。
+
 退出码 `0` 表示严格质量门禁通过，`2` 表示题集有效但质量或 Oracle 覆盖不足，`3` 表示题集或套件配置本身无效。当前 v1 150 题基线预期返回 `2`；CI 应把它视为真实阻断，不能改写为成功。v2 小套件必须通过才能接受新的策略变更。
 
 执行真实 SQL Server 多实例对账验收（会创建并自动销毁临时容器、数据库，最多并发七个 API 实例）：

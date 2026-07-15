@@ -11,5 +11,9 @@
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" />
     <!-- 显式覆盖 OpenAPI 包的易受攻击传递版本，修复 CVE-2026-49451。 -->
     <PackageReference Include="Microsoft.OpenApi" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" />
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Http" />
   </ItemGroup>
 </Project>
