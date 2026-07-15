@@ -425,7 +425,7 @@ $env:AIMENTOR_OIDC_TOKEN_B = '<subject-b-token>'
 ## 验证状态
 
 - 2026-07-15 本地自动化测试 249/249 通过；独立 v2 critical 套件扩展为 16/16 Pass，动作、引用和 Oracle 覆盖率均为 100%。PII Transform、跨用户记忆、工具精确参数/重放/过期、SQL Atlas 强杀恢复、OIDC/JWKS、Provider 配对、OpenSearch Alias 生命周期及运营任务脱敏均有自动化回归。
-- 2026-07-15 OpenSearch 3.5 容器验收尝试因 Docker Desktop Linux Engine 未运行而返回 `NotReady`，没有把 HTTP 契约测试描述为真实集群通过。
+- 2026-07-15 已恢复 Docker Desktop Linux Engine，并修复“只启动 OpenSearch 也被 SQL profile 密码插值阻断”的 Compose 回归；随后 `opensearchproject/opensearch:3.5.0` 镜像拉取持续无进度，真实集群验收仍为 `NotReady`。没有把 HTTP 契约测试描述为真实集群通过。
 
 - 2026-07-14 本地自动化测试 179/179 通过；新增严格题集哈希与套件完整性校验、v1/v2 schema 隔离、结构化 Oracle、Runner 侧可信 Fixture Registry、知识检索/内容安全/重排/回答四边界记录、真实输入安全、ACL 双主体及间接注入 CLEAN/MIXED 回归、精确引用 provenance、critical 阻断，以及 Target 自报 Ready、错误主体、未召回假绿、伪造安全轨迹、接受或错误拒绝恶意块、同 ID 替换正文、重复 Evidence、隔离后继续传播、输出 canary、恶意引用、always-refuse 等负向控制。InMemory 与 SQL Server 补偿路径继续覆盖加密快照、职责分离、幂等、结果不确定冻结和双人结案。严格 150 题基线为 0 Pass / 72 Fail / 78 NotReady，动作准确率 46.4%、动作覆盖率 83.33%、必需来源 micro recall 79.59%、完整 Oracle 覆盖率 0%，门禁按预期失败；独立 v2 critical 套件为 6/6 Pass，动作、引用和 Oracle 覆盖率均为 100%，门禁退出码 0；NuGet 直接与传递依赖未发现已知漏洞。
 - OpenSearch 请求契约已由自动化测试验证：索引映射、搜索管线、批量摄取，以及 BM25/k-NN 两个分支中的租户和 ACL 过滤。

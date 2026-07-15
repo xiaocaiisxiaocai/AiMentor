@@ -24,7 +24,8 @@ services:
     profiles: ["workflow"]
     environment:
       ACCEPT_EULA: "Y"
-      MSSQL_SA_PASSWORD: ${AIMENTOR_SQLSERVER_SA_PASSWORD:?请设置 AIMENTOR_SQLSERVER_SA_PASSWORD}
+      # Compose 在应用 profile 前解析变量；空值允许只启动 OpenSearch，SQL Server 自身仍会安全拒绝空密码。
+      MSSQL_SA_PASSWORD: ${AIMENTOR_SQLSERVER_SA_PASSWORD:-}
     ports:
       - "${AIMENTOR_SQLSERVER_PORT:-1433}:1433"
     volumes:
