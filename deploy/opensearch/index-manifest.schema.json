@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AiMentor OpenSearch index manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "physicalIndex", "expectedChunks", "vectorDimensions", "currentAlias", "previousAlias", "publishedAt"],
+  "properties": {
+    "schemaVersion": { "const": "1" },
+    "physicalIndex": { "type": "string", "pattern": "^aimentor-knowledge-[a-z0-9._-]+-[a-z0-9._-]+$" },
+    "expectedChunks": { "type": "integer", "minimum": 1 },
+    "vectorDimensions": { "type": "integer", "minimum": 1 },
+    "currentAlias": { "const": "aimentor-knowledge-current" },
+    "previousAlias": { "const": "aimentor-knowledge-previous" },
+    "publishedAt": { "type": "string", "format": "date-time" }
+  }
+}

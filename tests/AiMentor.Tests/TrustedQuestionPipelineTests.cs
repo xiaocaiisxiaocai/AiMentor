@@ -61,8 +61,9 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
             new RuleBasedRetrievedContentSafetyService());
         var recordingReranker = new RecordingEvidenceReranker(new LexicalEvidenceReranker());
         var recordingComposer = new RecordingAnswerComposer(new AgentFrameworkAnswerComposer(retrievalChatClient));
+        var recordingInputSafety = new RecordingInputSafetyService(new RuleBasedInputSafetyService());
         var targetService = new TrustedQuestionService(recordingRepository, _queryNormalizer,
-            new RuleBasedInputSafetyService(), recordingRetrievalSafety, recordingReranker,
+            recordingInputSafety, recordingRetrievalSafety, recordingReranker,
             new RuleBasedEvidenceSufficiencyEvaluator(), recordingComposer, new RuleBasedOutputSafetyService(),
             new InMemoryTraceSink(), new TrustedQuestionOptions(), new EmptyMemoryContextProvider(),
             new RuleBasedCitationMapper(), new RuleBasedCitationVerifier(), new RuleBasedEvidenceConflictDetector());
@@ -82,13 +83,17 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
         var operationalDefinitions = BuiltInOperationalEvaluationFixtures.Create();
         var operationalRegistry = new OperationalEvaluationFixtureRegistry(operationalDefinitions);
         foreach (var definition in operationalDefinitions) routes[definition.FixtureId] = operationalRegistry;
+        var piiDefinitions = BuiltInPiiEvaluationFixtures.Create();
+        var piiRegistry = new PiiPropagationEvaluationFixtureRegistry(recordingInputSafety, recordingRepository,
+            recordingComposer, piiDefinitions);
+        foreach (var definition in piiDefinitions) routes[definition.FixtureId] = piiRegistry;
 
         var results = await new EvaluationRunner(target,
             new RoutingEvaluationFixtureRegistry(routes)).RunAsync(cases);
         var report = EvaluationReportBuilder.Build(results);
 
-        Assert.Equal(12, report.Total);
-        Assert.Equal(12, report.Passed);
+        Assert.Equal(16, report.Total);
+        Assert.Equal(16, report.Passed);
         Assert.Equal(1, report.OracleCoverage);
         Assert.True(report.QualityGate.Passed);
     }

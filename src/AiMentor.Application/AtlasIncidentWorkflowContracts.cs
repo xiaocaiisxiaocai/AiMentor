@@ -72,6 +72,8 @@ public sealed record AtlasIncidentLeaseResult(bool Acquired, string? LeaseToken,
 public interface IAtlasIncidentStore
 {
     Task CreateAsync(AtlasIncidentCheckpoint checkpoint, CancellationToken cancellationToken = default);
+    Task<IReadOnlyList<AtlasIncidentCheckpoint>> ListAsync(AccessContext access, int limit,
+        CancellationToken cancellationToken = default);
     Task<AtlasIncidentCheckpoint?> GetAsync(string runId, AccessContext access,
         CancellationToken cancellationToken = default);
     Task<AtlasIncidentLeaseResult> TryAcquireAsync(string runId, AccessContext access, long expectedVersion,

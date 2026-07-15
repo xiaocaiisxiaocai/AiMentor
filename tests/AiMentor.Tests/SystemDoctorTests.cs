@@ -54,6 +54,15 @@ public sealed class SystemDoctorTests
     }
 
     [Fact]
+    public async Task ProductionRejectsProcessLocalAtlasIncidentStore()
+    {
+        var report = await RunAsync(ProductionOptions() with { AtlasIncidentStorePersistent = false });
+
+        Assert.False(report.IsReady);
+        Assert.Contains(report.Checks, item => item.Code == "ATLAS_SQL_REQUIRED");
+    }
+
+    [Fact]
     public async Task ProductionRejectsSandboxProvidersAndEmbeddingDimensionMismatch()
     {
         var report = await RunAsync(ProductionOptions() with
@@ -128,6 +137,7 @@ public sealed class SystemDoctorTests
         SubjectClaimConfigured = true,
         TenantClaimConfigured = true,
         WorkflowProvider = "SqlServer",
+        AtlasIncidentStorePersistent = true,
         MemoryKeyConfigured = true,
         MemoryKeyValid = true,
         WorkflowKeyRingConfigured = true,

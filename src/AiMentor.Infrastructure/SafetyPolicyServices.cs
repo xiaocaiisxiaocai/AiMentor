@@ -159,11 +159,25 @@ public sealed partial class RuleBasedOutputSafetyService : IOutputSafetyService
     public string PolicyVersion => SafetyPolicyVersions.Current;
 
     public SafetyDecision Review(string answer, IReadOnlyList<Evidence> evidence, IReadOnlyList<Citation> citations)
+        => ReviewContent(answer, evidence, citations).Decision;
+
+    public ContentSafetyReview ReviewContent(string answer, IReadOnlyList<Evidence> evidence, IReadOnlyList<Citation> citations)
     {
-        if (string.IsNullOrWhiteSpace(answer)) return Refuse("OUTPUT_EMPTY", "模型没有生成可审核的回答。");
-        if (SecretValue().IsMatch(answer)) return Refuse("OUTPUT_SECRET_LEAK", "模型输出疑似包含可用凭证，已阻止返回。");
-        if (PolicyBypassClaim().IsMatch(answer)) return Refuse("OUTPUT_POLICY_BYPASS", "模型输出疑似服从了越权指令，已阻止返回。");
-        if (citations.Count == 0) return Refuse("OUTPUT_WITHOUT_CITATION", "有证据回答必须至少包含一个可验证引用。");
+        if (string.IsNullOrWhiteSpace(answer)) return Result(Refuse("OUTPUT_EMPTY", "模型没有生成可审核的回答。"), answer);
+        if (SecretValue().IsMatch(answer)) return Result(Refuse("OUTPUT_SECRET_LEAK", "模型输出疑似包含可用凭证，已阻止返回。"), string.Empty);
+        if (PolicyBypassClaim().IsMatch(answer)) return Result(Refuse("OUTPUT_POLICY_BYPASS", "模型输出疑似服从了越权指令，已阻止返回。"), string.Empty);
+        var emailCount = OutputEmailPattern().Count(answer);
+        var phoneCount = OutputPhonePattern().Count(answer);
+        if (emailCount + phoneCount > 0)
+        {
+            var safe = OutputEmailPattern().Replace(answer, "<EMAIL_REDACTED>");
+            safe = OutputPhonePattern().Replace(safe, "<PHONE_REDACTED>");
+            var findings = new List<RedactionFinding>();
+            if (emailCount > 0) findings.Add(new("EMAIL", emailCount));
+            if (phoneCount > 0) findings.Add(new("MAINLAND_PHONE", phoneCount));
+            return new(new(SafetyAction.Transform, "OUTPUT_PII_REDACTED", "输出中的个人信息已不可逆脱敏。"), safe, findings);
+        }
+        if (citations.Count == 0) return Result(Refuse("OUTPUT_WITHOUT_CITATION", "有证据回答必须至少包含一个可验证引用。"), answer);
 
         foreach (var citation in citations)
         {
@@ -171,11 +185,11 @@ public sealed partial class RuleBasedOutputSafetyService : IOutputSafetyService
                 item.Chunk.DocumentId == citation.DocumentId
                 && item.Chunk.Version == citation.Version
                 && item.Chunk.Section == citation.Section);
-            if (source is null) return Refuse("CITATION_SOURCE_MISMATCH", "回答引用了本次证据集合之外的来源。");
+            if (source is null) return Result(Refuse("CITATION_SOURCE_MISMATCH", "回答引用了本次证据集合之外的来源。"), answer);
 
             var normalizedContent = Normalize(source.Chunk.Content);
             if (string.IsNullOrWhiteSpace(citation.Quote) || !normalizedContent.Contains(Normalize(citation.Quote), StringComparison.Ordinal))
-                return Refuse("CITATION_QUOTE_MISMATCH", "引用摘录无法在对应证据中验证。");
+                return Result(Refuse("CITATION_QUOTE_MISMATCH", "引用摘录无法在对应证据中验证。"), answer);
         }
 
         var groundingText = TrustedPresentationPrefix().Replace(answer, string.Empty);
@@ -183,10 +197,12 @@ public sealed partial class RuleBasedOutputSafetyService : IOutputSafetyService
         var evidenceTokens = EvidenceTextAnalysis.Tokens(string.Join(' ', evidence.Select(item => item.Chunk.Content)));
         var groundingCoverage = EvidenceTextAnalysis.Coverage(answerTokens, evidenceTokens);
         if (groundingCoverage < 0.15)
-            return Refuse("OUTPUT_NOT_GROUNDED", "模型输出与可访问证据缺少足够的词项对应关系。");
+            return Result(Refuse("OUTPUT_NOT_GROUNDED", "模型输出与可访问证据缺少足够的词项对应关系。"), answer);
 
-        return new SafetyDecision(SafetyAction.Allow, "OUTPUT_SAFE", "模型输出与结构化引用通过安全和一致性审核。");
+        return Result(new SafetyDecision(SafetyAction.Allow, "OUTPUT_SAFE", "模型输出与结构化引用通过安全和一致性审核。"), answer);
     }
+
+    private static ContentSafetyReview Result(SafetyDecision decision, string text) => new(decision, text, []);
 
     private static string Normalize(string value) =>
         string.Join(' ', value.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries));
@@ -201,4 +217,10 @@ public sealed partial class RuleBasedOutputSafetyService : IOutputSafetyService
 
     [GeneratedRegex(@"^\s*(?:根据当前可访问的正式知识|根据(?:当前)?证据)\s*[:：]?\s*", RegexOptions.CultureInvariant)]
     private static partial Regex TrustedPresentationPrefix();
+
+    [GeneratedRegex(@"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?![\w.-])", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)]
+    private static partial Regex OutputEmailPattern();
+
+    [GeneratedRegex(@"(?<!\d)(?:\+?86[ -]?)?1[3-9]\d{9}(?!\d)", RegexOptions.CultureInvariant)]
+    private static partial Regex OutputPhonePattern();
 }

@@ -18,6 +18,20 @@ public sealed class InMemoryAtlasIncidentStore(TimeProvider timeProvider) : IAtl
         return Task.CompletedTask;
     }
 
+    public Task<IReadOnlyList<AtlasIncidentCheckpoint>> ListAsync(AccessContext access, int limit,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (limit is < 1 or > 200) throw new ArgumentOutOfRangeException(nameof(limit));
+        IReadOnlyList<AtlasIncidentCheckpoint> result = _entries.Values.Select(entry =>
+            {
+                lock (entry.Gate) return ExpireIfNeeded(entry);
+            })
+            .Where(item => item.Access.TenantId == access.TenantId && item.Access.SubjectId == access.SubjectId)
+            .OrderByDescending(item => item.UpdatedAt).Take(limit).ToArray();
+        return Task.FromResult(result);
+    }
+
     public Task<AtlasIncidentCheckpoint?> GetAsync(string runId, AccessContext access,
         CancellationToken cancellationToken = default)
     {

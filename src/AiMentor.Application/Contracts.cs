@@ -74,7 +74,19 @@ public interface IInputSafetyService
 {
     string PolicyVersion { get; }
     SafetyDecision Review(string input);
+
+    /// <summary>返回后续组件唯一允许消费的安全文本；默认适配器保持现有实现兼容。</summary>
+    ContentSafetyReview ReviewContent(string input) => new(Review(input), input, []);
 }
+
+/// <summary>不携带原始敏感值的脱敏发现。</summary>
+public sealed record RedactionFinding(string Type, int Count);
+
+/// <summary>安全决定及完成不可逆转换后的文本。</summary>
+public sealed record ContentSafetyReview(
+    SafetyDecision Decision,
+    string SafeText,
+    IReadOnlyList<RedactionFinding> Findings);
 
 /// <summary>把检索内容视为不可信数据并隔离恶意指令或凭证。</summary>
 public interface IRetrievedContentSafetyService
@@ -109,6 +121,10 @@ public interface IOutputSafetyService
 {
     string PolicyVersion { get; }
     SafetyDecision Review(string answer, IReadOnlyList<Evidence> evidence, IReadOnlyList<Citation> citations);
+
+    /// <summary>返回可向调用方展示并继续做引用验证的安全文本。</summary>
+    ContentSafetyReview ReviewContent(string answer, IReadOnlyList<Evidence> evidence,
+        IReadOnlyList<Citation> citations) => new(Review(answer, evidence, citations), answer, []);
 }
 
 /// <summary>使用证据和只读记忆上下文编排回答，不负责生成引用。</summary>

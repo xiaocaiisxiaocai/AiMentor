@@ -10,9 +10,12 @@
     <ProjectReference Include="..\..\src\AiMentor.Domain\AiMentor.Domain.csproj" />
     <ProjectReference Include="..\..\src\AiMentor.Evaluation\AiMentor.Evaluation.csproj" />
     <ProjectReference Include="..\..\src\AiMentor.Infrastructure\AiMentor.Infrastructure.csproj" />
+    <ProjectReference Include="..\AiMentor.AtlasCrashHelper\AiMentor.AtlasCrashHelper.csproj"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="Microsoft.AspNetCore.TestHost" />
     <PackageReference Include="xunit" />
     <PackageReference Include="xunit.runner.visualstudio">
       <PrivateAssets>all</PrivateAssets>

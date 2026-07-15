@@ -169,7 +169,7 @@ public sealed class RecordingEvidenceReranker(IEvidenceReranker inner) : IEviden
         _recorder.BeginCapture("证据重排");
 }
 
-public sealed record AnswerCompositionCall(IReadOnlyList<RetrievedEvidenceObservation> Evidence);
+public sealed record AnswerCompositionCall(string Question, IReadOnlyList<RetrievedEvidenceObservation> Evidence);
 
 /// <summary>记录回答生成器实际收到的 Evidence，禁止仅凭最终文本推断隔离是否生效。</summary>
 public sealed class RecordingAnswerComposer(IAnswerComposer inner) : IAnswerComposer
@@ -182,7 +182,7 @@ public sealed class RecordingAnswerComposer(IAnswerComposer inner) : IAnswerComp
         var capture = _recorder.Current;
         capture?.EnsureOpen();
         var input = evidence.Select(RecordingKnowledgeRepository.ProjectEvidence).ToArray();
-        capture?.Add(new AnswerCompositionCall(input));
+        capture?.Add(new AnswerCompositionCall(question, input));
         var answer = await inner.ComposeAsync(question, evidence, memories, cancellationToken);
         return answer;
     }

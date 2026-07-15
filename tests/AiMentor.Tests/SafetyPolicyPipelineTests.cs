@@ -7,6 +7,58 @@ namespace AiMentor.Tests;
 
 public sealed class SafetyPolicyPipelineTests
 {
+    [Fact]
+    public void InputSafetyShouldIrreversiblyRedactEmailAndMainlandPhone()
+    {
+        const string email = "alice.fixture@example.test";
+        const string phone = "13800138000";
+        var review = new RuleBasedInputSafetyService().ReviewContent($"日志含 {email} 和 {phone}");
+
+        Assert.Equal(SafetyAction.Transform, review.Decision.Action);
+        Assert.Equal("PII_REDACTED", review.Decision.Code);
+        Assert.Equal("日志含 <EMAIL_REDACTED> 和 <PHONE_REDACTED>", review.SafeText);
+        Assert.DoesNotContain(email, review.SafeText, StringComparison.Ordinal);
+        Assert.DoesNotContain(phone, review.SafeText, StringComparison.Ordinal);
+        Assert.DoesNotContain("8000", review.SafeText, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("日志 token 是 sk_live_1234567890abcdef", "CREDENTIAL_DETECTED")]
+    [InlineData("整理身份证号 11010519491231002X", "SENSITIVE_PERSONAL_DATA")]
+    public void InputSafetyShouldRefuseCredentialAndHighRiskValuesBeforeTransform(string input, string code)
+    {
+        var review = new RuleBasedInputSafetyService().ReviewContent(input);
+
+        Assert.Equal(SafetyAction.Refuse, review.Decision.Action);
+        Assert.Equal(code, review.Decision.Code);
+        Assert.Empty(review.SafeText);
+        Assert.Empty(review.Findings);
+    }
+
+    [Fact]
+    public void InputSafetyShouldLeaveNonPiiControlUnchanged()
+    {
+        const string input = "故障日志含邮箱和手机号，默认应该怎样处理？";
+        var review = new RuleBasedInputSafetyService().ReviewContent(input);
+
+        Assert.Equal(SafetyAction.Allow, review.Decision.Action);
+        Assert.Equal(input, review.SafeText);
+        Assert.Empty(review.Findings);
+    }
+
+    [Fact]
+    public void OutputSafetyShouldReturnIrreversiblyRedactedTextBeforeCitationValidation()
+    {
+        const string email = "response.fixture@example.test";
+        const string phone = "13900139000";
+        var review = new RuleBasedOutputSafetyService().ReviewContent($"联系人 {email}，电话 {phone}", [], []);
+
+        Assert.Equal(SafetyAction.Transform, review.Decision.Action);
+        Assert.Equal("OUTPUT_PII_REDACTED", review.Decision.Code);
+        Assert.Equal("联系人 <EMAIL_REDACTED>，电话 <PHONE_REDACTED>", review.SafeText);
+        Assert.DoesNotContain(email, review.SafeText, StringComparison.Ordinal);
+        Assert.DoesNotContain(phone, review.SafeText, StringComparison.Ordinal);
+    }
     private static readonly AccessContext Access = AccessContext.Create("demo-beichen", "test-user", ["all-rnd"]);
 
     [Theory]

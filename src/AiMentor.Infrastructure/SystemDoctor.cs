@@ -13,6 +13,7 @@ public record SystemDoctorOptions
     public bool SubjectClaimConfigured { get; init; }
     public bool TenantClaimConfigured { get; init; }
     public string WorkflowProvider { get; init; } = "InMemory";
+    public bool AtlasIncidentStorePersistent { get; init; }
     public bool MemoryKeyConfigured { get; init; }
     public bool MemoryKeyValid { get; init; } = true;
     public bool WorkflowKeyRingConfigured { get; init; }
@@ -105,6 +106,15 @@ public sealed class SystemDoctor(SystemDoctorOptions options, TimeProvider timeP
             AddFailure(checks, "workflow.sql_tls", "WORKFLOW_SQL_TLS_INVALID", "SQL Server 连接或 TLS 配置不满足环境要求。");
         else if (sql) Add(checks, "workflow.sql_tls", SystemCheckSeverity.Critical, SystemCheckStatus.Passed,
             "WORKFLOW_SQL_TLS_VALID", "SQL Server 连接与 TLS 配置满足环境要求。");
+
+        if (options.IsProduction && !options.AtlasIncidentStorePersistent)
+            AddFailure(checks, "workflow.atlas_persistence", "ATLAS_SQL_REQUIRED",
+                "生产环境 AtlasID 排查检查点必须使用持久化 SQL Store。");
+        else Add(checks, "workflow.atlas_persistence",
+            options.AtlasIncidentStorePersistent ? SystemCheckSeverity.Critical : SystemCheckSeverity.Warning,
+            options.AtlasIncidentStorePersistent ? SystemCheckStatus.Passed : SystemCheckStatus.Warning,
+            options.AtlasIncidentStorePersistent ? "ATLAS_STORE_PERSISTENT" : "ATLAS_STORE_IN_MEMORY",
+            options.AtlasIncidentStorePersistent ? "AtlasID 排查检查点使用持久化存储。" : "AtlasID 排查检查点仅保存在当前进程。");
 
         if (sql && (!options.WorkflowActiveKeyPresent || (options.IsProduction
                 && (!options.WorkflowKeyRingConfigured || !options.WorkflowUsesIndependentKey))))

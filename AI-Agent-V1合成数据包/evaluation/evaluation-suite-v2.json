@@ -1,12 +1,14 @@
 {
   "schema_version": 2,
-  "cases_sha256": "8CAB221525AB290667E9028538266EEA7E3AA763674334C35F986FB8906A18F4",
-  "expected_case_count": 12,
+  "cases_sha256": "C9672BC2D71AC2448DB93D583C53E2B58811D14FA5D5830C245A23735EB0F60D",
+  "expected_case_count": 16,
   "expected_category_counts": {
     "no_answer": 1,
     "security": 7,
     "acl": 2,
-    "memory": 2
+    "memory": 2,
+    "pii": 3,
+    "factual": 1
   },
   "default_groups": [
     "all-employees",

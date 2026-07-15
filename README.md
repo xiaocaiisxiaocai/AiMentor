@@ -393,18 +393,39 @@ $env:Authentication__GroupsClaim = 'groups'
 
 调用时添加 `Authorization: Bearer <access-token>`。OIDC JWT 模式生成的 OpenAPI 会声明 Bearer 安全方案，并只给受保护的 v1 端点添加安全要求；健康检查保持匿名可用。
 
+OIDC 使用方必须明确自包含 JWT 的撤权窗口：服务校验签名、Issuer、Audience、有效期和唯一的主体/租户声明，并在未知 `kid` 时请求刷新 JWKS；但已经签发且仍在有效期内的 Token 不会因用户撤组或禁用而被本服务即时撤销。默认承诺是新 Token 立即反映权限变化，旧 Token 最长仍可使用其剩余 TTL 加 1 分钟 `ClockSkew`。需要即时撤权时必须由身份提供方提供 introspection、CAE 或等价机制，并在接入前另行实现和验收。
+
+真实双主体 OIDC 验收是显式 opt-in，不把缺少凭据算作成功：
+
+```powershell
+$env:AIMENTOR_OIDC_API_BASE = 'https://api.example.com'
+$env:AIMENTOR_OIDC_TOKEN_A = '<subject-a-token>'
+$env:AIMENTOR_OIDC_TOKEN_B = '<subject-b-token>'
+.\scripts\Test-OidcAcceptance.ps1
+```
+
+脚本只输出 Token 的短 SHA-256 哈希和稳定结果码；缺少环境变量或外部服务不可达时退出码为 `2`（NotReady），策略失败为 `1`，通过为 `0`。
+
 依赖审计曾阻止引入存在 CVE-2026-49451 的 `Microsoft.OpenApi 2.0.0`，当前已显式固定到官方修复版本 2.7.5，并通过全解决方案传递依赖漏洞检查。
+
+## 生产验收入口
+
+- PII 闭环会把普通问答中的邮箱和大陆手机号不可逆替换为类型占位符；凭证、身份证和高风险长数字仍失败关闭。v2 critical 已通过独立传播 Fixture 验证原值不会进入检索或模型边界。
+- AtlasID Workflow 在 SQL Server 模式使用 `009_atlas_incident_runs.sql`、加密载荷、版本号和短租约；测试通过独立 Helper 进程强杀验证租约到期接管。
+- Provider 对比使用 `AiMentor.Evaluation --compare --output <path>`，Chat、Embedding、Reranker 必须分别配置。缺少任一远端配置时 candidate 为 `NotReady` 并退出 `2`，不会回退确定性实现；用量未知为 `null`，成本只按显式带版本价格计算。
+- OpenSearch 发布使用 `scripts/Publish-OpenSearchIndex.ps1` 创建不可变物理索引，全部校验通过后原子切换 `current/previous` Alias；`scripts/Rollback-OpenSearchIndex.ps1` 原子回滚。Production 禁止启动时同步写索引。
+- 运营工作台位于 `/ops/`，统一展示审批、`OutcomeUnknown`、补偿和 AtlasID 运行的脱敏任务摘要；服务端仍是唯一授权边界。
 
 ## 下一阶段
 
-1. 继续迁移 critical 题：v2 已收录输入安全、`BK-POL-009` 文档级 ACL 双主体及间接注入 CLEAN/MIXED 配对；其余题必须先完成更多真实受限资源、真实工具参数与调用记录、PII 脱敏、撤权缓存和跨用户记忆状态 Fixture，不得把普通证据不足或缺少工具能力当作安全正确性证明。
-2. 为事实题补 `required_claims / forbidden_claims`，为 Workflow、冲突和记忆题补阶段事件、工具调用、状态变化及终态 Oracle；人工签核前不得提升覆盖率。
-3. 接入真实身份提供方做两个主体的有效 Token 端到端验收，并覆盖密钥轮换、过期 Token、错误 audience、组变更和审批人离职场景。
-4. 将内存轨迹替换为 OpenTelemetry + 持久化审计存储；增加延迟、成本、越权泄漏率、恶意文档隔离率和引用正确率门禁。
-5. 在 V1 知识与场景主路径完成前冻结新的修改工具；现有 `OutcomeUnknown` 继续按专属探测和双人对账处理，后续再建设人工任务队列与超时升级。
-6. 接入真实模型、嵌入与语义重排供应商，比较当前确定性重排、归一化加权和 RRF 等策略，并运行同一套严格回归，确认沙箱与生产适配器行为边界。
+1. 在已授权环境运行真实 OIDC 双主体脚本、真实 Provider 对比和 OpenSearch 容器验收；缺少外部凭据或 Docker 引擎时必须保持 `NotReady`。
+2. 为 Atlas SQL、OpenSearch Alias 和运营任务队列增加 Linux 容器 CI，避免仅依赖 Windows LocalDB。
+3. 将运营工作台的动作面继续绑定双人复核、SLA 升级和持久审计，不在前端放宽任何权限。
 
 ## 验证状态
+
+- 2026-07-15 本地自动化测试 249/249 通过；独立 v2 critical 套件扩展为 16/16 Pass，动作、引用和 Oracle 覆盖率均为 100%。PII Transform、跨用户记忆、工具精确参数/重放/过期、SQL Atlas 强杀恢复、OIDC/JWKS、Provider 配对、OpenSearch Alias 生命周期及运营任务脱敏均有自动化回归。
+- 2026-07-15 OpenSearch 3.5 容器验收尝试因 Docker Desktop Linux Engine 未运行而返回 `NotReady`，没有把 HTTP 契约测试描述为真实集群通过。
 
 - 2026-07-14 本地自动化测试 179/179 通过；新增严格题集哈希与套件完整性校验、v1/v2 schema 隔离、结构化 Oracle、Runner 侧可信 Fixture Registry、知识检索/内容安全/重排/回答四边界记录、真实输入安全、ACL 双主体及间接注入 CLEAN/MIXED 回归、精确引用 provenance、critical 阻断，以及 Target 自报 Ready、错误主体、未召回假绿、伪造安全轨迹、接受或错误拒绝恶意块、同 ID 替换正文、重复 Evidence、隔离后继续传播、输出 canary、恶意引用、always-refuse 等负向控制。InMemory 与 SQL Server 补偿路径继续覆盖加密快照、职责分离、幂等、结果不确定冻结和双人结案。严格 150 题基线为 0 Pass / 72 Fail / 78 NotReady，动作准确率 46.4%、动作覆盖率 83.33%、必需来源 micro recall 79.59%、完整 Oracle 覆盖率 0%，门禁按预期失败；独立 v2 critical 套件为 6/6 Pass，动作、引用和 Oracle 覆盖率均为 100%，门禁退出码 0；NuGet 直接与传递依赖未发现已知漏洞。
 - OpenSearch 请求契约已由自动化测试验证：索引映射、搜索管线、批量摄取，以及 BM25/k-NN 两个分支中的租户和 ACL 过滤。

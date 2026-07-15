@@ -52,6 +52,9 @@ if (jwtAuthenticationEnabled)
         jwtOptions.Authority = authenticationOptions.Authority;
         jwtOptions.Audience = authenticationOptions.Audience;
         jwtOptions.RequireHttpsMetadata = true;
+        jwtOptions.RefreshOnIssuerKeyNotFound = true;
+        jwtOptions.RefreshInterval = TimeSpan.FromMinutes(5);
+        jwtOptions.AutomaticRefreshInterval = TimeSpan.FromHours(12);
         jwtOptions.MapInboundClaims = false;
         jwtOptions.IncludeErrorDetails = false;
         jwtOptions.TokenValidationParameters = new TokenValidationParameters
@@ -62,6 +65,15 @@ if (jwtAuthenticationEnabled)
             ValidateIssuerSigningKey = true,
             NameClaimType = authenticationOptions.SubjectClaim,
             ClockSkew = TimeSpan.FromMinutes(1)
+        };
+        jwtOptions.Events = new JwtBearerEvents
+        {
+            OnTokenValidated = context =>
+            {
+                try { _ = ClaimsAccessContextProvider.CreateValidated(context.Principal!, authenticationOptions); }
+                catch (UnauthorizedAccessException) { context.Fail("JWT 身份声明无效或存在歧义。"); }
+                return Task.CompletedTask;
+            }
         };
     });
     builder.Services.AddAuthorization(authorizationOptions => authorizationOptions.AddPolicy("question-api", policy =>
@@ -92,7 +104,7 @@ builder.Services.AddRateLimiter(rateLimitOptions =>
 {
     rateLimitOptions.AddPolicy("questions", context =>
     {
-        var partitionKey = context.User.FindFirst("sub")?.Value
+        var partitionKey = context.User.FindFirst(authenticationOptions.SubjectClaim)?.Value
             ?? context.Connection.RemoteIpAddress?.ToString()
             ?? "unknown";
         return RateLimitPartition.GetFixedWindowLimiter(partitionKey, _ => new FixedWindowRateLimiterOptions
@@ -153,11 +165,18 @@ if (string.Equals(ragProvider, "OpenSearch", StringComparison.OrdinalIgnoreCase)
             Convert.ToBase64String(Encoding.UTF8.GetBytes($"{username}:{password}")));
     }
     builder.Services.AddSingleton(client);
+    var openSearchIndexName = builder.Configuration["OpenSearch:IndexName"] ?? "aimentor-knowledge-v1";
+    var synchronizeOpenSearchOnStartup = builder.Configuration.GetValue("OpenSearch:SynchronizeOnStartup", true);
+    if (builder.Environment.IsProduction() && synchronizeOpenSearchOnStartup)
+        throw new InvalidOperationException("Production 禁止 OpenSearch 启动同步，必须通过蓝绿索引发布流程切换 alias。");
+    if (builder.Environment.IsProduction()
+        && !string.Equals(openSearchIndexName, "aimentor-knowledge-current", StringComparison.Ordinal))
+        throw new InvalidOperationException("Production OpenSearch 读路径必须使用 aimentor-knowledge-current alias。");
     builder.Services.AddSingleton(new OpenSearchOptions
     {
-        IndexName = builder.Configuration["OpenSearch:IndexName"] ?? "aimentor-knowledge-v1",
+        IndexName = openSearchIndexName,
         SearchPipelineName = builder.Configuration["OpenSearch:SearchPipelineName"] ?? "aimentor-hybrid-v1",
-        SynchronizeOnStartup = builder.Configuration.GetValue("OpenSearch:SynchronizeOnStartup", true)
+        SynchronizeOnStartup = synchronizeOpenSearchOnStartup
     });
     builder.Services.AddSingleton<IKnowledgeRepository, OpenSearchKnowledgeRepository>();
 }
@@ -316,9 +335,12 @@ builder.Services.AddSingleton<IMemoryWorkflowService, MemoryWorkflowService>();
 builder.Services.AddSingleton(new MemoryContextOptions());
 builder.Services.AddSingleton<IMemoryContextProvider, SafeMemoryContextProvider>();
 builder.Services.AddSingleton(new AtlasIncidentWorkflowOptions());
-// 当前仅提供单进程并发安全恢复；接口可替换为 SQL Store，但此实现不宣称跨重启耐久。
-builder.Services.AddSingleton<IAtlasIncidentStore, InMemoryAtlasIncidentStore>();
+if (string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase))
+    builder.Services.AddSingleton<IAtlasIncidentStore, SqlServerAtlasIncidentStore>();
+else
+    builder.Services.AddSingleton<IAtlasIncidentStore, InMemoryAtlasIncidentStore>();
 builder.Services.AddSingleton<IAtlasIncidentWorkflow, AtlasIncidentWorkflow>();
+builder.Services.AddSingleton<IOperationsTaskService, OperationsTaskService>();
 
 var configuredWorkflowKeys = builder.Configuration.GetSection("Workflow:Encryption:Keys").GetChildren().ToArray();
 var openSearchUsername = builder.Configuration["OpenSearch:Username"]
@@ -335,6 +357,7 @@ builder.Services.AddSingleton(new SystemDoctorOptions
     SubjectClaimConfigured = !string.IsNullOrWhiteSpace(authenticationOptions.SubjectClaim),
     TenantClaimConfigured = !string.IsNullOrWhiteSpace(authenticationOptions.TenantClaim),
     WorkflowProvider = workflowProvider,
+    AtlasIncidentStorePersistent = string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase),
     MemoryKeyConfigured = !string.IsNullOrWhiteSpace(configuredMemoryKey),
     MemoryKeyValid = memoryKey.Length == 32,
     WorkflowKeyRingConfigured = configuredWorkflowKeys.Length > 0,
@@ -381,6 +404,8 @@ if (!string.IsNullOrWhiteSpace(otlpEndpoint))
 
 var app = builder.Build();
 app.UseExceptionHandler();
+app.UseDefaultFiles();
+app.UseStaticFiles();
 if (jwtAuthenticationEnabled)
 {
     app.UseAuthentication();
@@ -422,6 +447,10 @@ app.MapGet("/health", async (ISystemDoctor doctor, CancellationToken cancellatio
 
 var v1 = app.MapGroup("/api/v1").WithTags("AiMentor v1");
 if (jwtAuthenticationEnabled) v1.RequireAuthorization("question-api");
+v1.MapGet("/operations/tasks", ListOperationsTasksAsync)
+    .WithName("ListOperationsTasksV1").WithTags("AiMentor operations v1")
+    .Produces<OperationsTaskPage>();
+app.MapGet("/ops", () => Results.Redirect("/ops/index.html", permanent: false)).ExcludeFromDescription();
 v1.MapGet("/knowledge/stats", () => Results.Ok(repository.Statistics))
     .WithName("GetKnowledgeStatisticsV1").Produces<KnowledgeStatistics>();
 v1.MapPost("/questions", AskAsync)
@@ -837,6 +866,23 @@ static async Task<IResult> ListToolApprovalsAsync(ToolApprovalStatus? status, IT
     catch (ToolApprovalException exception)
     {
         return ToolApprovalProblem(exception, context);
+    }
+}
+
+static async Task<IResult> ListOperationsTasksAsync(string? type, string? status, string? cursor, int? limit,
+    IOperationsTaskService service, IRequestAccessContextProvider accessProvider, HttpContext context,
+    CancellationToken cancellationToken)
+{
+    try
+    {
+        var page = await service.ListAsync(accessProvider.GetAccessContext(context.User), type, status, cursor,
+            limit ?? 50, cancellationToken);
+        return Results.Ok(page);
+    }
+    catch (ArgumentException exception)
+    {
+        return Results.Problem(statusCode: StatusCodes.Status400BadRequest, title: "运营任务查询参数无效",
+            detail: exception.Message, type: "https://httpstatuses.com/400");
     }
 }
 

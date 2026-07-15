@@ -7,7 +7,7 @@
     <Project Path="src/AiMentor.Evaluation/AiMentor.Evaluation.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/AiMentor.AtlasCrashHelper/AiMentor.AtlasCrashHelper.csproj" />
     <Project Path="tests/AiMentor.Tests/AiMentor.Tests.csproj" />
   </Folder>
 </Solution>
-

@@ -71,4 +71,38 @@ public sealed class RequestAccessContextProviderTests
         Assert.Equal("fixed-developer", access.SubjectId);
         Assert.DoesNotContain("security", access.Groups);
     }
+
+    [Fact]
+    public void ClaimsProviderShouldAcceptRepeatedAndJsonArrayGroupClaims()
+    {
+        var principal = new ClaimsPrincipal(new ClaimsIdentity(
+        [
+            new Claim("sub", "user-001"), new Claim("tenant_id", "demo-beichen"),
+            new Claim("groups", "readers"), new Claim("groups", "[\"operators\",\"auditors\"]")
+        ], "Bearer"));
+
+        var access = new ClaimsAccessContextProvider(Options).GetAccessContext(principal);
+
+        Assert.Equal(3, access.Groups.Count);
+        Assert.Contains("operators", access.Groups);
+    }
+
+    [Fact]
+    public void ClaimsProviderShouldRejectDuplicateIdentityAndNonStringGroupArray()
+    {
+        var duplicate = new ClaimsPrincipal(new ClaimsIdentity(
+        [
+            new Claim("sub", "user-001"), new Claim("sub", "user-002"),
+            new Claim("tenant_id", "demo-beichen")
+        ], "Bearer"));
+        var invalidGroups = new ClaimsPrincipal(new ClaimsIdentity(
+        [
+            new Claim("sub", "user-001"), new Claim("tenant_id", "demo-beichen"),
+            new Claim("groups", "[\"readers\",7]")
+        ], "Bearer"));
+
+        var provider = new ClaimsAccessContextProvider(Options);
+        Assert.Throws<UnauthorizedAccessException>(() => provider.GetAccessContext(duplicate));
+        Assert.Throws<UnauthorizedAccessException>(() => provider.GetAccessContext(invalidGroups));
+    }
 }

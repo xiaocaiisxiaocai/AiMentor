@@ -25,16 +25,29 @@ public sealed class TrustedQuestionService(
         var trace = new List<TraceStep>();
         Trace("run.started", "ok", new Dictionary<string, object?> { ["tenant"] = question.Access.TenantId, ["subject"] = question.Access.SubjectId });
 
-        var safetyDecision = safety.Review(question.Question);
+        var inputReview = safety.ReviewContent(question.Question);
+        var safetyDecision = inputReview.Decision;
         Trace("input.safety", safetyDecision.Action.ToString(), new Dictionary<string, object?>
         {
             ["code"] = safetyDecision.Code,
-            ["policyVersion"] = safety.PolicyVersion
+            ["policyVersion"] = safety.PolicyVersion,
+            ["redactionTypes"] = string.Join(',', inputReview.Findings.Select(item => item.Type).Distinct(StringComparer.Ordinal)),
+            ["redactionCount"] = inputReview.Findings.Sum(item => item.Count)
         });
-        if (safetyDecision.Action != SafetyAction.Allow)
+        if (safetyDecision.Action is SafetyAction.Refuse or SafetyAction.RequireApproval)
         {
             return await CompleteAsync(AnswerDecision.Refused, safetyDecision.Message, false, safetyDecision, [], trace);
         }
+        if (safetyDecision.Action == SafetyAction.Transform
+            && (string.IsNullOrWhiteSpace(inputReview.SafeText)
+                || string.Equals(inputReview.SafeText, question.Question, StringComparison.Ordinal)
+                || inputReview.Findings.Count == 0))
+        {
+            var invalid = new SafetyDecision(SafetyAction.Refuse, "PII_TRANSFORM_INVALID",
+                "个人信息转换未形成可验证的安全文本，已停止处理。");
+            return await CompleteAsync(AnswerDecision.Refused, invalid.Message, false, invalid, [], trace);
+        }
+        var safeQuestion = inputReview.SafeText;
 
         if (string.IsNullOrWhiteSpace(question.Access.TenantId) || string.IsNullOrWhiteSpace(question.Access.SubjectId))
         {
@@ -43,8 +56,8 @@ public sealed class TrustedQuestionService(
             return await CompleteAsync(AnswerDecision.Refused, invalid.Message, false, invalid, [], trace);
         }
 
-        var normalizedQuery = queryNormalizer.Normalize(question.Question);
-        Trace("query.normalized", string.Equals(normalizedQuery, question.Question, StringComparison.Ordinal) ? "unchanged" : "normalized",
+        var normalizedQuery = queryNormalizer.Normalize(safeQuestion);
+        Trace("query.normalized", string.Equals(normalizedQuery, safeQuestion, StringComparison.Ordinal) ? "unchanged" : "normalized",
             new Dictionary<string, object?> { ["characterCount"] = normalizedQuery.Length });
         var retrievedCandidates = await knowledge.SearchAsync(normalizedQuery, question.Access, options.SearchLimit, cancellationToken);
         Trace("knowledge.search", retrievedCandidates.Count > 0 ? "found" : "empty", new Dictionary<string, object?>
@@ -62,13 +75,13 @@ public sealed class TrustedQuestionService(
             ["policyVersion"] = retrievedContentSafety.PolicyVersion
         });
 
-        var evidence = await reranker.RerankAsync(question.Question, contentReview.AcceptedEvidence, cancellationToken);
+        var evidence = await reranker.RerankAsync(safeQuestion, contentReview.AcceptedEvidence, cancellationToken);
         Trace("evidence.rerank", evidence.Count > 0 ? "ranked" : "empty", new Dictionary<string, object?>
         {
             ["candidateCount"] = evidence.Count,
             ["topRerankedScore"] = evidence.Count > 0 ? evidence[0].Score : 0
         });
-        var assessment = sufficiencyEvaluator.Evaluate(question.Question, evidence, options.MinimumTopScore);
+        var assessment = sufficiencyEvaluator.Evaluate(safeQuestion, evidence, options.MinimumTopScore);
         if (!assessment.IsSufficient || evidence.Count < options.MinimumEvidenceCount)
         {
             Trace("evidence.gate", "insufficient", new Dictionary<string, object?>
@@ -103,23 +116,44 @@ public sealed class TrustedQuestionService(
         }
         try
         {
-            var memories = await memoryContext.GetRelevantAsync(question.Question, question.Access, question.SessionId,
+            var memories = await memoryContext.GetRelevantAsync(safeQuestion, question.Access, question.SessionId,
                 cancellationToken);
             Trace("memory.context", memories.Count > 0 ? "injected" : "empty", new Dictionary<string, object?>
             {
                 ["count"] = memories.Count,
                 ["scopes"] = string.Join(',', memories.Select(item => item.Scope).Distinct())
             });
-            var answer = await composer.ComposeAsync(question.Question, evidence, memories, cancellationToken);
-            var preflight = outputSafety.Review(answer, evidence, []);
-            if (preflight.Code != "OUTPUT_WITHOUT_CITATION")
+            var answer = await composer.ComposeAsync(safeQuestion, evidence, memories, cancellationToken);
+            var preflight = outputSafety.ReviewContent(answer, evidence, []);
+            SafetyDecision? outputTransform = null;
+            if (preflight.Decision.Action == SafetyAction.Transform)
             {
-                Trace("output.safety", preflight.Action.ToString(), new Dictionary<string, object?>
+                if (string.IsNullOrWhiteSpace(preflight.SafeText)
+                    || string.Equals(preflight.SafeText, answer, StringComparison.Ordinal)
+                    || preflight.Findings.Count == 0)
                 {
-                    ["code"] = preflight.Code,
+                    var invalid = new SafetyDecision(SafetyAction.Refuse, "OUTPUT_PII_TRANSFORM_INVALID",
+                        "输出脱敏未形成可验证的安全文本，已阻止返回。");
+                    return await CompleteAsync(AnswerDecision.Refused, invalid.Message, false, invalid, [], trace);
+                }
+                answer = preflight.SafeText;
+                outputTransform = preflight.Decision;
+                Trace("output.transform", "Transform", new Dictionary<string, object?>
+                {
+                    ["code"] = preflight.Decision.Code,
+                    ["redactionTypes"] = string.Join(',', preflight.Findings.Select(item => item.Type).Distinct(StringComparer.Ordinal)),
+                    ["redactionCount"] = preflight.Findings.Sum(item => item.Count),
                     ["policyVersion"] = outputSafety.PolicyVersion
                 });
-                return await CompleteAsync(AnswerDecision.Refused, preflight.Message, false, preflight, [], trace);
+            }
+            else if (preflight.Decision.Code != "OUTPUT_WITHOUT_CITATION")
+            {
+                Trace("output.safety", preflight.Decision.Action.ToString(), new Dictionary<string, object?>
+                {
+                    ["code"] = preflight.Decision.Code,
+                    ["policyVersion"] = outputSafety.PolicyVersion
+                });
+                return await CompleteAsync(AnswerDecision.Refused, preflight.Decision.Message, false, preflight.Decision, [], trace);
             }
             var citations = citationMapper.Map(answer, evidence);
             Trace("citation.mapping", citations.Count > 0 ? "mapped" : "empty", new Dictionary<string, object?>
@@ -138,7 +172,7 @@ public sealed class TrustedQuestionService(
                 return await CompleteAsync(AnswerDecision.Refused, verification.Message, false, invalidCitation, [], trace);
             }
             Trace("answer.composed", "ok", new Dictionary<string, object?> { ["citationCount"] = citations.Count });
-            var outputDecision = outputSafety.Review(answer, evidence, citations);
+            var outputDecision = outputSafety.ReviewContent(answer, evidence, citations).Decision;
             Trace("output.safety", outputDecision.Action.ToString(), new Dictionary<string, object?>
             {
                 ["code"] = outputDecision.Code,
@@ -147,7 +181,8 @@ public sealed class TrustedQuestionService(
             if (outputDecision.Action != SafetyAction.Allow)
                 return await CompleteAsync(AnswerDecision.Refused, outputDecision.Message, false, outputDecision, [], trace);
 
-            return await CompleteAsync(AnswerDecision.Answered, answer, true, safetyDecision, citations, trace);
+            return await CompleteAsync(AnswerDecision.Answered, answer, true,
+                outputTransform ?? safetyDecision, citations, trace);
         }
         catch (Exception exception) when (exception is not OperationCanceledException)
         {
