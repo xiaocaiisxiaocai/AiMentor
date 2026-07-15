@@ -472,7 +472,7 @@ public sealed class SqlServerToolExecutionLedger(
         command.CommandText = $"""
             SELECT TOP (@limit) ExecutionKey,TenantId,SubjectId,ToolName,RunId,CreatedAt,UpdatedAt
             FROM dbo.{TableName}
-            WHERE TenantId=@tenantId AND Status=3
+            WHERE TenantId COLLATE Latin1_General_100_BIN2=@tenantId AND Status=3
             ORDER BY UpdatedAt DESC;
             """;
         AddInt(command, "@limit", limit);
@@ -498,7 +498,8 @@ public sealed class SqlServerToolExecutionLedger(
         command.CommandText = $"""
             SELECT ExecutionKey,TenantId,SubjectId,ToolName,RunId,CreatedAt,UpdatedAt,RequestFingerprint
             FROM dbo.{TableName}
-            WHERE ExecutionKey=@key AND TenantId=@tenantId AND Status=3;
+            WHERE ExecutionKey COLLATE Latin1_General_100_BIN2=@key
+              AND TenantId COLLATE Latin1_General_100_BIN2=@tenantId AND Status=3;
             """;
         AddAnsiString(command, "@key", 64, executionKey);
         AddString(command, "@tenantId", 128, tenantId);
@@ -522,7 +523,9 @@ public sealed class SqlServerToolExecutionLedger(
         await using (var ledger = connection.CreateCommand())
         {
             ledger.Transaction = transaction;
-            ledger.CommandText = $"SELECT Status FROM dbo.{TableName} WITH (UPDLOCK,HOLDLOCK) WHERE ExecutionKey=@key AND TenantId=@tenant;";
+            ledger.CommandText = $"SELECT Status FROM dbo.{TableName} WITH (UPDLOCK,HOLDLOCK) " +
+                "WHERE ExecutionKey COLLATE Latin1_General_100_BIN2=@key " +
+                "AND TenantId COLLATE Latin1_General_100_BIN2=@tenant;";
             AddAnsiString(ledger, "@key", 64, review.ExecutionKey); AddString(ledger, "@tenant", 128, review.TenantId);
             var statusValue = await ledger.ExecuteScalarAsync(cancellationToken);
             if (statusValue is null || Convert.ToByte(statusValue, CultureInfo.InvariantCulture) != 3)
@@ -654,18 +657,23 @@ public sealed class SqlServerToolExecutionLedger(
                 IF OBJECT_ID(N'dbo.{TableName}',N'U') IS NULL
                 BEGIN
                   CREATE TABLE dbo.{TableName}(
-                    ExecutionKey char(64) NOT NULL CONSTRAINT PK_{TableName} PRIMARY KEY,
-                    RequestFingerprint char(64) NOT NULL,RunId nvarchar(128) NOT NULL,Status tinyint NOT NULL,
-                    TenantId nvarchar(128) NULL,SubjectId nvarchar(256) NULL,ToolName nvarchar(128) NULL,
+                    ExecutionKey char(64) COLLATE Latin1_General_100_BIN2 NOT NULL
+                      CONSTRAINT PK_{TableName} PRIMARY KEY,
+                    RequestFingerprint char(64) NOT NULL,
+                    RunId nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL,Status tinyint NOT NULL,
+                    TenantId nvarchar(128) COLLATE Latin1_General_100_BIN2 NULL,
+                    SubjectId nvarchar(256) COLLATE Latin1_General_100_BIN2 NULL,ToolName nvarchar(128) NULL,
                     LeaseToken nvarchar(64) NOT NULL,LeaseExpiresAt datetimeoffset(7) NOT NULL,
                     KeyVersion nvarchar(64) NULL,ResultCipher nvarchar(max) NULL,
                     CreatedAt datetimeoffset(7) NOT NULL,UpdatedAt datetimeoffset(7) NOT NULL,RowVersion rowversion NOT NULL);
                   CREATE INDEX IX_{TableName}_StatusUpdated ON dbo.{TableName}(Status,UpdatedAt);
                 END;
                 IF COL_LENGTH(N'dbo.{TableName}',N'TenantId') IS NULL
-                    ALTER TABLE dbo.{TableName} ADD TenantId nvarchar(128) NULL;
+                    ALTER TABLE dbo.{TableName} ADD TenantId nvarchar(128)
+                      COLLATE Latin1_General_100_BIN2 NULL;
                 IF COL_LENGTH(N'dbo.{TableName}',N'SubjectId') IS NULL
-                    ALTER TABLE dbo.{TableName} ADD SubjectId nvarchar(256) NULL;
+                    ALTER TABLE dbo.{TableName} ADD SubjectId nvarchar(256)
+                      COLLATE Latin1_General_100_BIN2 NULL;
                 IF COL_LENGTH(N'dbo.{TableName}',N'ToolName') IS NULL
                     ALTER TABLE dbo.{TableName} ADD ToolName nvarchar(128) NULL;
                 IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.{TableName}')
@@ -675,12 +683,15 @@ public sealed class SqlServerToolExecutionLedger(
                 IF OBJECT_ID(N'dbo.AiMentorToolReconciliations',N'U') IS NULL
                 BEGIN
                   CREATE TABLE dbo.AiMentorToolReconciliations(
-                    ExecutionKey char(64) NOT NULL CONSTRAINT PK_AiMentorToolReconciliations PRIMARY KEY,
-                    TenantId nvarchar(128) NOT NULL,EvidenceState tinyint NOT NULL,
+                    ExecutionKey char(64) COLLATE Latin1_General_100_BIN2 NOT NULL
+                      CONSTRAINT PK_AiMentorToolReconciliations PRIMARY KEY,
+                    TenantId nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL,EvidenceState tinyint NOT NULL,
                     EvidenceCode nvarchar(128) NOT NULL,EvidenceObservedAt datetimeoffset(7) NOT NULL,
-                    EvidenceExpiresAt datetimeoffset(7) NOT NULL,FirstReviewerSubjectId nvarchar(256) NOT NULL,
+                    EvidenceExpiresAt datetimeoffset(7) NOT NULL,
+                    FirstReviewerSubjectId nvarchar(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
                     FirstConfirmed bit NOT NULL,FirstReasonHash char(64) NOT NULL,
-                    FirstReviewedAt datetimeoffset(7) NOT NULL,SecondReviewerSubjectId nvarchar(256) NULL,
+                    FirstReviewedAt datetimeoffset(7) NOT NULL,
+                    SecondReviewerSubjectId nvarchar(256) COLLATE Latin1_General_100_BIN2 NULL,
                     SecondConfirmed bit NULL,SecondReasonHash char(64) NULL,SecondReviewedAt datetimeoffset(7) NULL,
                     Status tinyint NOT NULL,UpdatedAt datetimeoffset(7) NOT NULL,RowVersion rowversion NOT NULL,
                     CONSTRAINT FK_AiMentorToolReconciliations_Execution FOREIGN KEY(ExecutionKey)

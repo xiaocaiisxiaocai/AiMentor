@@ -6,12 +6,17 @@
   <title>AiMentor 运营指挥台</title>
   <link rel="icon" href="data:,">
   <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="session.css">
 </head>
 <body>
 <a class="skip" href="#task-list">跳到任务列表</a>
 <header>
   <div><p class="eyebrow">AIMENTOR / OPERATIONS</p><h1>运营指挥台</h1></div>
-  <div class="health"><span id="signal" aria-hidden="true"></span><span id="connection">正在连接</span></div>
+  <div class="session">
+    <div class="health"><span id="signal" aria-hidden="true"></span><span id="connection">正在连接</span></div>
+    <a id="login" href="/ops/login?returnUrl=%2Fops%2Findex.html" hidden>登录</a>
+    <button id="logout" type="button" hidden>退出</button>
+  </div>
 </header>
 <main>
   <aside aria-label="任务过滤">

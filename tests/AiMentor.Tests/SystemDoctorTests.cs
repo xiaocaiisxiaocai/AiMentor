@@ -63,6 +63,32 @@ public sealed class SystemDoctorTests
     }
 
     [Fact]
+    public async Task ProductionRejectsProcessLocalMemoryStore()
+    {
+        var report = await RunAsync(ProductionOptions() with { MemoryStorePersistent = false });
+
+        Assert.False(report.IsReady);
+        Assert.Contains(report.Checks, item => item.Code == "MEMORY_SQL_REQUIRED");
+    }
+
+    [Fact]
+    public async Task RetentionFailureKeepsReadinessRedUntilNextSuccessfulPurge()
+    {
+        var health = new MemoryRetentionHealthState(true);
+        health.MarkFailure();
+        var doctor = new SystemDoctor(ProductionOptions(), TimeProvider.System, health);
+
+        var failed = await doctor.RunAsync();
+        Assert.False(failed.IsReady);
+        Assert.Contains(failed.Checks, item => item.Code == "MEMORY_RETENTION_FAILED");
+
+        health.MarkSuccess();
+        var recovered = await doctor.RunAsync();
+        Assert.True(recovered.IsReady);
+        Assert.Contains(recovered.Checks, item => item.Code == "MEMORY_RETENTION_HEALTHY");
+    }
+
+    [Fact]
     public async Task ProductionRejectsSandboxProvidersAndEmbeddingDimensionMismatch()
     {
         var report = await RunAsync(ProductionOptions() with
@@ -159,6 +185,7 @@ public sealed class SystemDoctorTests
         TenantClaimConfigured = true,
         WorkflowProvider = "SqlServer",
         AtlasIncidentStorePersistent = true,
+        MemoryStorePersistent = true,
         MemoryKeyConfigured = true,
         MemoryKeyValid = true,
         WorkflowKeyRingConfigured = true,

@@ -48,6 +48,35 @@ public sealed class OperationsTaskServiceTests
     }
 
     [Fact]
+    public async Task SlaUsesTerminalCompletionTimeAndNeverEscalatesTerminalIncident()
+    {
+        var now = new DateTimeOffset(2026, 7, 15, 8, 0, 0, TimeSpan.Zero);
+        var clock = new FixedTimeProvider(now);
+        var access = AccessContext.Create("tenant-a", "operator",
+            ["tool-approvers", "operations-escalators"]);
+        var approval = new ToolApprovalRequest("approval-on-time", "tenant-a", "requester", "memory.delete",
+            ToolOperationRisk.Mutation, new string('A', 64), ["memoryId"], "redacted", now.AddHours(-2),
+            now.AddHours(-1), ToolApprovalStatus.Approved, "operator", now.AddHours(-1).AddMinutes(-1));
+        var atlas = new InMemoryAtlasIncidentStore(clock);
+        await atlas.CreateAsync(Checkpoint("incident-expired", access, now.AddMinutes(-1)));
+        var service = new OperationsTaskService(new ApprovalStub([approval]), new CompensationStub([]),
+            new ExecutionStub([]), atlas, new ToolApprovalOptions(), new ToolCompensationOptions(),
+            new ToolExecutionReconciliationOptions(), new InMemoryOperationsActionStore(),
+            new OperationsActionOptions(), clock);
+
+        var rows = (await service.ListAsync(access, null, null, null, 10)).Items;
+        var onTime = Assert.Single(rows, item => item.Id == approval.Id);
+        var incident = Assert.Single(rows, item => item.Id == "incident-expired");
+
+        Assert.Equal("OnTrack", onTime.SlaStatus);
+        Assert.False(onTime.Overdue);
+        Assert.DoesNotContain("escalate", onTime.AllowedActions);
+        Assert.Equal(AtlasIncidentStatus.Expired.ToString(), incident.Status);
+        Assert.Equal("Breached", incident.SlaStatus);
+        Assert.DoesNotContain("escalate", incident.AllowedActions);
+    }
+
+    [Fact]
     public void OperationsStaticAssetsContainAccessibleLoadingAndConflictStates()
     {
         var root = Directory.GetParent(Directory.GetParent(WorkspacePathLocator.FindKnowledgeRoot())!.FullName)!.FullName;
@@ -60,8 +89,10 @@ public sealed class OperationsTaskServiceTests
         Assert.Contains("401", script, StringComparison.Ordinal);
         Assert.Contains("403", script, StringComparison.Ordinal);
         Assert.Contains("Idempotency-Key", script, StringComparison.Ordinal);
-        Assert.Contains("/operations/tasks/", script, StringComparison.Ordinal);
-        Assert.Contains("/operations/actions/", script, StringComparison.Ordinal);
+        Assert.Contains("/ops/api/tasks/", script, StringComparison.Ordinal);
+        Assert.Contains("/ops/api/actions/", script, StringComparison.Ordinal);
+        Assert.Contains("X-AiMentor-CSRF", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("/api/v1/operations", script, StringComparison.Ordinal);
         Assert.DoesNotContain("/tool-approvals/", script, StringComparison.Ordinal);
         Assert.Contains("syncDetail()", script, StringComparison.Ordinal);
         Assert.Contains("clearDetail()", script, StringComparison.Ordinal);

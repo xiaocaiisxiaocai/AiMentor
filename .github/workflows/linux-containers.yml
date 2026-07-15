@@ -68,7 +68,7 @@ jobs:
           Write-Output 'VULNERABLE_DEPENDENCIES=0'
 
   sql-atlas-operations:
-    name: SQL Atlas and operations queue
+    name: SQL memory, Atlas and operations queue
     runs-on: ubuntu-latest
     timeout-minutes: 25
     services:
@@ -96,14 +96,14 @@ jobs:
         run: dotnet restore AiMentor.slnx
       - name: Build Release
         run: dotnet build AiMentor.slnx --configuration Release --no-restore
-      - name: Verify Atlas SQL leases and encryption
+      - name: Verify SQL memory, Atlas leases and operations isolation
         shell: pwsh
         env:
           AIMENTOR_SQLSERVER_SA_PASSWORD: ${{ format('AiMentor_CI_{0}!9z', github.run_id) }}
           SQL_HOST_PORT: ${{ job.services.sqlserver.ports[1433] }}
         run: |
           $env:AIMENTOR_SQLSERVER_TEST_CONNECTION = "Server=127.0.0.1,$env:SQL_HOST_PORT;Initial Catalog=master;User ID=sa;Password=$env:AIMENTOR_SQLSERVER_SA_PASSWORD;Encrypt=True;TrustServerCertificate=True"
-          dotnet test tests/AiMentor.Tests/AiMentor.Tests.csproj --configuration Release --no-build --filter "FullyQualifiedName~SqlServerAtlasIncidentStoreTests|FullyQualifiedName~SqlServerOperationsActionStoreTests" --logger "console;verbosity=normal"
+          dotnet test tests/AiMentor.Tests/AiMentor.Tests.csproj --configuration Release --no-build --filter "FullyQualifiedName~SqlServerMemoryStoreTests|FullyQualifiedName~SqlServerAtlasIncidentStoreTests|FullyQualifiedName~SqlServerOperationsActionStoreTests|FullyQualifiedName~SqlServerOrdinalIdentityIsolationTests|FullyQualifiedName~SqlServerWorkflowIntegrationTests" --logger "console;verbosity=normal"
       - name: Verify distributed reconciliation and redacted operations queue
         shell: pwsh
         env:

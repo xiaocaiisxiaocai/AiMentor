@@ -43,6 +43,8 @@ public sealed class EncryptedMemoryStoreTests
             Assert.Equal("表格", memory.Value);
             Assert.Empty(await restartedStore.ListActiveAsync(
                 AccessContext.Create("tenant-b", "user-a", ["all-rnd"]), null, null, clock.GetUtcNow()));
+            Assert.Empty(await restartedStore.ListActiveAsync(
+                AccessContext.Create("Tenant-A", "user-a", ["all-rnd"]), null, null, clock.GetUtcNow()));
         }
         finally
         {

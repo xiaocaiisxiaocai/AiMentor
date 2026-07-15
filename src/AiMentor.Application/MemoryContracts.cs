@@ -24,6 +24,26 @@ public interface IMemoryStore
         CancellationToken cancellationToken = default);
 }
 
+/// <summary>
+/// 为独立后台任务或运维作业提供跨租户、分布式互斥且有界的过期数据清理入口。
+/// 普通业务请求不得调用此入口；其请求内清理只能限定当前租户。
+/// </summary>
+public interface IMemoryRetentionStore
+{
+    Task<MemoryPurgeResult> PurgeExpiredAsync(DateTimeOffset now, int maximumRowsPerTable,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>供受控后台宿主或运维入口触发保留期清理，时间只能来自服务器时钟。</summary>
+public interface IMemoryRetentionService
+{
+    Task<MemoryPurgeResult> PurgeExpiredAsync(int maximumRowsPerTable,
+        CancellationToken cancellationToken = default);
+}
+
+/// <summary>描述一次显式保留期清理是否取得分布式锁及实际删除的行数。</summary>
+public sealed record MemoryPurgeResult(bool LockAcquired, int ProposalsDeleted, int MemoriesDeleted);
+
 /// <summary>描述删除工具目标在当前所有权边界内的可验证状态，不返回记忆正文。</summary>
 public enum MemoryTargetState { Absent, PresentAtExpectedVersion, PresentAtDifferentVersion, Inaccessible }
 
@@ -83,13 +103,19 @@ public sealed record ProposeMemoryCommand(
 public sealed record CorrectMemoryCommand(string Value, int ExpectedVersion, DateTimeOffset? ExpiresAt = null);
 
 /// <summary>供 API 映射稳定 HTTP 状态的记忆工作流错误类别。</summary>
-public enum MemoryWorkflowErrorKind { Validation, NotFound, Conflict, Unsafe }
+public enum MemoryWorkflowErrorKind { Validation, NotFound, Conflict, Unsafe, Capacity }
 
 /// <summary>携带稳定错误码且不包含记忆正文的工作流异常。</summary>
 public sealed class MemoryWorkflowException(string code, string message, MemoryWorkflowErrorKind kind) : Exception(message)
 {
     public string Code { get; } = code;
     public MemoryWorkflowErrorKind Kind { get; } = kind;
+}
+
+/// <summary>存储在原子容量检查失败时抛出，由应用层转换为稳定的 503，而不是泄漏基础设施异常。</summary>
+public sealed class MemoryStoreCapacityException : Exception
+{
+    public MemoryStoreCapacityException() : base("记忆提案队列已达到当前租户容量上限。") { }
 }
 
 /// <summary>配置各类记忆的批准窗口、默认期限和最大保留期限。</summary>
@@ -102,4 +128,6 @@ public sealed class MemoryWorkflowOptions
     public TimeSpan MaximumPreferenceLifetime { get; init; } = TimeSpan.FromDays(365);
     public TimeSpan DefaultFactLifetime { get; init; } = TimeSpan.FromDays(90);
     public TimeSpan MaximumFactLifetime { get; init; } = TimeSpan.FromDays(365);
+    public int MaximumPendingProposalsPerTenant { get; init; } = 10_000;
+    public int RequestCleanupBatchSize { get; init; } = 100;
 }

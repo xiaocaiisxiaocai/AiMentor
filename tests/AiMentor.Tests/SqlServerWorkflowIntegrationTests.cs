@@ -4,24 +4,18 @@ using AiMentor.Domain;
 using AiMentor.Infrastructure;
 using Microsoft.Data.SqlClient;
 using Xunit;
+using Xunit.Sdk;
 
 namespace AiMentor.Tests;
 
+[Trait("Category", "RequiresSqlServer")]
 public sealed class SqlServerWorkflowIntegrationTests
 {
     [Fact]
     public async Task SqlServerShouldConsumeApprovalOnceLeaseOnceAndEncryptCheckpointPayload()
     {
-        if (!OperatingSystem.IsWindows()) return;
-
         var databaseName = $"AiMentorWorkflowTest_{Guid.NewGuid():N}";
-        var master = new SqlConnectionStringBuilder
-        {
-            DataSource = @"(localdb)\MSSQLLocalDB",
-            InitialCatalog = "master",
-            IntegratedSecurity = true,
-            Encrypt = false
-        };
+        var master = MasterConnection();
         await CreateDatabaseAsync(master.ConnectionString, databaseName);
         var testConnection = new SqlConnectionStringBuilder(master.ConnectionString)
         {
@@ -332,6 +326,23 @@ public sealed class SqlServerWorkflowIntegrationTests
         await using var command = connection.CreateCommand();
         command.CommandText = $"CREATE DATABASE [{databaseName}];";
         await command.ExecuteNonQueryAsync();
+    }
+
+    private static SqlConnectionStringBuilder MasterConnection()
+    {
+        var external = Environment.GetEnvironmentVariable("AIMENTOR_SQLSERVER_TEST_CONNECTION");
+        if (!string.IsNullOrWhiteSpace(external))
+            return new SqlConnectionStringBuilder(external) { InitialCatalog = "master" };
+        if (!OperatingSystem.IsWindows())
+            throw SkipException.ForSkip(
+                "非 Windows 平台需显式提供 AIMENTOR_SQLSERVER_TEST_CONNECTION；未执行不能记为通过。");
+        return new SqlConnectionStringBuilder
+        {
+            DataSource = @"(localdb)\MSSQLLocalDB",
+            InitialCatalog = "master",
+            IntegratedSecurity = true,
+            Encrypt = false
+        };
     }
 
     private static async Task ExecuteScriptAsync(string connectionString, string scriptPath)

@@ -50,7 +50,8 @@ public sealed class SqlServerAtlasIncidentStore(
             SELECT TOP (@limit) RunId,TenantId,SubjectId,RunbookId,RunbookVersion,Status,Version,ExpiresAt,
                 KeyVersion,PayloadCipher,LeaseToken,LeaseExpiresAt
             FROM dbo.{TableName}
-            WHERE TenantId=@tenantId AND SubjectId=@subjectId
+            WHERE TenantId COLLATE Latin1_General_100_BIN2=@tenantId
+              AND SubjectId COLLATE Latin1_General_100_BIN2=@subjectId
             ORDER BY UpdatedAt DESC,RunId ASC;
             """;
         command.Parameters.Add("@limit", System.Data.SqlDbType.Int).Value = limit;
@@ -59,11 +60,15 @@ public sealed class SqlServerAtlasIncidentStore(
         var result = new List<AtlasIncidentCheckpoint>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
-            result.Add(Decode(new Row(reader.GetString(0), reader.GetString(1), reader.GetString(2),
+        {
+            var row = new Row(reader.GetString(0), reader.GetString(1), reader.GetString(2),
                 reader.GetString(3), reader.GetString(4), (AtlasIncidentStatus)reader.GetByte(5),
                 reader.GetInt64(6), reader.GetDateTimeOffset(7), reader.GetString(8), reader.GetString(9),
                 reader.IsDBNull(10) ? null : reader.GetString(10),
-                reader.IsDBNull(11) ? null : reader.GetDateTimeOffset(11))));
+                reader.IsDBNull(11) ? null : reader.GetDateTimeOffset(11));
+            EnsureOwner(row, access);
+            result.Add(Decode(row));
+        }
         return result;
     }
 
@@ -72,16 +77,36 @@ public sealed class SqlServerAtlasIncidentStore(
     {
         await EnsureInitializedAsync(cancellationToken);
         await using var connection = await OpenAsync(cancellationToken);
-        var row = await ReadAsync(connection, null, runId, cancellationToken);
+        var row = await ReadAsync(connection, null, runId, access.TenantId, access.SubjectId, cancellationToken);
         if (row is null) return null;
         EnsureOwner(row, access);
         if (row.ExpiresAt <= timeProvider.GetUtcNow() && !IsTerminal(row.Status))
         {
             await ExpireAsync(connection, row, cancellationToken);
-            row = await ReadAsync(connection, null, runId, cancellationToken)
+            row = await ReadAsync(connection, null, runId, access.TenantId, access.SubjectId, cancellationToken)
                 ?? throw Failure("ATLAS_RUN_NOT_FOUND", "没有找到排查运行。", AtlasIncidentErrorKind.NotFound);
         }
         return await DecodeAndRotateAsync(connection, row, cancellationToken);
+    }
+
+    public async Task<AtlasIncidentTaskState?> GetTaskStateAsync(string tenantId, string runId,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureInitializedAsync(cancellationToken);
+        await using var connection = await OpenAsync(cancellationToken);
+        var row = await ReadAsync(connection, null, runId, tenantId, null, cancellationToken);
+        if (row is null || !string.Equals(row.RunId, runId, StringComparison.Ordinal)
+            || !string.Equals(row.TenantId, tenantId, StringComparison.Ordinal)) return null;
+        if (row.ExpiresAt <= timeProvider.GetUtcNow() && !IsTerminal(row.Status))
+        {
+            await ExpireAsync(connection, row, cancellationToken);
+            row = await ReadAsync(connection, null, runId, tenantId, null, cancellationToken);
+            if (row is null || !string.Equals(row.RunId, runId, StringComparison.Ordinal)
+                || !string.Equals(row.TenantId, tenantId, StringComparison.Ordinal)) return null;
+        }
+        var checkpoint = await DecodeAndRotateAsync(connection, row, cancellationToken);
+        return new AtlasIncidentTaskState(checkpoint.RunId, checkpoint.Access.TenantId, checkpoint.Status,
+            checkpoint.Version, checkpoint.CreatedAt, checkpoint.UpdatedAt, checkpoint.ExpiresAt);
     }
 
     public async Task<AtlasIncidentLeaseResult> TryAcquireAsync(string runId, AccessContext access,
@@ -94,7 +119,8 @@ public sealed class SqlServerAtlasIncidentStore(
         await using var connection = await OpenAsync(cancellationToken);
         await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.Serializable,
             cancellationToken);
-        var row = await ReadAsync(connection, transaction, runId, cancellationToken, lockRow: true);
+        var row = await ReadAsync(connection, transaction, runId, access.TenantId, access.SubjectId,
+            cancellationToken, lockRow: true);
         if (row is null) { await transaction.CommitAsync(cancellationToken); return new(false, null, null); }
         EnsureOwner(row, access);
         if (row.ExpiresAt <= now && !IsTerminal(row.Status))
@@ -115,13 +141,18 @@ public sealed class SqlServerAtlasIncidentStore(
             update.CommandText = $"""
                 UPDATE dbo.{TableName} SET LeaseToken=@token,LeaseOwner=@owner,LeaseExpiresAt=@leaseExpiresAt,
                     UpdatedAt=@now
-                WHERE RunId=@runId AND Version=@version AND (LeaseExpiresAt IS NULL OR LeaseExpiresAt<=@now);
+                WHERE RunId COLLATE Latin1_General_100_BIN2=@runId
+                  AND TenantId COLLATE Latin1_General_100_BIN2=@tenantId
+                  AND SubjectId COLLATE Latin1_General_100_BIN2=@subjectId
+                  AND Version=@version AND (LeaseExpiresAt IS NULL OR LeaseExpiresAt<=@now);
                 """;
             AddString(update, "@token", 64, token);
             AddString(update, "@owner", 256, $"pid-{Environment.ProcessId}");
             AddDateTime(update, "@leaseExpiresAt", now.Add(leaseDuration));
             AddDateTime(update, "@now", now);
             AddString(update, "@runId", 128, runId);
+            AddString(update, "@tenantId", 128, row.TenantId);
+            AddString(update, "@subjectId", 256, row.SubjectId);
             AddLong(update, "@version", expectedVersion);
             if (await update.ExecuteNonQueryAsync(cancellationToken) != 1)
                 throw Failure("ATLAS_RUN_BUSY", "排查运行正在由其他请求推进。", AtlasIncidentErrorKind.Conflict);
@@ -146,7 +177,9 @@ public sealed class SqlServerAtlasIncidentStore(
             UPDATE dbo.{TableName} SET RunbookId=@runbookId,RunbookVersion=@runbookVersion,Status=@status,
                 Version=@version,ExpiresAt=@expiresAt,KeyVersion=@keyVersion,PayloadCipher=@payload,
                 LeaseToken=NULL,LeaseOwner=NULL,LeaseExpiresAt=NULL,UpdatedAt=@updatedAt
-            WHERE RunId=@runId AND TenantId=@tenantId AND SubjectId=@subjectId AND Version=@oldVersion
+            WHERE RunId COLLATE Latin1_General_100_BIN2=@runId
+              AND TenantId COLLATE Latin1_General_100_BIN2=@tenantId
+              AND SubjectId COLLATE Latin1_General_100_BIN2=@subjectId AND Version=@oldVersion
               AND LeaseToken=@leaseToken AND LeaseExpiresAt>@now;
             """;
         AddCheckpoint(command, checkpoint, payload);
@@ -166,7 +199,8 @@ public sealed class SqlServerAtlasIncidentStore(
         await using var connection = await OpenAsync(cancellationToken);
         await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(IsolationLevel.Serializable,
             cancellationToken);
-        var row = await ReadAsync(connection, transaction, runId, cancellationToken, lockRow: true)
+        var row = await ReadAsync(connection, transaction, runId, access.TenantId, access.SubjectId,
+            cancellationToken, lockRow: true)
             ?? throw Failure("ATLAS_RUN_NOT_FOUND", "没有找到排查运行。", AtlasIncidentErrorKind.NotFound);
         EnsureOwner(row, access);
         if (row.ExpiresAt <= now && !IsTerminal(row.Status))
@@ -188,7 +222,10 @@ public sealed class SqlServerAtlasIncidentStore(
         update.CommandText = $"""
             UPDATE dbo.{TableName} SET Status=@status,Version=@newVersion,KeyVersion=@keyVersion,
                 PayloadCipher=@payload,LeaseToken=NULL,LeaseOwner=NULL,LeaseExpiresAt=NULL,UpdatedAt=@now
-            WHERE RunId=@runId AND Version=@oldVersion AND (LeaseExpiresAt IS NULL OR LeaseExpiresAt<=@now);
+            WHERE RunId COLLATE Latin1_General_100_BIN2=@runId
+              AND TenantId COLLATE Latin1_General_100_BIN2=@tenantId
+              AND SubjectId COLLATE Latin1_General_100_BIN2=@subjectId
+              AND Version=@oldVersion AND (LeaseExpiresAt IS NULL OR LeaseExpiresAt<=@now);
             """;
         AddInt(update, "@status", (byte)cancelled.Status);
         AddLong(update, "@newVersion", cancelled.Version);
@@ -196,6 +233,8 @@ public sealed class SqlServerAtlasIncidentStore(
         AddString(update, "@payload", -1, payload.Ciphertext);
         AddDateTime(update, "@now", now);
         AddString(update, "@runId", 128, runId);
+        AddString(update, "@tenantId", 128, row.TenantId);
+        AddString(update, "@subjectId", 256, row.SubjectId);
         AddLong(update, "@oldVersion", expectedVersion);
         if (await update.ExecuteNonQueryAsync(cancellationToken) != 1)
             throw Failure("ATLAS_RUN_BUSY", "排查运行正在由其他请求推进。", AtlasIncidentErrorKind.Conflict);
@@ -212,12 +251,17 @@ public sealed class SqlServerAtlasIncidentStore(
         await using var update = connection.CreateCommand();
         update.CommandText = $"""
             UPDATE dbo.{TableName} SET KeyVersion=@newKey,PayloadCipher=@newPayload,UpdatedAt=@now
-            WHERE RunId=@runId AND Version=@version AND KeyVersion=@oldKey AND PayloadCipher=@oldPayload;
+            WHERE RunId COLLATE Latin1_General_100_BIN2=@runId
+              AND TenantId COLLATE Latin1_General_100_BIN2=@tenantId
+              AND SubjectId COLLATE Latin1_General_100_BIN2=@subjectId
+              AND Version=@version AND KeyVersion=@oldKey AND PayloadCipher=@oldPayload;
             """;
         AddString(update, "@newKey", 64, payload.KeyVersion);
         AddString(update, "@newPayload", -1, payload.Ciphertext);
         AddDateTime(update, "@now", timeProvider.GetUtcNow());
         AddString(update, "@runId", 128, row.RunId);
+        AddString(update, "@tenantId", 128, row.TenantId);
+        AddString(update, "@subjectId", 256, row.SubjectId);
         AddLong(update, "@version", row.Version);
         AddString(update, "@oldKey", 64, row.KeyVersion);
         AddString(update, "@oldPayload", -1, row.PayloadCipher);
@@ -232,12 +276,17 @@ public sealed class SqlServerAtlasIncidentStore(
         await using var update = connection.CreateCommand();
         update.CommandText = $"""
             UPDATE dbo.{TableName} SET KeyVersion=@keyVersion,PayloadCipher=@payload,UpdatedAt=@now
-            WHERE RunId=@runId AND Version=@version AND LeaseToken=@leaseToken;
+            WHERE RunId COLLATE Latin1_General_100_BIN2=@runId
+              AND TenantId COLLATE Latin1_General_100_BIN2=@tenantId
+              AND SubjectId COLLATE Latin1_General_100_BIN2=@subjectId
+              AND Version=@version AND LeaseToken=@leaseToken;
             """;
         AddString(update, "@keyVersion", 64, payload.KeyVersion);
         AddString(update, "@payload", -1, payload.Ciphertext);
         AddDateTime(update, "@now", timeProvider.GetUtcNow());
         AddString(update, "@runId", 128, row.RunId);
+        AddString(update, "@tenantId", 128, row.TenantId);
+        AddString(update, "@subjectId", 256, row.SubjectId);
         AddLong(update, "@version", row.Version);
         AddString(update, "@leaseToken", 64, leaseToken);
         if (await update.ExecuteNonQueryAsync(cancellationToken) != 1)
@@ -275,7 +324,9 @@ public sealed class SqlServerAtlasIncidentStore(
     {
         var checkpoint = Decode(row) with
         {
-            Status = AtlasIncidentStatus.Expired, Version = row.Version + 1, UpdatedAt = now
+            Status = AtlasIncidentStatus.Expired,
+            Version = row.Version + 1,
+            UpdatedAt = now
         };
         var payload = Protect(checkpoint);
         await using var update = connection.CreateCommand();
@@ -283,7 +334,10 @@ public sealed class SqlServerAtlasIncidentStore(
         update.CommandText = $"""
             UPDATE dbo.{TableName} SET Status=@status,Version=@newVersion,KeyVersion=@keyVersion,
                 PayloadCipher=@payload,LeaseToken=NULL,LeaseOwner=NULL,LeaseExpiresAt=NULL,UpdatedAt=@now
-            WHERE RunId=@runId AND Version=@oldVersion AND ExpiresAt<=@now AND Status NOT IN (@cancelled,@expired);
+            WHERE RunId COLLATE Latin1_General_100_BIN2=@runId
+              AND TenantId COLLATE Latin1_General_100_BIN2=@tenantId
+              AND SubjectId COLLATE Latin1_General_100_BIN2=@subjectId
+              AND Version=@oldVersion AND ExpiresAt<=@now AND Status NOT IN (@cancelled,@expired);
             """;
         AddInt(update, "@status", (byte)AtlasIncidentStatus.Expired);
         AddLong(update, "@newVersion", checkpoint.Version);
@@ -291,6 +345,8 @@ public sealed class SqlServerAtlasIncidentStore(
         AddString(update, "@payload", -1, payload.Ciphertext);
         AddDateTime(update, "@now", now);
         AddString(update, "@runId", 128, row.RunId);
+        AddString(update, "@tenantId", 128, row.TenantId);
+        AddString(update, "@subjectId", 256, row.SubjectId);
         AddLong(update, "@oldVersion", row.Version);
         AddInt(update, "@cancelled", (byte)AtlasIncidentStatus.Cancelled);
         AddInt(update, "@expired", (byte)AtlasIncidentStatus.Expired);
@@ -302,21 +358,27 @@ public sealed class SqlServerAtlasIncidentStore(
 
     private static void EnsureOwner(Row row, AccessContext access)
     {
-        if (row.TenantId != access.TenantId || row.SubjectId != access.SubjectId)
+        if (!string.Equals(row.TenantId, access.TenantId, StringComparison.Ordinal)
+            || !string.Equals(row.SubjectId, access.SubjectId, StringComparison.Ordinal))
             throw Failure("ATLAS_RUN_FORBIDDEN", "只有原始调用者可以访问排查运行。", AtlasIncidentErrorKind.Forbidden);
     }
 
     private static async Task<Row?> ReadAsync(SqlConnection connection, SqlTransaction? transaction, string runId,
-        CancellationToken cancellationToken, bool lockRow = false)
+        string tenantId, string? subjectId, CancellationToken cancellationToken, bool lockRow = false)
     {
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = $"""
             SELECT RunId,TenantId,SubjectId,RunbookId,RunbookVersion,Status,Version,ExpiresAt,KeyVersion,
                    PayloadCipher,LeaseToken,LeaseExpiresAt
-            FROM dbo.{TableName} {(lockRow ? "WITH (UPDLOCK,HOLDLOCK)" : string.Empty)} WHERE RunId=@runId;
+            FROM dbo.{TableName} {(lockRow ? "WITH (UPDLOCK,HOLDLOCK)" : string.Empty)}
+            WHERE RunId COLLATE Latin1_General_100_BIN2=@runId
+              AND TenantId COLLATE Latin1_General_100_BIN2=@tenantId
+              AND (@subjectId IS NULL OR SubjectId COLLATE Latin1_General_100_BIN2=@subjectId);
             """;
         AddString(command, "@runId", 128, runId);
+        AddString(command, "@tenantId", 128, tenantId);
+        AddNullableString(command, "@subjectId", 256, subjectId);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken)) return null;
         return new(reader.GetString(0), reader.GetString(1), reader.GetString(2), reader.GetString(3),
@@ -343,12 +405,15 @@ public sealed class SqlServerAtlasIncidentStore(
                     IF OBJECT_ID(N'dbo.{TableName}', N'U') IS NULL
                     BEGIN
                         CREATE TABLE dbo.{TableName}(
-                            RunId nvarchar(128) NOT NULL CONSTRAINT PK_{TableName} PRIMARY KEY,
-                            TenantId nvarchar(128) NOT NULL,SubjectId nvarchar(256) NOT NULL,
+                            RunId nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL
+                                CONSTRAINT PK_{TableName} PRIMARY KEY,
+                            TenantId nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                            SubjectId nvarchar(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
                             RunbookId nvarchar(128) NOT NULL,RunbookVersion nvarchar(64) NOT NULL,
                             Status tinyint NOT NULL,Version bigint NOT NULL,ExpiresAt datetimeoffset(7) NOT NULL,
                             KeyVersion nvarchar(64) NOT NULL,PayloadCipher nvarchar(max) NOT NULL,
-                            LeaseToken nvarchar(64) NULL,LeaseOwner nvarchar(256) NULL,
+                            LeaseToken nvarchar(64) NULL,
+                            LeaseOwner nvarchar(256) COLLATE Latin1_General_100_BIN2 NULL,
                             LeaseExpiresAt datetimeoffset(7) NULL,CreatedAt datetimeoffset(7) NOT NULL,
                             UpdatedAt datetimeoffset(7) NOT NULL,RowVersion rowversion NOT NULL);
                         CREATE INDEX IX_{TableName}_OwnerStatus ON dbo.{TableName}(TenantId,SubjectId,Status);
@@ -390,6 +455,8 @@ public sealed class SqlServerAtlasIncidentStore(
 
     private static void AddString(SqlCommand command, string name, int size, string value) =>
         command.Parameters.Add(name, SqlDbType.NVarChar, size).Value = value;
+    private static void AddNullableString(SqlCommand command, string name, int size, string? value) =>
+        command.Parameters.Add(name, SqlDbType.NVarChar, size).Value = value is null ? DBNull.Value : value;
     private static void AddLong(SqlCommand command, string name, long value) =>
         command.Parameters.Add(name, SqlDbType.BigInt).Value = value;
     private static void AddInt(SqlCommand command, string name, byte value) =>

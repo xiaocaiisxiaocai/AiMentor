@@ -6,11 +6,13 @@ using Microsoft.Data.SqlClient;
 namespace AiMentor.Infrastructure;
 
 /// <summary>单进程开发实现；所有状态转换都在同一把锁内完成，语义与 SQL Store 对齐。</summary>
-public sealed class InMemoryOperationsActionStore(TimeProvider? timeProvider = null) : IOperationsActionStore
+public sealed class InMemoryOperationsActionStore(TimeProvider? timeProvider = null,
+    OperationsActionOptions? actionOptions = null) : IOperationsActionStore
 {
     private readonly object _gate = new();
     private readonly Dictionary<string, OperationsActionRecord> _records = new(StringComparer.Ordinal);
     private readonly TimeProvider _timeProvider = timeProvider ?? TimeProvider.System;
+    private readonly OperationsActionOptions _actionOptions = actionOptions ?? new OperationsActionOptions();
 
     public Task<OperationsActionCreateResult> CreateAsync(OperationsActionRecord record, int maximumEntries,
         CancellationToken cancellationToken = default)
@@ -18,7 +20,7 @@ public sealed class InMemoryOperationsActionStore(TimeProvider? timeProvider = n
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
-            Expire(record.CreatedAt);
+            Normalize(record.CreatedAt);
             var replay = _records.Values.FirstOrDefault(item => item.TenantId == record.TenantId
                 && item.IdempotencyHash == record.IdempotencyHash);
             if (replay is not null)
@@ -29,10 +31,14 @@ public sealed class InMemoryOperationsActionStore(TimeProvider? timeProvider = n
             if (_records.Values.Any(item => item.TenantId == record.TenantId
                 && item.TargetType == record.TargetType && item.TargetId == record.TargetId
                 && item.Status is OperationsActionStatus.AwaitingReview or OperationsActionStatus.Executing
-                    or OperationsActionStatus.OutcomeUnknown))
+                    or OperationsActionStatus.OutcomeUnknown or OperationsActionStatus.OutcomeUnknownArchived))
                 return Task.FromResult(new OperationsActionCreateResult(OperationsActionCreateStatus.TargetBusy, null));
-            if (_records.Values.Count(item => item.Status is OperationsActionStatus.AwaitingReview
-                    or OperationsActionStatus.Executing or OperationsActionStatus.OutcomeUnknown) >= maximumEntries)
+            if (_records.Values.Count(item => item.TenantId == record.TenantId
+                    && item.Status is OperationsActionStatus.AwaitingReview or OperationsActionStatus.Executing)
+                >= maximumEntries)
+                return Task.FromResult(new OperationsActionCreateResult(OperationsActionCreateStatus.Capacity, null));
+            if (_records.Values.Count(item => item.TenantId == record.TenantId)
+                >= _actionOptions.MaximumAuditEntriesPerTenant)
                 return Task.FromResult(new OperationsActionCreateResult(OperationsActionCreateStatus.Capacity, null));
             _records.Add(record.Id, record);
             return Task.FromResult(new OperationsActionCreateResult(OperationsActionCreateStatus.Created, record));
@@ -45,7 +51,7 @@ public sealed class InMemoryOperationsActionStore(TimeProvider? timeProvider = n
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
-            Expire(_timeProvider.GetUtcNow());
+            Normalize(_timeProvider.GetUtcNow());
             IReadOnlyList<OperationsActionRecord> result = _records.Values
                 .Where(item => item.TenantId == tenantId)
                 .OrderByDescending(item => item.CreatedAt).Take(limit).ToArray();
@@ -59,10 +65,11 @@ public sealed class InMemoryOperationsActionStore(TimeProvider? timeProvider = n
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
-            Expire(_timeProvider.GetUtcNow());
+            Normalize(_timeProvider.GetUtcNow());
             IReadOnlyList<OperationsActionRecord> result = _records.Values.Where(item => item.TenantId == tenantId
                     && (item.Status is OperationsActionStatus.AwaitingReview or OperationsActionStatus.Executing
                         or OperationsActionStatus.OutcomeUnknown
+                        or OperationsActionStatus.OutcomeUnknownArchived
                         || item.Action == "escalate" && item.Status == OperationsActionStatus.Completed))
                 .ToArray();
             return Task.FromResult(result);
@@ -75,7 +82,7 @@ public sealed class InMemoryOperationsActionStore(TimeProvider? timeProvider = n
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
-            Expire(_timeProvider.GetUtcNow());
+            Normalize(_timeProvider.GetUtcNow());
             return Task.FromResult(_records.TryGetValue(id, out var record) && record.TenantId == tenantId
                 ? record : null);
         }
@@ -87,7 +94,7 @@ public sealed class InMemoryOperationsActionStore(TimeProvider? timeProvider = n
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
-            Expire(_timeProvider.GetUtcNow());
+            Normalize(_timeProvider.GetUtcNow());
             return Task.FromResult(_records.Values.FirstOrDefault(item => item.TenantId == tenantId
                 && item.IdempotencyHash == idempotencyHash));
         }
@@ -100,7 +107,7 @@ public sealed class InMemoryOperationsActionStore(TimeProvider? timeProvider = n
         cancellationToken.ThrowIfCancellationRequested();
         lock (_gate)
         {
-            Expire(now);
+            Normalize(now);
             if (!_records.TryGetValue(id, out var current) || current.TenantId != tenantId)
                 return Task.FromResult(new OperationsActionAcquireResult(OperationsActionAcquireStatus.NotFound, null));
             if (current.Status != OperationsActionStatus.AwaitingReview)
@@ -111,7 +118,7 @@ public sealed class InMemoryOperationsActionStore(TimeProvider? timeProvider = n
                 var replay = current.ReviewerSubjectId == reviewerSubjectId
                     && current.Status is OperationsActionStatus.Executing or OperationsActionStatus.Completed
                         or OperationsActionStatus.Rejected or OperationsActionStatus.Failed
-                        or OperationsActionStatus.OutcomeUnknown;
+                        or OperationsActionStatus.OutcomeUnknown or OperationsActionStatus.OutcomeUnknownArchived;
                 return Task.FromResult(new OperationsActionAcquireResult(
                     replay ? OperationsActionAcquireStatus.Replay : OperationsActionAcquireStatus.VersionConflict,
                     current));
@@ -166,7 +173,7 @@ public sealed class InMemoryOperationsActionStore(TimeProvider? timeProvider = n
         }
     }
 
-    private void Expire(DateTimeOffset now)
+    private void Normalize(DateTimeOffset now)
     {
         foreach (var pair in _records.ToArray())
             if (pair.Value.Status is OperationsActionStatus.AwaitingReview or OperationsActionStatus.Executing
@@ -182,15 +189,24 @@ public sealed class InMemoryOperationsActionStore(TimeProvider? timeProvider = n
                         : "OPERATIONS_ACTION_REVIEW_EXPIRED"
                 };
             }
+            else if (pair.Value.Status == OperationsActionStatus.OutcomeUnknown
+                && (pair.Value.CompletedAt ?? pair.Value.ExpiresAt) <= now - _actionOptions.OutcomeUnknownRetention)
+                _records[pair.Key] = pair.Value with
+                {
+                    Status = OperationsActionStatus.OutcomeUnknownArchived,
+                    Version = pair.Value.Version + 1
+                };
     }
 }
 
 /// <summary>跨实例持久审计 Store；可串行化事务保证幂等键、目标占位和第二复核都只有一个胜者。</summary>
-public sealed class SqlServerOperationsActionStore(SqlServerWorkflowOptions options, TimeProvider timeProvider)
+public sealed class SqlServerOperationsActionStore(SqlServerWorkflowOptions options, TimeProvider timeProvider,
+    OperationsActionOptions? actionOptions = null)
     : IOperationsActionStore, IDisposable
 {
     private const string TableName = "AiMentorOperationsActions";
     private readonly SemaphoreSlim _initializationGate = new(1, 1);
+    private readonly OperationsActionOptions _actionOptions = actionOptions ?? new OperationsActionOptions();
     private volatile bool _initialized;
 
     public async Task<OperationsActionCreateResult> CreateAsync(OperationsActionRecord record, int maximumEntries,
@@ -201,7 +217,7 @@ public sealed class SqlServerOperationsActionStore(SqlServerWorkflowOptions opti
         await connection.OpenAsync(cancellationToken);
         await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(
             IsolationLevel.Serializable, cancellationToken);
-        await ExpireAsync(connection, transaction, record.CreatedAt, cancellationToken);
+        await NormalizeAsync(connection, transaction, record.CreatedAt, cancellationToken);
 
         var replay = await FindByIdempotencyAsync(connection, transaction, record.TenantId, record.IdempotencyHash,
             cancellationToken);
@@ -216,7 +232,7 @@ public sealed class SqlServerOperationsActionStore(SqlServerWorkflowOptions opti
         {
             active.Transaction = transaction;
             active.CommandText = $"SELECT COUNT_BIG(1) FROM dbo.{TableName} WITH (UPDLOCK,HOLDLOCK) " +
-                "WHERE TenantId=@tenant AND TargetType=@type AND TargetId=@target AND Status IN (0,1,5);";
+                "WHERE TenantId=@tenant AND TargetType=@type AND TargetId=@target AND Status IN (0,1,5,7);";
             AddString(active, "@tenant", 128, record.TenantId);
             AddString(active, "@type", 32, record.TargetType);
             AddString(active, "@target", 128, record.TargetId);
@@ -230,9 +246,23 @@ public sealed class SqlServerOperationsActionStore(SqlServerWorkflowOptions opti
         {
             capacity.Transaction = transaction;
             capacity.CommandText = $"SELECT COUNT_BIG(1) FROM dbo.{TableName} WITH (UPDLOCK,HOLDLOCK) " +
-                "WHERE Status IN (0,1,5);";
+                "WHERE TenantId=@tenant AND Status IN (0,1);";
+            AddString(capacity, "@tenant", 128, record.TenantId);
             if (Convert.ToInt64(await capacity.ExecuteScalarAsync(cancellationToken), CultureInfo.InvariantCulture)
                 >= maximumEntries)
+            {
+                await transaction.CommitAsync(cancellationToken);
+                return new(OperationsActionCreateStatus.Capacity, null);
+            }
+        }
+        await using (var auditCapacity = connection.CreateCommand())
+        {
+            auditCapacity.Transaction = transaction;
+            auditCapacity.CommandText = $"SELECT COUNT_BIG(1) FROM dbo.{TableName} WITH (UPDLOCK,HOLDLOCK) " +
+                "WHERE TenantId=@tenant;";
+            AddString(auditCapacity, "@tenant", 128, record.TenantId);
+            if (Convert.ToInt64(await auditCapacity.ExecuteScalarAsync(cancellationToken),
+                    CultureInfo.InvariantCulture) >= _actionOptions.MaximumAuditEntriesPerTenant)
             {
                 await transaction.CommitAsync(cancellationToken);
                 return new(OperationsActionCreateStatus.Capacity, null);
@@ -262,7 +292,7 @@ public sealed class SqlServerOperationsActionStore(SqlServerWorkflowOptions opti
         await using var connection = new SqlConnection(options.ConnectionString);
         await connection.OpenAsync(cancellationToken);
         await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
-        await ExpireAsync(connection, transaction, timeProvider.GetUtcNow(), cancellationToken);
+        await NormalizeAsync(connection, transaction, timeProvider.GetUtcNow(), cancellationToken);
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = $"SELECT TOP (@limit) {Columns} FROM dbo.{TableName} " +
@@ -284,11 +314,11 @@ public sealed class SqlServerOperationsActionStore(SqlServerWorkflowOptions opti
         await using var connection = new SqlConnection(options.ConnectionString);
         await connection.OpenAsync(cancellationToken);
         await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
-        await ExpireAsync(connection, transaction, timeProvider.GetUtcNow(), cancellationToken);
+        await NormalizeAsync(connection, transaction, timeProvider.GetUtcNow(), cancellationToken);
         await using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = $"SELECT {Columns} FROM dbo.{TableName} WHERE TenantId=@tenant " +
-            "AND (Status IN (0,1,5) OR (Action=N'escalate' AND Status=2)) ORDER BY CreatedAt DESC,Id DESC;";
+            "AND (Status IN (0,1,5,7) OR (Action=N'escalate' AND Status=2)) ORDER BY CreatedAt DESC,Id DESC;";
         AddString(command, "@tenant", 128, tenantId);
         var rows = new List<OperationsActionRecord>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
@@ -305,7 +335,7 @@ public sealed class SqlServerOperationsActionStore(SqlServerWorkflowOptions opti
         await using var connection = new SqlConnection(options.ConnectionString);
         await connection.OpenAsync(cancellationToken);
         await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
-        await ExpireAsync(connection, transaction, timeProvider.GetUtcNow(), cancellationToken);
+        await NormalizeAsync(connection, transaction, timeProvider.GetUtcNow(), cancellationToken);
         var record = await FindAsync(connection, transaction, tenantId, id, cancellationToken);
         await transaction.CommitAsync(cancellationToken);
         return record;
@@ -318,7 +348,7 @@ public sealed class SqlServerOperationsActionStore(SqlServerWorkflowOptions opti
         await using var connection = new SqlConnection(options.ConnectionString);
         await connection.OpenAsync(cancellationToken);
         await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(cancellationToken);
-        await ExpireAsync(connection, transaction, timeProvider.GetUtcNow(), cancellationToken);
+        await NormalizeAsync(connection, transaction, timeProvider.GetUtcNow(), cancellationToken);
         var record = await FindByIdempotencyAsync(connection, transaction, tenantId, idempotencyHash,
             cancellationToken);
         await transaction.CommitAsync(cancellationToken);
@@ -334,7 +364,7 @@ public sealed class SqlServerOperationsActionStore(SqlServerWorkflowOptions opti
         await connection.OpenAsync(cancellationToken);
         await using var transaction = (SqlTransaction)await connection.BeginTransactionAsync(
             IsolationLevel.Serializable, cancellationToken);
-        await ExpireAsync(connection, transaction, now, cancellationToken);
+        await NormalizeAsync(connection, transaction, now, cancellationToken);
         var current = await FindAsync(connection, transaction, tenantId, id, cancellationToken, true);
         if (current is null) return await Finish(OperationsActionAcquireStatus.NotFound, null);
         if (current.Status != OperationsActionStatus.AwaitingReview)
@@ -344,7 +374,7 @@ public sealed class SqlServerOperationsActionStore(SqlServerWorkflowOptions opti
             var replay = current.ReviewerSubjectId == reviewerSubjectId
                 && current.Status is OperationsActionStatus.Executing or OperationsActionStatus.Completed
                     or OperationsActionStatus.Rejected or OperationsActionStatus.Failed
-                    or OperationsActionStatus.OutcomeUnknown;
+                    or OperationsActionStatus.OutcomeUnknown or OperationsActionStatus.OutcomeUnknownArchived;
             return await Finish(replay ? OperationsActionAcquireStatus.Replay
                 : OperationsActionAcquireStatus.VersionConflict, current);
         }
@@ -435,7 +465,7 @@ public sealed class SqlServerOperationsActionStore(SqlServerWorkflowOptions opti
         finally { _initializationGate.Release(); }
     }
 
-    private static async Task ExpireAsync(SqlConnection connection, SqlTransaction transaction, DateTimeOffset now,
+    private async Task NormalizeAsync(SqlConnection connection, SqlTransaction transaction, DateTimeOffset now,
         CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
@@ -444,8 +474,11 @@ public sealed class SqlServerOperationsActionStore(SqlServerWorkflowOptions opti
             "Status=CASE WHEN Status=0 THEN 6 ELSE 5 END,Version=Version+1,CompletedAt=@now," +
             "OutcomeCode=CASE WHEN Status=0 THEN N'OPERATIONS_ACTION_REVIEW_EXPIRED' " +
             "ELSE N'OPERATIONS_ACTION_EXECUTION_EXPIRED_OUTCOME_UNKNOWN' END " +
-            "WHERE Status IN (0,1) AND ExpiresAt<=@now;";
+            "WHERE Status IN (0,1) AND ExpiresAt<=@now; " +
+            $"UPDATE dbo.{TableName} SET Status=7,Version=Version+1 " +
+            "WHERE Status=5 AND COALESCE(CompletedAt,ExpiresAt)<=@archiveBefore;";
         AddDate(command, "@now", now);
+        AddDate(command, "@archiveBefore", now - _actionOptions.OutcomeUnknownRetention);
         await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
@@ -503,21 +536,33 @@ public sealed class SqlServerOperationsActionStore(SqlServerWorkflowOptions opti
         "ReviewerSubjectId,ReviewReasonHash,ReviewedAt,CompletedAt,OutcomeCode";
 
     private const string SchemaSql = """
+        SET XACT_ABORT ON;
+        SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+        BEGIN TRANSACTION;
         DECLARE @lockResult int;
         EXEC @lockResult=sys.sp_getapplock @Resource=N'AiMentor.Workflow.Schema',@LockMode='Exclusive',
-            @LockOwner='Session',@LockTimeout=30000;
+            @LockOwner='Transaction',@LockTimeout=30000;
         IF @lockResult < 0 THROW 51000,N'无法获取工作流建表锁。',1;
         IF OBJECT_ID(N'dbo.AiMentorOperationsActions',N'U') IS NULL
         BEGIN
           CREATE TABLE dbo.AiMentorOperationsActions(
-            Id nvarchar(64) NOT NULL CONSTRAINT PK_AiMentorOperationsActions PRIMARY KEY,
-            TenantId nvarchar(128) NOT NULL,TargetType nvarchar(32) NOT NULL,TargetId nvarchar(128) NOT NULL,
-            Action nvarchar(32) NOT NULL,TargetETag nvarchar(80) NOT NULL,RequestFingerprint char(64) NOT NULL,
-            IdempotencyHash char(64) NOT NULL,RequesterSubjectId nvarchar(256) NOT NULL,
-            RequestReasonHash char(64) NOT NULL,Status tinyint NOT NULL,Version bigint NOT NULL,
+            Id nvarchar(64) COLLATE Latin1_General_100_BIN2 NOT NULL
+              CONSTRAINT PK_AiMentorOperationsActions PRIMARY KEY,
+            TenantId nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+            TargetType nvarchar(32) COLLATE Latin1_General_100_BIN2 NOT NULL,
+            TargetId nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+            Action nvarchar(32) COLLATE Latin1_General_100_BIN2 NOT NULL,
+            TargetETag nvarchar(80) COLLATE Latin1_General_100_BIN2 NOT NULL,
+            RequestFingerprint char(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+            IdempotencyHash char(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+            RequesterSubjectId nvarchar(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
+            RequestReasonHash char(64) COLLATE Latin1_General_100_BIN2 NOT NULL,
+            Status tinyint NOT NULL,Version bigint NOT NULL,
             CreatedAt datetimeoffset(7) NOT NULL,ExpiresAt datetimeoffset(7) NOT NULL,
-            ReviewerSubjectId nvarchar(256) NULL,ReviewReasonHash char(64) NULL,ReviewedAt datetimeoffset(7) NULL,
-            CompletedAt datetimeoffset(7) NULL,OutcomeCode nvarchar(128) NULL,RowVersion rowversion NOT NULL);
+            ReviewerSubjectId nvarchar(256) COLLATE Latin1_General_100_BIN2 NULL,
+            ReviewReasonHash char(64) COLLATE Latin1_General_100_BIN2 NULL,
+            ReviewedAt datetimeoffset(7) NULL,CompletedAt datetimeoffset(7) NULL,
+            OutcomeCode nvarchar(128) COLLATE Latin1_General_100_BIN2 NULL,RowVersion rowversion NOT NULL);
           CREATE UNIQUE INDEX UX_AiMentorOperationsActions_Idempotency
             ON dbo.AiMentorOperationsActions(TenantId,IdempotencyHash);
           CREATE INDEX IX_AiMentorOperationsActions_Target
@@ -525,7 +570,81 @@ public sealed class SqlServerOperationsActionStore(SqlServerWorkflowOptions opti
           CREATE INDEX IX_AiMentorOperationsActions_Queue
             ON dbo.AiMentorOperationsActions(TenantId,Status,ExpiresAt);
         END;
-        EXEC sys.sp_releaseapplock @Resource=N'AiMentor.Workflow.Schema',@LockOwner='Session';
+
+        IF EXISTS (
+          SELECT 1 FROM sys.columns
+          WHERE object_id=OBJECT_ID(N'dbo.AiMentorOperationsActions')
+            AND name IN (N'Id',N'TenantId',N'TargetType',N'TargetId',N'Action',N'TargetETag',
+              N'RequestFingerprint',N'IdempotencyHash',N'RequesterSubjectId',N'RequestReasonHash',
+              N'ReviewerSubjectId',N'ReviewReasonHash',N'OutcomeCode')
+            AND collation_name<>N'Latin1_General_100_BIN2')
+        BEGIN
+          DECLARE @rowCount bigint;
+          SELECT @rowCount=COUNT_BIG(1) FROM dbo.AiMentorOperationsActions WITH (TABLOCKX,HOLDLOCK);
+          -- 身份别名无法自动归并；为避免把既有审计记录分配给错误租户，升级必须失败关闭。
+          IF EXISTS (
+            SELECT 1 FROM dbo.AiMentorOperationsActions
+            GROUP BY TenantId
+            HAVING COUNT(DISTINCT TenantId COLLATE Latin1_General_100_BIN2)>1)
+            THROW 51011,N'检测到仅大小写或排序差异的多个租户标识；请先核实归属并清理别名。',1;
+          IF EXISTS (
+            SELECT Id COLLATE Latin1_General_100_BIN2 FROM dbo.AiMentorOperationsActions
+            GROUP BY Id COLLATE Latin1_General_100_BIN2 HAVING COUNT_BIG(1)>1)
+            THROW 51012,N'检测到完全相同的运营动作标识，无法重建主键。',1;
+          IF EXISTS (
+            SELECT TenantId COLLATE Latin1_General_100_BIN2,
+              IdempotencyHash COLLATE Latin1_General_100_BIN2
+            FROM dbo.AiMentorOperationsActions
+            GROUP BY TenantId COLLATE Latin1_General_100_BIN2,
+              IdempotencyHash COLLATE Latin1_General_100_BIN2 HAVING COUNT_BIG(1)>1)
+            THROW 51013,N'检测到完全相同的租户幂等键，无法重建唯一索引。',1;
+
+          DROP INDEX IF EXISTS UX_AiMentorOperationsActions_Idempotency
+            ON dbo.AiMentorOperationsActions;
+          DROP INDEX IF EXISTS IX_AiMentorOperationsActions_Target ON dbo.AiMentorOperationsActions;
+          DROP INDEX IF EXISTS IX_AiMentorOperationsActions_Queue ON dbo.AiMentorOperationsActions;
+          IF EXISTS (SELECT 1 FROM sys.key_constraints
+            WHERE parent_object_id=OBJECT_ID(N'dbo.AiMentorOperationsActions')
+              AND name=N'PK_AiMentorOperationsActions')
+            ALTER TABLE dbo.AiMentorOperationsActions DROP CONSTRAINT PK_AiMentorOperationsActions;
+
+          ALTER TABLE dbo.AiMentorOperationsActions ALTER COLUMN Id nvarchar(64)
+            COLLATE Latin1_General_100_BIN2 NOT NULL;
+          ALTER TABLE dbo.AiMentorOperationsActions ALTER COLUMN TenantId nvarchar(128)
+            COLLATE Latin1_General_100_BIN2 NOT NULL;
+          ALTER TABLE dbo.AiMentorOperationsActions ALTER COLUMN TargetType nvarchar(32)
+            COLLATE Latin1_General_100_BIN2 NOT NULL;
+          ALTER TABLE dbo.AiMentorOperationsActions ALTER COLUMN TargetId nvarchar(128)
+            COLLATE Latin1_General_100_BIN2 NOT NULL;
+          ALTER TABLE dbo.AiMentorOperationsActions ALTER COLUMN Action nvarchar(32)
+            COLLATE Latin1_General_100_BIN2 NOT NULL;
+          ALTER TABLE dbo.AiMentorOperationsActions ALTER COLUMN TargetETag nvarchar(80)
+            COLLATE Latin1_General_100_BIN2 NOT NULL;
+          ALTER TABLE dbo.AiMentorOperationsActions ALTER COLUMN RequestFingerprint char(64)
+            COLLATE Latin1_General_100_BIN2 NOT NULL;
+          ALTER TABLE dbo.AiMentorOperationsActions ALTER COLUMN IdempotencyHash char(64)
+            COLLATE Latin1_General_100_BIN2 NOT NULL;
+          ALTER TABLE dbo.AiMentorOperationsActions ALTER COLUMN RequesterSubjectId nvarchar(256)
+            COLLATE Latin1_General_100_BIN2 NOT NULL;
+          ALTER TABLE dbo.AiMentorOperationsActions ALTER COLUMN RequestReasonHash char(64)
+            COLLATE Latin1_General_100_BIN2 NOT NULL;
+          ALTER TABLE dbo.AiMentorOperationsActions ALTER COLUMN ReviewerSubjectId nvarchar(256)
+            COLLATE Latin1_General_100_BIN2 NULL;
+          ALTER TABLE dbo.AiMentorOperationsActions ALTER COLUMN ReviewReasonHash char(64)
+            COLLATE Latin1_General_100_BIN2 NULL;
+          ALTER TABLE dbo.AiMentorOperationsActions ALTER COLUMN OutcomeCode nvarchar(128)
+            COLLATE Latin1_General_100_BIN2 NULL;
+
+          ALTER TABLE dbo.AiMentorOperationsActions
+            ADD CONSTRAINT PK_AiMentorOperationsActions PRIMARY KEY(Id);
+          CREATE UNIQUE INDEX UX_AiMentorOperationsActions_Idempotency
+            ON dbo.AiMentorOperationsActions(TenantId,IdempotencyHash);
+          CREATE INDEX IX_AiMentorOperationsActions_Target
+            ON dbo.AiMentorOperationsActions(TenantId,TargetType,TargetId,Status);
+          CREATE INDEX IX_AiMentorOperationsActions_Queue
+            ON dbo.AiMentorOperationsActions(TenantId,Status,ExpiresAt);
+        END;
+        COMMIT TRANSACTION;
         """;
 
     public void Dispose() => _initializationGate.Dispose();

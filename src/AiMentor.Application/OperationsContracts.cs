@@ -13,10 +13,16 @@ public interface IOperationsTaskService
 {
     Task<OperationsTaskPage> ListAsync(AccessContext access, string? type, string? status, string? cursor,
         int limit, CancellationToken cancellationToken = default);
+    Task<bool> IsEscalationCurrentAsync(string targetType, string targetId, string targetETag,
+        AccessContext access, CancellationToken cancellationToken = default);
 }
 
 /// <summary>运营动作必须先提出、再由独立第二人复核；状态本身也是持久审计记录。</summary>
-public enum OperationsActionStatus { AwaitingReview, Executing, Completed, Rejected, Failed, OutcomeUnknown, Expired }
+public enum OperationsActionStatus
+{
+    AwaitingReview, Executing, Completed, Rejected, Failed, OutcomeUnknown, Expired,
+    OutcomeUnknownArchived
+}
 
 /// <summary>不包含理由原文的运营动作记录；主体标识仅供服务端职责分离，不通过 API 序列化。</summary>
 public sealed record OperationsActionRecord(
@@ -93,12 +99,16 @@ public interface IOperationsActionService
         bool approved, string reason, AccessContext access, CancellationToken cancellationToken = default);
     Task<IReadOnlyList<OperationsActionSummary>> ListAsync(AccessContext access,
         CancellationToken cancellationToken = default);
+    Task<OperationsActionSummary> GetAsync(string requestId, AccessContext access,
+        CancellationToken cancellationToken = default);
 }
 
 public sealed class OperationsActionOptions
 {
     public TimeSpan ReviewLifetime { get; init; } = TimeSpan.FromMinutes(15);
     public int MaximumEntries { get; init; } = 10_000;
+    public int MaximumAuditEntriesPerTenant { get; init; } = 100_000;
+    public TimeSpan OutcomeUnknownRetention { get; init; } = TimeSpan.FromDays(30);
     public IReadOnlySet<string> ReviewerGroups { get; init; } =
         new HashSet<string>(["tool-approvers"], StringComparer.OrdinalIgnoreCase);
     public IReadOnlySet<string> EscalatorGroups { get; init; } =

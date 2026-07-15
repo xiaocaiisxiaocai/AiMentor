@@ -15,7 +15,8 @@ public sealed class SqlServerOperationsActionStoreTests
     {
         var database = $"AiMentorOpsTest_{Guid.NewGuid():N}";
         var master = MasterConnection();
-        await ExecuteAsync(master.ConnectionString, $"CREATE DATABASE [{database}];");
+        await ExecuteAsync(master.ConnectionString,
+            $"CREATE DATABASE [{database}] COLLATE Latin1_General_100_CI_AS;");
         var connectionString = new SqlConnectionStringBuilder(master.ConnectionString)
         {
             InitialCatalog = database
@@ -23,8 +24,8 @@ public sealed class SqlServerOperationsActionStoreTests
         try
         {
             var root = FindRepositoryRoot();
-            await ExecuteAsync(connectionString,
-                await File.ReadAllTextAsync(Path.Combine(root, "deploy", "sql", "010_operations_actions.sql")));
+            await ApplyMigrationsAsync(connectionString, root, "010_operations_actions.sql",
+                "011_operations_action_ordinal_identifiers.sql");
             var now = new DateTimeOffset(2026, 7, 15, 10, 0, 0, TimeSpan.Zero);
             var clock = new FixedTimeProvider(now);
             var options = new SqlServerWorkflowOptions { ConnectionString = connectionString, InitializeSchema = false };
@@ -79,6 +80,181 @@ public sealed class SqlServerOperationsActionStoreTests
         }
     }
 
+    [Fact]
+    public async Task RuntimeSchemaKeepsCaseDistinctTenantAndResourceIdentifiers()
+    {
+        var database = $"AiMentorOpsOrdinal_{Guid.NewGuid():N}";
+        var master = MasterConnection();
+        await ExecuteAsync(master.ConnectionString,
+            $"CREATE DATABASE [{database}] COLLATE Latin1_General_100_CI_AS;");
+        var connectionString = new SqlConnectionStringBuilder(master.ConnectionString)
+        {
+            InitialCatalog = database
+        }.ConnectionString;
+        try
+        {
+            var now = new DateTimeOffset(2026, 7, 15, 10, 0, 0, TimeSpan.Zero);
+            var clock = new FixedTimeProvider(now);
+            var options = new SqlServerWorkflowOptions { ConnectionString = connectionString, InitializeSchema = true };
+            using var store = new SqlServerOperationsActionStore(options, clock);
+            var idempotencyHash = new string('B', 64);
+            var upper = Record("Action-Case", "Tenant-A", "Approval", "Approval-1", idempotencyHash, 'A', now);
+            var lower = Record("action-case", "tenant-a", "approval", "approval-1", idempotencyHash, 'F', now);
+
+            Assert.Equal(OperationsActionCreateStatus.Created, (await store.CreateAsync(upper, 100)).Status);
+            Assert.Equal(OperationsActionCreateStatus.Created, (await store.CreateAsync(lower, 100)).Status);
+
+            Assert.Equal(upper.Id, Assert.Single(await store.ListAsync("Tenant-A", 10)).Id);
+            Assert.Equal(lower.Id, Assert.Single(await store.ListAsync("tenant-a", 10)).Id);
+            Assert.Empty(await store.ListAsync("TENANT-A", 10));
+            Assert.Null(await store.GetAsync("Tenant-A", lower.Id));
+            Assert.Null(await store.GetByIdempotencyAsync("TENANT-A", idempotencyHash));
+            Assert.Equal(OperationsActionAcquireStatus.NotFound,
+                (await store.TryAcquireReviewAsync("tenant-a", upper.Id, 1, "reviewer", true,
+                    new string('D', 64), now)).Status);
+
+            await AssertOrdinalIdentifierCollationsAsync(connectionString);
+        }
+        finally
+        {
+            await ExecuteAsync(master.ConnectionString,
+                $"ALTER DATABASE [{database}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{database}];");
+        }
+    }
+
+    [Fact]
+    public async Task OrdinalMigrationFailsClosedOnTenantAliasesThenUpgradesWithoutDataLoss()
+    {
+        var database = $"AiMentorOpsMigration_{Guid.NewGuid():N}";
+        var master = MasterConnection();
+        await ExecuteAsync(master.ConnectionString,
+            $"CREATE DATABASE [{database}] COLLATE Latin1_General_100_CI_AS;");
+        var connectionString = new SqlConnectionStringBuilder(master.ConnectionString)
+        {
+            InitialCatalog = database
+        }.ConnectionString;
+        try
+        {
+            var root = FindRepositoryRoot();
+            await ApplyMigrationsAsync(connectionString, root, "010_operations_actions.sql");
+            await ExecuteAsync(connectionString, """
+                INSERT dbo.AiMentorOperationsActions
+                    (Id,TenantId,TargetType,TargetId,Action,TargetETag,RequestFingerprint,IdempotencyHash,
+                     RequesterSubjectId,RequestReasonHash,Status,Version,CreatedAt,ExpiresAt)
+                VALUES
+                    (N'action-upper',N'Tenant-A',N'approval',N'approval-1',N'approve',N'"etag"',
+                     REPLICATE('A',64),REPLICATE('B',64),N'operator-a',REPLICATE('C',64),0,1,
+                     '2026-07-15T10:00:00+00:00','2026-07-15T10:15:00+00:00'),
+                    (N'action-lower',N'tenant-a',N'approval',N'approval-2',N'approve',N'"etag"',
+                     REPLICATE('D',64),REPLICATE('E',64),N'operator-b',REPLICATE('F',64),0,1,
+                     '2026-07-15T10:00:00+00:00','2026-07-15T10:15:00+00:00');
+                """);
+
+            var migration = await File.ReadAllTextAsync(Path.Combine(root, "deploy", "sql",
+                "011_operations_action_ordinal_identifiers.sql"));
+            var conflict = await Assert.ThrowsAsync<SqlException>(() => ExecuteAsync(connectionString, migration));
+
+            Assert.Contains(conflict.Errors.Cast<SqlError>(), error => error.Number == 51011);
+            Assert.Equal(2L, await ScalarInt64Async(connectionString,
+                "SELECT COUNT_BIG(1) FROM dbo.AiMentorOperationsActions;"));
+            Assert.NotEqual("Latin1_General_100_BIN2", await ScalarStringAsync(connectionString, """
+                SELECT collation_name FROM sys.columns
+                WHERE object_id=OBJECT_ID(N'dbo.AiMentorOperationsActions') AND name=N'TenantId';
+                """));
+
+            await ExecuteAsync(connectionString,
+                "DELETE dbo.AiMentorOperationsActions WHERE Id=N'action-lower';");
+            await ExecuteAsync(connectionString, migration);
+            await ExecuteAsync(connectionString, migration);
+
+            Assert.Equal(1L, await ScalarInt64Async(connectionString,
+                "SELECT COUNT_BIG(1) FROM dbo.AiMentorOperationsActions;"));
+            Assert.Equal("Tenant-A", await ScalarStringAsync(connectionString,
+                "SELECT TenantId FROM dbo.AiMentorOperationsActions WHERE Id=N'action-upper';"));
+            Assert.Equal("Latin1_General_100_BIN2", await ScalarStringAsync(connectionString, """
+                SELECT collation_name FROM sys.columns
+                WHERE object_id=OBJECT_ID(N'dbo.AiMentorOperationsActions') AND name=N'TenantId';
+                """));
+            await AssertOrdinalIdentifierCollationsAsync(connectionString);
+            Assert.Equal(4L, await ScalarInt64Async(connectionString, """
+                SELECT COUNT_BIG(1)
+                FROM sys.indexes
+                WHERE object_id=OBJECT_ID(N'dbo.AiMentorOperationsActions')
+                  AND name IN (N'PK_AiMentorOperationsActions',N'UX_AiMentorOperationsActions_Idempotency',
+                    N'IX_AiMentorOperationsActions_Target',N'IX_AiMentorOperationsActions_Queue');
+                """));
+        }
+        finally
+        {
+            await ExecuteAsync(master.ConnectionString,
+                $"ALTER DATABASE [{database}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{database}];");
+        }
+    }
+
+    [Fact]
+    public async Task CapacityIsTenantScopedAndUnknownOutcomeArchivesWithoutUnfreezingTarget()
+    {
+        var database = $"AiMentorOpsRetention_{Guid.NewGuid():N}";
+        var master = MasterConnection();
+        await ExecuteAsync(master.ConnectionString,
+            $"CREATE DATABASE [{database}] COLLATE Latin1_General_100_CI_AS;");
+        var connectionString = new SqlConnectionStringBuilder(master.ConnectionString)
+        {
+            InitialCatalog = database
+        }.ConnectionString;
+        try
+        {
+            var root = FindRepositoryRoot();
+            await ApplyMigrationsAsync(connectionString, root, "010_operations_actions.sql",
+                "011_operations_action_ordinal_identifiers.sql");
+            var now = new DateTimeOffset(2026, 7, 15, 10, 0, 0, TimeSpan.Zero);
+            var clock = new FixedTimeProvider(now);
+            var sqlOptions = new SqlServerWorkflowOptions
+            {
+                ConnectionString = connectionString,
+                InitializeSchema = false
+            };
+            var actionOptions = new OperationsActionOptions
+            {
+                MaximumEntries = 1,
+                MaximumAuditEntriesPerTenant = 2,
+                OutcomeUnknownRetention = TimeSpan.FromMinutes(1)
+            };
+            using var store = new SqlServerOperationsActionStore(sqlOptions, clock, actionOptions);
+            var first = Record("unknown-a", "tenant-a", "approval", "target-a", new string('B', 64), 'A', now);
+            var otherTenant = Record("pending-b", "tenant-b", "approval", "target-b", new string('G', 64), 'F', now);
+            Assert.Equal(OperationsActionCreateStatus.Created, (await store.CreateAsync(first, 1)).Status);
+            Assert.Equal(OperationsActionCreateStatus.Created, (await store.CreateAsync(otherTenant, 1)).Status);
+            var acquired = await store.TryAcquireReviewAsync("tenant-a", first.Id, 1, "reviewer", true,
+                new string('D', 64), now);
+            await store.CompleteAsync("tenant-a", first.Id, acquired.Record!.Version,
+                OperationsActionStatus.OutcomeUnknown, "OPERATIONS_ACTION_OUTCOME_UNKNOWN", now);
+            var second = Record("pending-a", "tenant-a", "approval", "target-a-2", new string('L', 64), 'K', now);
+            Assert.Equal(OperationsActionCreateStatus.Created, (await store.CreateAsync(second, 1)).Status);
+
+            clock.Advance(TimeSpan.FromMinutes(2));
+            var archived = Assert.Single(await store.ListAsync("tenant-a", 10), item => item.Id == first.Id);
+            var taskState = Assert.Single(await store.ListTaskStateAsync("tenant-a"), item => item.Id == first.Id);
+            var sameTarget = Record("replay-a", "tenant-a", "approval", "target-a", new string('Q', 64), 'P',
+                clock.GetUtcNow());
+
+            Assert.Equal(OperationsActionStatus.OutcomeUnknownArchived, archived.Status);
+            Assert.Equal("OPERATIONS_ACTION_OUTCOME_UNKNOWN", archived.OutcomeCode);
+            Assert.Equal(OperationsActionStatus.OutcomeUnknownArchived, taskState.Status);
+            Assert.Equal(OperationsActionCreateStatus.TargetBusy,
+                (await store.CreateAsync(sameTarget, 10)).Status);
+            var capacity = Record("capacity-a", "tenant-a", "approval", "target-a-3", new string('V', 64),
+                'U', clock.GetUtcNow());
+            Assert.Equal(OperationsActionCreateStatus.Capacity,
+                (await store.CreateAsync(capacity, 10)).Status);
+        }
+        finally
+        {
+            await ExecuteAsync(master.ConnectionString,
+                $"ALTER DATABASE [{database}] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [{database}];");
+        }
+    }
+
     private static SqlConnectionStringBuilder MasterConnection()
     {
         var external = Environment.GetEnvironmentVariable("AIMENTOR_SQLSERVER_TEST_CONNECTION");
@@ -105,6 +281,65 @@ public sealed class SqlServerOperationsActionStoreTests
         command.CommandText = sql;
         await command.ExecuteNonQueryAsync();
     }
+
+    private static async Task ApplyMigrationsAsync(string connectionString, string root,
+        params string[] migrationNames)
+    {
+        foreach (var migrationName in migrationNames)
+            await ExecuteAsync(connectionString,
+                await File.ReadAllTextAsync(Path.Combine(root, "deploy", "sql", migrationName)));
+    }
+
+    private static async Task<long> ScalarInt64Async(string connectionString, string sql)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return Convert.ToInt64(await command.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture);
+    }
+
+    private static async Task<string> ScalarStringAsync(string connectionString, string sql)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        return Convert.ToString(await command.ExecuteScalarAsync(), System.Globalization.CultureInfo.InvariantCulture)!;
+    }
+
+    private static async Task<IReadOnlyList<string>> QueryStringsAsync(string connectionString, string sql)
+    {
+        await using var connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = connection.CreateCommand();
+        command.CommandText = sql;
+        var result = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync()) result.Add(reader.GetString(0));
+        return result;
+    }
+
+    private static async Task AssertOrdinalIdentifierCollationsAsync(string connectionString)
+    {
+        var collations = await QueryStringsAsync(connectionString, """
+            SELECT c.name + N':' + c.collation_name
+            FROM sys.columns c
+            WHERE c.object_id=OBJECT_ID(N'dbo.AiMentorOperationsActions')
+              AND c.name IN (N'Id',N'TenantId',N'TargetType',N'TargetId',N'Action',N'TargetETag',
+                N'RequestFingerprint',N'IdempotencyHash',N'RequesterSubjectId',N'RequestReasonHash',
+                N'ReviewerSubjectId',N'ReviewReasonHash',N'OutcomeCode')
+            ORDER BY c.name;
+            """);
+        Assert.Equal(13, collations.Count);
+        Assert.All(collations,
+            value => Assert.EndsWith(":Latin1_General_100_BIN2", value, StringComparison.Ordinal));
+    }
+
+    private static OperationsActionRecord Record(string id, string tenantId, string targetType, string targetId,
+        string idempotencyHash, char marker, DateTimeOffset now) => new(id, tenantId, targetType, targetId, "approve",
+        "\"etag\"", new string(marker, 64), idempotencyHash, $"operator-{marker}", new string(marker, 64),
+        OperationsActionStatus.AwaitingReview, 1, now, now.AddMinutes(15));
 
     private static string FindRepositoryRoot()
     {

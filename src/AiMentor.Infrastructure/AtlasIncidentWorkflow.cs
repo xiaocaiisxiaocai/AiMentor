@@ -44,6 +44,21 @@ public sealed class InMemoryAtlasIncidentStore(TimeProvider timeProvider) : IAtl
         }
     }
 
+    public Task<AtlasIncidentTaskState?> GetTaskStateAsync(string tenantId, string runId,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!_entries.TryGetValue(runId, out var entry)) return Task.FromResult<AtlasIncidentTaskState?>(null);
+        lock (entry.Gate)
+        {
+            var checkpoint = ExpireIfNeeded(entry);
+            if (!string.Equals(checkpoint.RunId, runId, StringComparison.Ordinal)
+                || !string.Equals(checkpoint.Access.TenantId, tenantId, StringComparison.Ordinal))
+                return Task.FromResult<AtlasIncidentTaskState?>(null);
+            return Task.FromResult<AtlasIncidentTaskState?>(TaskState(checkpoint));
+        }
+    }
+
     public Task<AtlasIncidentLeaseResult> TryAcquireAsync(string runId, AccessContext access, long expectedVersion,
         TimeSpan leaseDuration, CancellationToken cancellationToken = default)
     {
@@ -131,6 +146,10 @@ public sealed class InMemoryAtlasIncidentStore(TimeProvider timeProvider) : IAtl
             || !string.Equals(checkpoint.Access.SubjectId, access.SubjectId, StringComparison.Ordinal))
             throw Failure("ATLAS_RUN_FORBIDDEN", "只有原始调用者可以访问排查运行。", AtlasIncidentErrorKind.Forbidden);
     }
+
+    private static AtlasIncidentTaskState TaskState(AtlasIncidentCheckpoint checkpoint) => new(
+        checkpoint.RunId, checkpoint.Access.TenantId, checkpoint.Status, checkpoint.Version,
+        checkpoint.CreatedAt, checkpoint.UpdatedAt, checkpoint.ExpiresAt);
 
     private static AtlasIncidentWorkflowException Failure(string code, string message, AtlasIncidentErrorKind kind) =>
         new(code, message, kind);

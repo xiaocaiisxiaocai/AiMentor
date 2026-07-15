@@ -8,18 +8,18 @@ IF OBJECT_ID(N'dbo.AiMentorToolCompensations', N'U') IS NULL
 IF OBJECT_ID(N'dbo.AiMentorToolCompensationReconciliations', N'U') IS NULL
 BEGIN
     CREATE TABLE dbo.AiMentorToolCompensationReconciliations (
-        CompensationId nvarchar(64) NOT NULL
+        CompensationId nvarchar(64) COLLATE Latin1_General_100_BIN2 NOT NULL
             CONSTRAINT PK_AiMentorToolCompensationReconciliations PRIMARY KEY,
-        TenantId nvarchar(128) NOT NULL,
+        TenantId nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
         EvidenceState tinyint NOT NULL,
         EvidenceCode nvarchar(128) NOT NULL,
         EvidenceObservedAt datetimeoffset(7) NOT NULL,
         EvidenceExpiresAt datetimeoffset(7) NOT NULL,
-        FirstReviewerSubjectId nvarchar(256) NOT NULL,
+        FirstReviewerSubjectId nvarchar(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
         FirstConfirmed bit NOT NULL,
         FirstReasonHash char(64) NOT NULL,
         FirstReviewedAt datetimeoffset(7) NOT NULL,
-        SecondReviewerSubjectId nvarchar(256) NULL,
+        SecondReviewerSubjectId nvarchar(256) COLLATE Latin1_General_100_BIN2 NULL,
         SecondConfirmed bit NULL,
         SecondReasonHash char(64) NULL,
         SecondReviewedAt datetimeoffset(7) NULL,

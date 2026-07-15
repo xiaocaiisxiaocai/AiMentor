@@ -4,9 +4,10 @@ BEGIN TRANSACTION;
 IF OBJECT_ID(N'dbo.AiMentorToolExecutions', N'U') IS NULL
 BEGIN
     CREATE TABLE dbo.AiMentorToolExecutions (
-        ExecutionKey char(64) NOT NULL CONSTRAINT PK_AiMentorToolExecutions PRIMARY KEY,
+        ExecutionKey char(64) COLLATE Latin1_General_100_BIN2 NOT NULL
+            CONSTRAINT PK_AiMentorToolExecutions PRIMARY KEY,
         RequestFingerprint char(64) NOT NULL,
-        RunId nvarchar(128) NOT NULL,
+        RunId nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
         Status tinyint NOT NULL,
         LeaseToken nvarchar(64) NOT NULL,
         LeaseExpiresAt datetimeoffset(7) NOT NULL,

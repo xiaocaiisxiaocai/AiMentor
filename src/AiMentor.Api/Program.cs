@@ -4,11 +4,17 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Threading.RateLimiting;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using AiMentor.Api;
 using AiMentor.Application;
 using AiMentor.Domain;
 using AiMentor.Infrastructure;
+using Microsoft.AspNetCore.Antiforgery;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Authentication.OpenIdConnect;
+using Microsoft.AspNetCore.DataProtection;
 using HttpJsonOptions = Microsoft.AspNetCore.Http.Json.JsonOptions;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
@@ -38,11 +44,77 @@ var authenticationOptions = new AiMentorAuthenticationOptions
     DevelopmentSubjectId = builder.Configuration["Authentication:Development:SubjectId"] ?? "development-user",
     DevelopmentGroups = builder.Configuration.GetSection("Authentication:Development:Groups").Get<string[]>() ?? ["all-rnd"]
 };
+const string operationsCookieScheme = "AiMentor.Operations.Cookie";
+const string operationsOidcScheme = "AiMentor.Operations.Oidc";
+var operationsClientSecret = builder.Configuration["Operations:Web:ClientSecret"];
+if (string.IsNullOrWhiteSpace(operationsClientSecret))
+    operationsClientSecret = Environment.GetEnvironmentVariable("AIMENTOR_OPERATIONS_OIDC_CLIENT_SECRET");
+var operationsDataProtectionCertificatePassword =
+    builder.Configuration["Operations:Web:DataProtectionCertificatePassword"];
+if (string.IsNullOrWhiteSpace(operationsDataProtectionCertificatePassword))
+    operationsDataProtectionCertificatePassword = Environment.GetEnvironmentVariable(
+        "AIMENTOR_OPERATIONS_DATA_PROTECTION_CERTIFICATE_PASSWORD");
+var operationsWebOptions = new OperationsWebAuthenticationOptions
+{
+    Enabled = builder.Configuration.GetValue("Operations:Web:Enabled", false),
+    ClientId = builder.Configuration["Operations:Web:ClientId"],
+    ClientSecret = operationsClientSecret,
+    Scopes = builder.Configuration.GetSection("Operations:Web:Scopes").Get<string[]>() ?? ["openid", "profile"],
+    CallbackPath = builder.Configuration["Operations:Web:CallbackPath"] ?? "/signin-oidc",
+    SignedOutCallbackPath = builder.Configuration["Operations:Web:SignedOutCallbackPath"]
+        ?? "/signout-callback-oidc",
+    DataProtectionKeyPath = builder.Configuration["Operations:Web:DataProtectionKeyPath"],
+    DataProtectionClusterId = builder.Configuration["Operations:Web:DataProtectionClusterId"],
+    DataProtectionKeyRingFingerprint = builder.Configuration[
+        "Operations:Web:DataProtectionKeyRingFingerprint"],
+    DataProtectionCertificatePath = builder.Configuration["Operations:Web:DataProtectionCertificatePath"],
+    DataProtectionDecryptionCertificatePaths = builder.Configuration
+        .GetSection("Operations:Web:DataProtectionDecryptionCertificatePaths").Get<string[]>() ?? [],
+    DataProtectionCertificatePassword = operationsDataProtectionCertificatePassword,
+    SessionLifetimeMinutes = builder.Configuration.GetValue("Operations:Web:SessionLifetimeMinutes", 60),
+    DiscoveryTimeoutSeconds = builder.Configuration.GetValue("Operations:Web:DiscoveryTimeoutSeconds", 10)
+};
 var jwtAuthenticationEnabled = string.Equals(authenticationOptions.Mode, "OidcJwt", StringComparison.OrdinalIgnoreCase);
 if (builder.Environment.IsProduction()
     && (!jwtAuthenticationEnabled || enableLegacyV0
-        || !string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase)))
-    throw new InvalidOperationException("Production 环境必须启用 OIDC JWT、禁用 V0，并使用 Workflow:Provider=SqlServer。");
+        || !string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase)
+        || !operationsWebOptions.Enabled))
+    throw new InvalidOperationException("Production 环境必须启用 OIDC JWT 与运营台 OIDC、禁用 V0，并使用 Workflow:Provider=SqlServer。");
+if (operationsWebOptions.Enabled
+    && (!jwtAuthenticationEnabled
+        || string.IsNullOrWhiteSpace(operationsWebOptions.ClientId)
+        || string.IsNullOrWhiteSpace(operationsWebOptions.ClientSecret)
+        || operationsWebOptions.Scopes.Length == 0
+        || !operationsWebOptions.Scopes.Contains("openid", StringComparer.Ordinal)
+        || operationsWebOptions.Scopes.Any(string.IsNullOrWhiteSpace)
+        || operationsWebOptions.SessionLifetimeMinutes is < 5 or > 720
+        || operationsWebOptions.DiscoveryTimeoutSeconds is < 2 or > 60
+        || !IsSafeOidcCallbackPath(operationsWebOptions.CallbackPath)
+        || !IsSafeOidcCallbackPath(operationsWebOptions.SignedOutCallbackPath)))
+    throw new InvalidOperationException("运营台 OIDC 配置无效；必须使用服务端机密客户端、openid scope 和安全回调路径。");
+if (builder.Environment.IsProduction()
+    && (string.IsNullOrWhiteSpace(operationsWebOptions.DataProtectionKeyPath)
+        || !Path.IsPathFullyQualified(operationsWebOptions.DataProtectionKeyPath)
+        || !Guid.TryParseExact(operationsWebOptions.DataProtectionClusterId, "D", out _)
+        || operationsWebOptions.DataProtectionKeyRingFingerprint is not { Length: 64 }
+        || operationsWebOptions.DataProtectionKeyRingFingerprint.Any(character => !Uri.IsHexDigit(character))
+        || ProductionSecurityValidators.IsPathWithin(
+            builder.Environment.WebRootPath, operationsWebOptions.DataProtectionKeyPath)
+        || string.IsNullOrWhiteSpace(operationsWebOptions.DataProtectionCertificatePath)
+        || !Path.IsPathFullyQualified(operationsWebOptions.DataProtectionCertificatePath)
+        || !File.Exists(operationsWebOptions.DataProtectionCertificatePath)
+        || ProductionSecurityValidators.IsPathWithin(
+            builder.Environment.WebRootPath, operationsWebOptions.DataProtectionCertificatePath)
+        || operationsWebOptions.DataProtectionDecryptionCertificatePaths.Any(path =>
+            string.IsNullOrWhiteSpace(path)
+            || !Path.IsPathFullyQualified(path)
+            || !File.Exists(path)
+            || ProductionSecurityValidators.IsPathWithin(builder.Environment.WebRootPath, path))))
+    throw new InvalidOperationException(
+        "Production 运营台必须配置可写共享 DataProtection 目录及位于静态目录之外的绝对证书路径。");
+if (builder.Environment.IsProduction())
+    ProductionSecurityValidators.ValidateDataProtectionDirectory(
+        operationsWebOptions.DataProtectionKeyPath!, operationsWebOptions.DataProtectionClusterId!);
 if (jwtAuthenticationEnabled)
 {
     if (!Uri.TryCreate(authenticationOptions.Authority, UriKind.Absolute, out var authorityUri)
@@ -55,7 +127,8 @@ if (jwtAuthenticationEnabled)
         throw new InvalidOperationException("OIDC JWT 模式要求配置 Authentication:Audience。");
     if (authenticationOptions.RefreshIntervalSeconds is < 1 or > 86_400)
         throw new InvalidOperationException("Authentication:RefreshIntervalSeconds 必须在 1 到 86400 秒之间。");
-    builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme).AddJwtBearer(jwtOptions =>
+    var authenticationBuilder = builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+        .AddJwtBearer(jwtOptions =>
     {
         jwtOptions.Authority = authenticationOptions.Authority;
         jwtOptions.Audience = authenticationOptions.Audience;
@@ -84,18 +157,128 @@ if (jwtAuthenticationEnabled)
             }
         };
     });
-    builder.Services.AddAuthorization(authorizationOptions => authorizationOptions.AddPolicy("question-api", policy =>
+    if (operationsWebOptions.Enabled)
     {
-        policy.RequireAuthenticatedUser();
-        policy.RequireClaim(authenticationOptions.SubjectClaim);
-        policy.RequireClaim(authenticationOptions.TenantClaim);
-    }));
+        var dataProtection = builder.Services.AddDataProtection().SetApplicationName("AiMentor.Operations");
+        if (builder.Environment.IsProduction()) dataProtection.DisableAutomaticKeyGeneration();
+        if (!string.IsNullOrWhiteSpace(operationsWebOptions.DataProtectionKeyPath))
+            dataProtection.PersistKeysToFileSystem(new DirectoryInfo(operationsWebOptions.DataProtectionKeyPath));
+        if (!string.IsNullOrWhiteSpace(operationsWebOptions.DataProtectionCertificatePath))
+        {
+            var certificate = X509CertificateLoader.LoadPkcs12FromFile(
+                operationsWebOptions.DataProtectionCertificatePath,
+                operationsWebOptions.DataProtectionCertificatePassword,
+                X509KeyStorageFlags.EphemeralKeySet);
+            ProductionSecurityValidators.ValidateDataProtectionCertificate(certificate, true);
+            var decryptionCertificates = operationsWebOptions.DataProtectionDecryptionCertificatePaths
+                .Select(path => X509CertificateLoader.LoadPkcs12FromFile(
+                    path, operationsWebOptions.DataProtectionCertificatePassword,
+                    X509KeyStorageFlags.EphemeralKeySet))
+                .Where(item => !item.Thumbprint.Equals(certificate.Thumbprint, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+            foreach (var decryptionCertificate in decryptionCertificates)
+                ProductionSecurityValidators.ValidateDataProtectionCertificate(decryptionCertificate, false);
+            var certificateRing = new[] { certificate }.Concat(decryptionCertificates).ToArray();
+            builder.Services.AddSingleton<IReadOnlyList<X509Certificate2>>(certificateRing);
+            dataProtection.ProtectKeysWithCertificate(certificate);
+            dataProtection.UnprotectKeysWithAnyCertificate(certificateRing);
+        }
+        authenticationBuilder
+            .AddCookie(operationsCookieScheme, cookieOptions =>
+            {
+                cookieOptions.Cookie.Name = builder.Environment.IsProduction()
+                    ? "__Host-AiMentor.Operations"
+                    : "AiMentor.Operations";
+                cookieOptions.Cookie.HttpOnly = true;
+                cookieOptions.Cookie.IsEssential = true;
+                cookieOptions.Cookie.Path = "/";
+                cookieOptions.Cookie.SameSite = SameSiteMode.Lax;
+                cookieOptions.Cookie.SecurePolicy = builder.Environment.IsProduction()
+                    ? CookieSecurePolicy.Always
+                    : CookieSecurePolicy.SameAsRequest;
+                cookieOptions.ExpireTimeSpan = TimeSpan.FromMinutes(operationsWebOptions.SessionLifetimeMinutes);
+                cookieOptions.SlidingExpiration = false;
+                cookieOptions.Events.OnRedirectToLogin = context =>
+                {
+                    context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                    return Task.CompletedTask;
+                };
+                cookieOptions.Events.OnRedirectToAccessDenied = context =>
+                {
+                    context.Response.StatusCode = StatusCodes.Status403Forbidden;
+                    return Task.CompletedTask;
+                };
+            })
+            .AddOpenIdConnect(operationsOidcScheme, oidcOptions =>
+            {
+                oidcOptions.Authority = authenticationOptions.Authority;
+                oidcOptions.ClientId = operationsWebOptions.ClientId;
+                oidcOptions.ClientSecret = operationsWebOptions.ClientSecret;
+                oidcOptions.RequireHttpsMetadata = authenticationOptions.RequireHttpsMetadata;
+                oidcOptions.ResponseType = "code";
+                oidcOptions.UsePkce = true;
+                oidcOptions.SaveTokens = false;
+                oidcOptions.MapInboundClaims = false;
+                oidcOptions.SignInScheme = operationsCookieScheme;
+                oidcOptions.CallbackPath = operationsWebOptions.CallbackPath;
+                oidcOptions.SignedOutCallbackPath = operationsWebOptions.SignedOutCallbackPath;
+                oidcOptions.Scope.Clear();
+                foreach (var scope in operationsWebOptions.Scopes.Distinct(StringComparer.Ordinal))
+                    oidcOptions.Scope.Add(scope);
+                oidcOptions.TokenValidationParameters.NameClaimType = authenticationOptions.SubjectClaim;
+                oidcOptions.Events = new OpenIdConnectEvents
+                {
+                    OnTokenValidated = context =>
+                    {
+                        try { _ = ClaimsAccessContextProvider.CreateValidated(context.Principal!, authenticationOptions); }
+                        catch (UnauthorizedAccessException) { context.Fail("OIDC 身份声明无效或存在歧义。"); }
+                        return Task.CompletedTask;
+                    },
+                    OnRemoteFailure = context =>
+                    {
+                        context.HandleResponse();
+                        context.Response.Redirect("/ops/index.html?authentication=failed");
+                        return Task.CompletedTask;
+                    }
+                };
+            });
+    }
+    builder.Services.AddAuthorization(authorizationOptions =>
+    {
+        authorizationOptions.AddPolicy("question-api", policy =>
+        {
+            policy.RequireAuthenticatedUser();
+            policy.RequireClaim(authenticationOptions.SubjectClaim);
+            policy.RequireClaim(authenticationOptions.TenantClaim);
+        });
+        authorizationOptions.AddPolicy("operations-web", policy =>
+        {
+            policy.AuthenticationSchemes.Add(operationsCookieScheme);
+            policy.RequireAuthenticatedUser();
+            policy.RequireClaim(authenticationOptions.SubjectClaim);
+            policy.RequireClaim(authenticationOptions.TenantClaim);
+        });
+    });
     builder.Services.AddSingleton<IRequestAccessContextProvider>(new ClaimsAccessContextProvider(authenticationOptions));
 }
 else
 {
     builder.Services.AddSingleton<IRequestAccessContextProvider>(new DevelopmentAccessContextProvider(authenticationOptions));
 }
+builder.Services.AddAntiforgery(antiforgeryOptions =>
+{
+    antiforgeryOptions.HeaderName = "X-AiMentor-CSRF";
+    antiforgeryOptions.Cookie.Name = builder.Environment.IsProduction()
+        ? "__Host-AiMentor.Antiforgery"
+        : "AiMentor.Antiforgery";
+    antiforgeryOptions.Cookie.HttpOnly = true;
+    antiforgeryOptions.Cookie.IsEssential = true;
+    antiforgeryOptions.Cookie.Path = "/";
+    antiforgeryOptions.Cookie.SameSite = SameSiteMode.Strict;
+    antiforgeryOptions.Cookie.SecurePolicy = builder.Environment.IsProduction()
+        ? CookieSecurePolicy.Always
+        : CookieSecurePolicy.SameAsRequest;
+});
 builder.Services.ConfigureHttpJsonOptions(options => options.SerializerOptions.Converters.Add(new JsonStringEnumConverter()));
 builder.Services.AddExceptionHandler<ApiExceptionHandler>();
 builder.Services.AddProblemDetails();
@@ -281,25 +464,49 @@ builder.Services.AddSingleton<IAnswerComposer, AgentFrameworkAnswerComposer>();
 builder.Services.AddSingleton(new TrustedQuestionOptions());
 builder.Services.AddSingleton<ITrustedQuestionService, TrustedQuestionService>();
 builder.Services.AddSingleton(TimeProvider.System);
-builder.Services.AddSingleton(new MemoryWorkflowOptions());
+var memoryWorkflowOptions = new MemoryWorkflowOptions
+{
+    MaximumPendingProposalsPerTenant = builder.Configuration.GetValue(
+        "Memory:MaximumPendingProposalsPerTenant", 10_000)
+};
+if (memoryWorkflowOptions.MaximumPendingProposalsPerTenant <= 0)
+    throw new InvalidOperationException("Memory:MaximumPendingProposalsPerTenant 必须大于 0。");
+builder.Services.AddSingleton(memoryWorkflowOptions);
+var memoryRetentionIntervalMinutes = builder.Configuration.GetValue(
+    "Memory:RetentionCleanupIntervalMinutes", 15);
+var memoryRetentionBatchSize = builder.Configuration.GetValue("Memory:RetentionCleanupBatchSize", 1_000);
+if (memoryRetentionIntervalMinutes is < 1 or > 1_440 || memoryRetentionBatchSize is < 1 or > 10_000)
+    throw new InvalidOperationException("Memory 后台清理周期或单次批次超出安全范围。");
 var memoryDataDirectory = Path.Combine(builder.Environment.ContentRootPath, "data");
 var memoryStorePath = builder.Configuration["Memory:StorePath"]
     ?? Path.Combine(memoryDataDirectory, "aimentor-memory.json");
 var configuredMemoryKey = builder.Configuration["Memory:EncryptionKey"]
     ?? Environment.GetEnvironmentVariable("AIMENTOR_MEMORY_ENCRYPTION_KEY");
-var memoryKey = ResolveMemoryMasterKey(
-    configuredMemoryKey,
-    Path.Combine(memoryDataDirectory, "memory.key"), builder.Environment.IsProduction());
-var memoryCipher = new AesGcmMemoryCipher(memoryKey);
+var configuredMemoryKeys = builder.Configuration.GetSection("Memory:Encryption:Keys").GetChildren().ToArray();
+var memoryLegacyKey = ResolveMemoryMasterKey(
+    configuredMemoryKey, Path.Combine(memoryDataDirectory, "memory.key"), builder.Environment.IsProduction(),
+    configuredMemoryKeys.Length == 0);
+var memoryKeyVersion = builder.Configuration["Memory:Encryption:ActiveKeyVersion"] ?? "v1";
+var memoryKeys = ResolveMemoryKeys(builder.Configuration, memoryKeyVersion, memoryLegacyKey);
+var configuredMemoryFingerprintKey = builder.Configuration["Memory:Encryption:FingerprintKey"]
+    ?? string.Empty;
+if (string.IsNullOrWhiteSpace(configuredMemoryFingerprintKey))
+    configuredMemoryFingerprintKey = Environment.GetEnvironmentVariable("AIMENTOR_MEMORY_FINGERPRINT_KEY");
+var memoryFingerprintKey = ResolveMemoryFingerprintKey(
+    configuredMemoryFingerprintKey, memoryKeys[memoryKeyVersion], builder.Environment.IsProduction());
+var memoryCipher = new AesGcmMemoryCipher(memoryKeyVersion, memoryKeys, memoryFingerprintKey);
 builder.Services.AddSingleton<IMemoryCipher>(memoryCipher);
 var workflowKeyVersion = builder.Configuration["Workflow:Encryption:ActiveKeyVersion"] ?? "v1";
-var workflowKeys = ResolveWorkflowKeys(builder.Configuration, workflowKeyVersion, memoryKey,
+var workflowKeys = ResolveWorkflowKeys(builder.Configuration, workflowKeyVersion, memoryKeys[memoryKeyVersion],
     builder.Environment.IsProduction() && string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase));
 builder.Services.AddSingleton<IWorkflowStateCipher>(
     new AesGcmWorkflowStateCipher(workflowKeyVersion, workflowKeys, memoryCipher));
 var sqlConnectionConfigured = false;
 var sqlEncrypt = false;
 var sqlTrustServerCertificate = false;
+var memoryRetentionHealth = new MemoryRetentionHealthState(
+    string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase));
+builder.Services.AddSingleton(memoryRetentionHealth);
 if (string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase))
 {
     var connectionString = builder.Configuration.GetConnectionString("WorkflowSqlServer")
@@ -336,8 +543,26 @@ else
 builder.Services.AddSingleton<IToolCompensationReconciliationService>(services =>
     services.GetRequiredService<IToolCompensationService>() as IToolCompensationReconciliationService
     ?? throw new InvalidOperationException("当前补偿存储未实现结果不确定对账契约。"));
-builder.Services.AddSingleton(new EncryptedFileMemoryStoreOptions { FilePath = memoryStorePath });
-builder.Services.AddSingleton<IMemoryStore, EncryptedFileMemoryStore>();
+if (string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase))
+{
+    builder.Services.AddSingleton<IMemoryStore, SqlServerMemoryStore>();
+    builder.Services.AddSingleton<IMemoryRetentionService, MemoryRetentionService>();
+    builder.Services.AddSingleton(new MemoryRetentionBackgroundOptions
+    {
+        Interval = TimeSpan.FromMinutes(memoryRetentionIntervalMinutes),
+        MaximumRowsPerTable = memoryRetentionBatchSize
+    });
+    builder.Services.AddHostedService<MemoryRetentionBackgroundService>();
+}
+else
+{
+    builder.Services.AddSingleton(new EncryptedFileMemoryStoreOptions
+    {
+        FilePath = memoryStorePath,
+        MaximumPendingProposalsPerTenant = memoryWorkflowOptions.MaximumPendingProposalsPerTenant
+    });
+    builder.Services.AddSingleton<IMemoryStore, EncryptedFileMemoryStore>();
+}
 builder.Services.AddSingleton<IMemoryContentSafetyService, RuleBasedMemoryContentSafetyService>();
 builder.Services.AddSingleton<IMemoryWorkflowService, MemoryWorkflowService>();
 builder.Services.AddSingleton(new MemoryContextOptions());
@@ -354,16 +579,24 @@ var operationsEscalatorGroups = builder.Configuration.GetSection("Operations:Esc
     ?? ["operations-escalators"];
 var operationsReviewLifetimeSeconds = builder.Configuration.GetValue("Operations:ReviewLifetimeSeconds", 900);
 var operationsMaximumPendingActions = builder.Configuration.GetValue("Operations:MaximumPendingActions", 10_000);
+var operationsMaximumAuditEntries = builder.Configuration.GetValue(
+    "Operations:MaximumAuditEntriesPerTenant", 100_000);
+var operationsOutcomeUnknownRetentionDays =
+    builder.Configuration.GetValue("Operations:OutcomeUnknownRetentionDays", 30);
 if (operationsReviewerGroups.Length == 0 || operationsReviewerGroups.Any(string.IsNullOrWhiteSpace)
     || operationsEscalatorGroups.Length == 0 || operationsEscalatorGroups.Any(string.IsNullOrWhiteSpace)
-    || operationsReviewLifetimeSeconds is < 30 or > 86_400 || operationsMaximumPendingActions <= 0)
+    || operationsReviewLifetimeSeconds is < 30 or > 86_400 || operationsMaximumPendingActions <= 0
+    || operationsMaximumAuditEntries < operationsMaximumPendingActions
+    || operationsOutcomeUnknownRetentionDays is < 1 or > 3_650)
     throw new InvalidOperationException("Operations 复核组、升级组或复核期限配置无效。");
 builder.Services.AddSingleton(new OperationsActionOptions
 {
     ReviewerGroups = new HashSet<string>(operationsReviewerGroups, StringComparer.OrdinalIgnoreCase),
     EscalatorGroups = new HashSet<string>(operationsEscalatorGroups, StringComparer.OrdinalIgnoreCase),
     ReviewLifetime = TimeSpan.FromSeconds(operationsReviewLifetimeSeconds),
-    MaximumEntries = operationsMaximumPendingActions
+    MaximumEntries = operationsMaximumPendingActions,
+    MaximumAuditEntriesPerTenant = operationsMaximumAuditEntries,
+    OutcomeUnknownRetention = TimeSpan.FromDays(operationsOutcomeUnknownRetentionDays)
 });
 builder.Services.AddSingleton<IOperationsActionStore>(services =>
     string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase)
@@ -389,12 +622,13 @@ builder.Services.AddSingleton(new SystemDoctorOptions
     TenantClaimConfigured = !string.IsNullOrWhiteSpace(authenticationOptions.TenantClaim),
     WorkflowProvider = workflowProvider,
     AtlasIncidentStorePersistent = string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase),
-    MemoryKeyConfigured = !string.IsNullOrWhiteSpace(configuredMemoryKey),
-    MemoryKeyValid = memoryKey.Length == 32,
+    MemoryStorePersistent = string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase),
+    MemoryKeyConfigured = !string.IsNullOrWhiteSpace(configuredMemoryKey) || configuredMemoryKeys.Length > 0,
+    MemoryKeyValid = memoryKeys[memoryKeyVersion].Length == 32,
     WorkflowKeyRingConfigured = configuredWorkflowKeys.Length > 0,
     WorkflowActiveKeyPresent = workflowKeys.ContainsKey(workflowKeyVersion),
     WorkflowUsesIndependentKey = workflowKeys.TryGetValue(workflowKeyVersion, out var activeWorkflowKey)
-        && !activeWorkflowKey.AsSpan().SequenceEqual(memoryKey),
+        && !activeWorkflowKey.AsSpan().SequenceEqual(memoryKeys[memoryKeyVersion]),
     SqlConnectionConfigured = sqlConnectionConfigured,
     SqlEncrypt = sqlEncrypt,
     SqlTrustServerCertificate = sqlTrustServerCertificate,
@@ -434,9 +668,46 @@ if (!string.IsNullOrWhiteSpace(otlpEndpoint))
 }
 
 var app = builder.Build();
+var operationsFormAction = operationsWebOptions.Enabled
+    ? $"'self' {new Uri(authenticationOptions.Authority!).GetLeftPart(UriPartial.Authority)}"
+    : "'self'";
 app.UseExceptionHandler();
-app.UseDefaultFiles();
-app.UseStaticFiles();
+if (builder.Environment.IsProduction())
+{
+    app.UseHsts();
+    app.UseHttpsRedirection();
+}
+app.Use(async (context, next) =>
+{
+    if (context.Request.Path.StartsWithSegments("/ops"))
+    {
+        context.Response.OnStarting(() =>
+        {
+            context.Response.Headers.ContentSecurityPolicy =
+                "default-src 'self'; base-uri 'none'; connect-src 'self'; frame-ancestors 'none'; " +
+                $"form-action {operationsFormAction}; object-src 'none'; script-src 'self'; style-src 'self'";
+            context.Response.Headers.XContentTypeOptions = "nosniff";
+            context.Response.Headers["Referrer-Policy"] = "no-referrer";
+            context.Response.Headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()";
+            if (context.Request.Path.StartsWithSegments("/ops/api")
+                || context.Request.Path.Equals("/ops/session", StringComparison.Ordinal))
+                context.Response.Headers.CacheControl = "no-store";
+            return Task.CompletedTask;
+        });
+    }
+    await next();
+});
+var webRootPath = app.Environment.WebRootPath
+    ?? Path.Combine(app.Environment.ContentRootPath, "wwwroot");
+var operationsAssetsRoot = Path.Combine(webRootPath, "ops");
+app.MapGet("/ops/index.html", () => Results.File(
+    Path.Combine(operationsAssetsRoot, "index.html"), "text/html; charset=utf-8")).ExcludeFromDescription();
+app.MapGet("/ops/app.js", () => Results.File(
+    Path.Combine(operationsAssetsRoot, "app.js"), "text/javascript; charset=utf-8")).ExcludeFromDescription();
+app.MapGet("/ops/styles.css", () => Results.File(
+    Path.Combine(operationsAssetsRoot, "styles.css"), "text/css; charset=utf-8")).ExcludeFromDescription();
+app.MapGet("/ops/session.css", () => Results.File(
+    Path.Combine(operationsAssetsRoot, "session.css"), "text/css; charset=utf-8")).ExcludeFromDescription();
 if (jwtAuthenticationEnabled)
 {
     app.UseAuthentication();
@@ -444,6 +715,33 @@ if (jwtAuthenticationEnabled)
 }
 app.UseRateLimiter();
 app.MapOpenApi();
+if (builder.Environment.IsProduction())
+{
+    ProductionSecurityValidators.ValidateExistingDataProtectionKeys(
+        app.Services, operationsWebOptions.DataProtectionKeyRingFingerprint!);
+    ProbeDataProtectionRoundTrip(app.Services);
+    using var discoveryTimeout = new CancellationTokenSource(
+        TimeSpan.FromSeconds(operationsWebOptions.DiscoveryTimeoutSeconds));
+    try
+    {
+        var oidc = app.Services.GetRequiredService<IOptionsMonitor<OpenIdConnectOptions>>()
+            .Get(operationsOidcScheme);
+        var metadata = await (oidc.ConfigurationManager
+            ?? throw new InvalidOperationException("运营台 OIDC 缺少 discovery 配置管理器。"))
+            .GetConfigurationAsync(discoveryTimeout.Token);
+        ProductionSecurityValidators.ValidateOidcDiscovery(metadata, authenticationOptions.Authority!);
+    }
+    catch (Exception exception) when (exception is not InvalidOperationException)
+    {
+        throw new InvalidOperationException("运营台 OIDC discovery 就绪探测失败。", exception);
+    }
+
+    var sqlMemory = app.Services.GetRequiredService<IMemoryStore>() as SqlServerMemoryStore
+        ?? throw new InvalidOperationException("Production 记忆存储未注册为 SQL Server 实现。");
+    using var sqlProbeTimeout = new CancellationTokenSource(
+        TimeSpan.FromSeconds(operationsWebOptions.DiscoveryTimeoutSeconds));
+    await sqlMemory.ProbeReadinessAsync(sqlProbeTimeout.Token);
+}
 var systemDoctor = app.Services.GetRequiredService<ISystemDoctor>();
 var startupDiagnostic = await systemDoctor.RunAsync();
 if (builder.Environment.IsProduction() && !startupDiagnostic.IsReady)
@@ -484,6 +782,11 @@ v1.MapGet("/operations/tasks", ListOperationsTasksAsync)
 v1.MapGet("/operations/actions", ListOperationsActionsAsync)
     .WithName("ListOperationsActionsV1").WithTags("AiMentor operations v1")
     .Produces<IReadOnlyList<OperationsActionSummary>>();
+v1.MapGet("/operations/actions/{requestId}", GetOperationsActionAsync)
+    .WithName("GetOperationsActionV1").WithTags("AiMentor operations v1")
+    .Produces<OperationsActionSummary>()
+    .ProducesProblem(StatusCodes.Status403Forbidden)
+    .ProducesProblem(StatusCodes.Status404NotFound);
 v1.MapPost("/operations/tasks/{targetType}/{targetId}/actions", RequestOperationsActionAsync)
     .WithName("RequestOperationsActionV1").WithTags("AiMentor operations v1")
     .Produces<OperationsActionSummary>(StatusCodes.Status202Accepted)
@@ -493,6 +796,43 @@ v1.MapPost("/operations/actions/{requestId}/review", ReviewOperationsActionAsync
     .Produces<OperationsActionSummary>()
     .ProducesProblem(StatusCodes.Status409Conflict);
 app.MapGet("/ops", () => Results.Redirect("/ops/index.html", permanent: false)).ExcludeFromDescription();
+var operationsSession = app.MapGet("/ops/session", (HttpContext context, IAntiforgery antiforgery,
+    IRequestAccessContextProvider accessProvider) =>
+{
+    _ = accessProvider.GetAccessContext(context.User);
+    var tokenSet = antiforgery.GetAndStoreTokens(context);
+    return Results.Ok(new
+    {
+        authenticated = !operationsWebOptions.Enabled || context.User.Identity?.IsAuthenticated == true,
+        authenticationRequired = operationsWebOptions.Enabled,
+        csrfToken = tokenSet.RequestToken
+    });
+}).ExcludeFromDescription();
+if (operationsWebOptions.Enabled) operationsSession.RequireAuthorization("operations-web");
+
+var operationsBrowserApi = app.MapGroup("/ops/api").ExcludeFromDescription();
+if (operationsWebOptions.Enabled) operationsBrowserApi.RequireAuthorization("operations-web");
+operationsBrowserApi.MapGet("/tasks", ListOperationsTasksAsync);
+operationsBrowserApi.MapGet("/actions", ListOperationsActionsAsync);
+operationsBrowserApi.MapGet("/actions/{requestId}", GetOperationsActionAsync);
+operationsBrowserApi.MapPost("/tasks/{targetType}/{targetId}/actions", RequestOperationsActionAsync)
+    .AddEndpointFilter(ValidateOperationsAntiforgeryAsync);
+operationsBrowserApi.MapPost("/actions/{requestId}/review", ReviewOperationsActionAsync)
+    .AddEndpointFilter(ValidateOperationsAntiforgeryAsync);
+if (operationsWebOptions.Enabled)
+{
+    app.MapGet("/ops/login", (string? returnUrl) => Results.Challenge(
+            new AuthenticationProperties { RedirectUri = SafeOperationsReturnUrl(returnUrl) },
+            [operationsOidcScheme]))
+        .AllowAnonymous()
+        .ExcludeFromDescription();
+    app.MapPost("/ops/logout", () => Results.SignOut(
+            new AuthenticationProperties { RedirectUri = "/ops/index.html" },
+            [operationsCookieScheme, operationsOidcScheme]))
+        .RequireAuthorization("operations-web")
+        .AddEndpointFilter(ValidateOperationsAntiforgeryAsync)
+        .ExcludeFromDescription();
+}
 v1.MapGet("/knowledge/stats", () => Results.Ok(repository.Statistics))
     .WithName("GetKnowledgeStatisticsV1").Produces<KnowledgeStatistics>();
 v1.MapPost("/questions", AskAsync)
@@ -853,6 +1193,7 @@ static IResult MemoryProblem(MemoryWorkflowException exception, HttpContext cont
     {
         MemoryWorkflowErrorKind.NotFound => StatusCodes.Status404NotFound,
         MemoryWorkflowErrorKind.Conflict => StatusCodes.Status409Conflict,
+        MemoryWorkflowErrorKind.Capacity => StatusCodes.Status503ServiceUnavailable,
         _ => StatusCodes.Status400BadRequest
     };
     return Results.Problem(statusCode: statusCode, title: "记忆工作流请求失败", detail: exception.Message,
@@ -938,6 +1279,17 @@ static async Task<IResult> ListOperationsActionsAsync(IOperationsActionService s
     catch (OperationsActionException exception) { return OperationsActionProblem(exception, context); }
 }
 
+static async Task<IResult> GetOperationsActionAsync(string requestId, IOperationsActionService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        return Results.Ok(await service.GetAsync(requestId, accessProvider.GetAccessContext(context.User),
+            cancellationToken));
+    }
+    catch (OperationsActionException exception) { return OperationsActionProblem(exception, context); }
+}
+
 static async Task<IResult> RequestOperationsActionAsync(string targetType, string targetId,
     RequestOperationsActionRequest request, IOperationsActionService service,
     IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
@@ -948,7 +1300,10 @@ static async Task<IResult> RequestOperationsActionAsync(string targetType, strin
         var idempotencyKey = context.Request.Headers["Idempotency-Key"].ToString();
         var result = await service.RequestAsync(targetType, targetId, request.Action, etag, request.Reason,
             idempotencyKey, accessProvider.GetAccessContext(context.User), cancellationToken);
-        return Results.Accepted($"/api/v1/operations/actions/{result.Id}", result);
+        var locationPrefix = context.Request.Path.StartsWithSegments("/ops/api")
+            ? "/ops/api"
+            : "/api/v1/operations";
+        return Results.Accepted($"{locationPrefix}/actions/{result.Id}", result);
     }
     catch (OperationsActionException exception) { return OperationsActionProblem(exception, context); }
 }
@@ -1350,7 +1705,8 @@ static string GetCorrelationId(HttpContext context)
     return Guid.NewGuid().ToString("N");
 }
 
-static byte[] ResolveMemoryMasterKey(string? configuredKey, string developmentKeyPath, bool production)
+static byte[]? ResolveMemoryMasterKey(string? configuredKey, string developmentKeyPath, bool production,
+    bool requireInProduction)
 {
     if (!string.IsNullOrWhiteSpace(configuredKey))
     {
@@ -1365,8 +1721,9 @@ static byte[] ResolveMemoryMasterKey(string? configuredKey, string developmentKe
         }
         throw new InvalidOperationException("Memory:EncryptionKey 必须是 Base64 编码的 32 字节密钥。");
     }
-    if (production)
+    if (production && requireInProduction)
         throw new InvalidOperationException("Production 环境必须通过 AIMENTOR_MEMORY_ENCRYPTION_KEY 提供记忆加密密钥。");
+    if (production) return null;
 
     Directory.CreateDirectory(Path.GetDirectoryName(developmentKeyPath)!);
     if (File.Exists(developmentKeyPath))
@@ -1406,6 +1763,61 @@ static IReadOnlyDictionary<string, byte[]> ResolveWorkflowKeys(IConfiguration co
     if (!keys.ContainsKey(activeVersion))
         throw new InvalidOperationException("Workflow:Encryption:ActiveKeyVersion 必须存在于密钥环中。");
     return keys;
+}
+
+static IReadOnlyDictionary<string, byte[]> ResolveMemoryKeys(IConfiguration configuration, string activeVersion,
+    byte[]? legacyKey)
+{
+    var keys = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+    foreach (var child in configuration.GetSection("Memory:Encryption:Keys").GetChildren())
+    {
+        try
+        {
+            var decoded = Convert.FromBase64String(child.Value?.Trim() ?? string.Empty);
+            if (decoded.Length != 32) throw new FormatException();
+            keys.Add(child.Key, decoded);
+        }
+        catch (Exception exception) when (exception is FormatException or ArgumentException)
+        {
+            throw new InvalidOperationException(
+                $"Memory:Encryption:Keys:{child.Key} 必须是唯一版本的 Base64 编码 32 字节密钥。");
+        }
+    }
+    if (keys.Count == 0)
+        keys.Add(activeVersion, legacyKey
+            ?? throw new InvalidOperationException("记忆密钥环为空且未提供兼容主密钥。"));
+    if (legacyKey is not null)
+    {
+        if (keys.TryGetValue("v1", out var configuredLegacy)
+            && !configuredLegacy.AsSpan().SequenceEqual(legacyKey))
+            throw new InvalidOperationException(
+                "Memory v1 密钥必须与 AIMENTOR_MEMORY_ENCRYPTION_KEY 一致，以兼容既有密文。");
+        keys.TryAdd("v1", legacyKey);
+    }
+    if (!keys.ContainsKey(activeVersion))
+        throw new InvalidOperationException("Memory:Encryption:ActiveKeyVersion 必须存在于密钥环中。");
+    return keys;
+}
+
+static byte[] ResolveMemoryFingerprintKey(string? configuredKey, byte[] developmentFallback, bool production)
+{
+    if (!string.IsNullOrWhiteSpace(configuredKey))
+    {
+        try
+        {
+            var decoded = Convert.FromBase64String(configuredKey.Trim());
+            if (decoded.Length == 32) return decoded;
+        }
+        catch (FormatException)
+        {
+            // 统一返回不包含密钥材料的稳定配置错误。
+        }
+        throw new InvalidOperationException("Memory:Encryption:FingerprintKey 必须是 Base64 编码的 32 字节密钥。");
+    }
+    if (production)
+        throw new InvalidOperationException(
+            "Production 必须通过 AIMENTOR_MEMORY_FINGERPRINT_KEY 提供独立且跨轮换稳定的指纹密钥。");
+    return developmentFallback;
 }
 
 static ModelProviderOptions ReadModelProviderOptions(IConfiguration configuration, string sectionName,
@@ -1463,3 +1875,57 @@ static AiProviderKind ParseProvider(string? value, AiProviderKind fallback, stri
     if (Enum.TryParse<AiProviderKind>(value, true, out var provider)) return provider;
     throw new InvalidOperationException($"{sectionName}:Provider 不受支持。");
 }
+
+static bool IsSafeOidcCallbackPath(string value) =>
+    value.StartsWith('/')
+    && !value.StartsWith("//", StringComparison.Ordinal)
+    && !value.Contains('\\')
+    && !value.Contains('?')
+    && !value.Contains('#');
+
+static void ProbeDataProtectionRoundTrip(IServiceProvider services)
+{
+    try
+    {
+        var protector = services.GetRequiredService<IDataProtectionProvider>()
+            .CreateProtector("AiMentor.Operations.StartupProbe.v1");
+        var plainText = Guid.NewGuid().ToString("N");
+        if (!plainText.Equals(protector.Unprotect(protector.Protect(plainText)), StringComparison.Ordinal))
+            throw new CryptographicException("Data Protection 往返结果不一致。");
+    }
+    catch (Exception exception) when (exception is not InvalidOperationException)
+    {
+        throw new InvalidOperationException("运营台 Data Protection 读写与解密探测失败。", exception);
+    }
+}
+
+static string SafeOperationsReturnUrl(string? returnUrl)
+{
+    if (string.IsNullOrWhiteSpace(returnUrl)) return "/ops/index.html";
+    return Uri.TryCreate(returnUrl, UriKind.Relative, out _)
+        && returnUrl.StartsWith("/ops", StringComparison.Ordinal)
+        && !returnUrl.StartsWith("//", StringComparison.Ordinal)
+        && !returnUrl.Contains('\\')
+            ? returnUrl
+            : "/ops/index.html";
+}
+
+static async ValueTask<object?> ValidateOperationsAntiforgeryAsync(
+    EndpointFilterInvocationContext invocationContext, EndpointFilterDelegate next)
+{
+    try
+    {
+        var antiforgery = invocationContext.HttpContext.RequestServices.GetRequiredService<IAntiforgery>();
+        await antiforgery.ValidateRequestAsync(invocationContext.HttpContext);
+        return await next(invocationContext);
+    }
+    catch (AntiforgeryValidationException)
+    {
+        return Results.Problem(statusCode: StatusCodes.Status400BadRequest,
+            title: "运营台请求校验失败", detail: "请求缺少有效的防伪令牌，请刷新运营台后重试。",
+            type: "https://httpstatuses.com/400", instance: invocationContext.HttpContext.Request.Path,
+            extensions: new Dictionary<string, object?> { ["code"] = "OPERATIONS_CSRF_INVALID" });
+    }
+}
+
+public partial class Program;

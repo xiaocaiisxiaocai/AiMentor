@@ -106,7 +106,25 @@ public sealed class OperationsActionServiceTests
     }
 
     [Fact]
-    public async Task IncidentSlaEscalationDoesNotImpersonateOwnerOrMutateOwnerOnlyTarget()
+    public async Task EscalationReviewRejectsTargetThatChangedAfterProposal()
+    {
+        var fixture = Fixture.Create(overdue: true);
+        var task = Assert.Single((await fixture.Tasks.ListAsync(fixture.OperatorA, "approval", null, null, 10)).Items);
+        var request = await fixture.Actions.RequestAsync("approval", task.Id, "escalate", task.ETag,
+            "提出逾期升级", "stale-sla-001", fixture.OperatorA);
+        fixture.Approvals.MoveTo(ToolApprovalStatus.Rejected);
+
+        var conflict = await Assert.ThrowsAsync<OperationsActionException>(() => fixture.Actions.ReviewAsync(
+            request.Id, request.Version, request.ETag, true, "确认升级", fixture.OperatorB));
+        var audit = Assert.Single(await fixture.Store.ListAsync("tenant-a", 10));
+
+        Assert.Equal("OPERATIONS_TARGET_VERSION_CONFLICT", conflict.Code);
+        Assert.Equal(OperationsActionStatus.Failed, audit.Status);
+        Assert.Equal(0, fixture.Approvals.DecideCount);
+    }
+
+    [Fact]
+    public async Task IncidentEscalationReviewUsesMetadataAndRejectsStaleTerminalWithoutImpersonatingOwner()
     {
         var now = new DateTimeOffset(2026, 7, 15, 9, 0, 0, TimeSpan.Zero);
         var clock = new ManualTimeProvider(now);
@@ -115,7 +133,7 @@ public sealed class OperationsActionServiceTests
         var atlas = new InMemoryAtlasIncidentStore(clock);
         var checkpoint = new AtlasIncidentCheckpoint("incident-1", owner, "BK-RUN-001", "2.2",
             AtlasIncidentStatus.RequiredInputs, new SafeAtlasIncidentInput(), ["region"], [], null, 1,
-            now.AddHours(-2), now.AddHours(-2), now.AddMinutes(-1));
+            now.AddHours(-2), now.AddHours(-2), now.AddMinutes(1));
         await atlas.CreateAsync(checkpoint);
         var approval = new ToolApprovalRequest("unused", "tenant-a", "requester", "memory.delete",
             ToolOperationRisk.Mutation, new string('F', 64), ["memoryId"], "unused", now,
@@ -131,23 +149,23 @@ public sealed class OperationsActionServiceTests
             new ToolApprovalOptions(), new ToolCompensationOptions(), actionOptions, clock);
 
         var task = Assert.Single((await tasks.ListAsync(owner, "incident", null, null, 10)).Items);
-        var ownerSnapshot = (await atlas.GetAsync(checkpoint.RunId, owner))!;
-        var requested = await actions.RequestAsync("incident", task.Id, "escalate", task.ETag,
-            "排查超时", "incident-sla-001", owner);
-        var reviewTask = Assert.Single((await tasks.ListAsync(
-            reviewer, "action-review", null, null, 10)).Items);
+        var record = new OperationsActionRecord("incident-escalation", "tenant-a", "incident", task.Id,
+            "escalate", task.ETag, new string('A', 64), new string('B', 64), owner.SubjectId,
+            new string('C', 64), OperationsActionStatus.AwaitingReview, 1, now, now.AddMinutes(15));
+        await actionStore.CreateAsync(record, 100);
         var forbidden = await Assert.ThrowsAsync<AtlasIncidentWorkflowException>(() =>
             atlas.GetAsync(checkpoint.RunId, reviewer));
-        var completed = await actions.ReviewAsync(requested.Id, reviewTask.Version!.Value, reviewTask.ETag, true,
-            "独立确认升级", reviewer);
+        clock.Advance(TimeSpan.FromMinutes(2));
+        var conflict = await Assert.ThrowsAsync<OperationsActionException>(() => actions.ReviewAsync(record.Id,
+            record.Version, OperationsActionService.ETag(record), true, "独立确认升级", reviewer));
         var after = (await atlas.GetAsync(checkpoint.RunId, owner))!;
+        var audit = Assert.Single(await actionStore.ListAsync("tenant-a", 10));
 
         Assert.Equal("ATLAS_RUN_FORBIDDEN", forbidden.Code);
-        Assert.Equal(OperationsActionStatus.Completed, completed.Status);
-        Assert.Equal("OPERATIONS_SLA_ESCALATED", completed.OutcomeCode);
-        Assert.Equal(ownerSnapshot.Status, after.Status);
-        Assert.Equal(ownerSnapshot.Version, after.Version);
-        Assert.Equal(ownerSnapshot.UpdatedAt, after.UpdatedAt);
+        Assert.Equal("OPERATIONS_TARGET_VERSION_CONFLICT", conflict.Code);
+        Assert.Equal(AtlasIncidentStatus.Expired, after.Status);
+        Assert.Equal(2, after.Version);
+        Assert.Equal(OperationsActionStatus.Failed, audit.Status);
         Assert.Equal(0, approvals.DecideCount);
     }
 
@@ -171,11 +189,17 @@ public sealed class OperationsActionServiceTests
         var escalationAudit = await fixture.Actions.ListAsync(escalatorOnly);
         var workflowAudit = await fixture.Actions.ListAsync(reviewerOnly);
         var denied = await Assert.ThrowsAsync<OperationsActionException>(() => fixture.Actions.ListAsync(outsider));
+        var approvalHidden = await Assert.ThrowsAsync<OperationsActionException>(() =>
+            fixture.Actions.GetAsync("approval-action", escalatorOnly));
+        var escalationHidden = await Assert.ThrowsAsync<OperationsActionException>(() =>
+            fixture.Actions.GetAsync("escalation-action", reviewerOnly));
 
         Assert.Equal("escalation-action", Assert.Single(escalationAudit).Id);
         Assert.Equal(["approval-action", "compensation-action"],
             workflowAudit.Select(item => item.Id).Order(StringComparer.Ordinal).ToArray());
         Assert.Equal("OPERATIONS_REVIEWER_ROLE_REQUIRED", denied.Code);
+        Assert.Equal("OPERATIONS_ACTION_NOT_FOUND", approvalHidden.Code);
+        Assert.Equal("OPERATIONS_ACTION_NOT_FOUND", escalationHidden.Code);
     }
 
     [Fact]
@@ -256,6 +280,46 @@ public sealed class OperationsActionServiceTests
         var expired = await fixture.Store.TryAcquireReviewAsync("tenant-a", pending.Id, 1, "operator-b", true,
             new string('3', 64), fixture.Clock.GetUtcNow());
         Assert.Equal(OperationsActionAcquireStatus.Expired, expired.Status);
+    }
+
+    [Fact]
+    public async Task CapacityIsTenantScopedAndArchivedUnknownOutcomeKeepsTargetFrozenAndAuditReadable()
+    {
+        var now = new DateTimeOffset(2026, 7, 15, 9, 0, 0, TimeSpan.Zero);
+        var clock = new ManualTimeProvider(now);
+        var options = new OperationsActionOptions
+        {
+            MaximumEntries = 1,
+            MaximumAuditEntriesPerTenant = 2,
+            OutcomeUnknownRetention = TimeSpan.FromMinutes(1)
+        };
+        var store = new InMemoryOperationsActionStore(clock, options);
+        OperationsActionRecord Record(string id, string tenant, string target, char marker) => new(id, tenant,
+            "approval", target, "approve", "\"etag\"", new string(marker, 64),
+            new string((char)(marker + 1), 64), "requester", new string((char)(marker + 2), 64),
+            OperationsActionStatus.AwaitingReview, 1, now, now.AddMinutes(15));
+        var first = Record("unknown-a", "tenant-a", "target-a", 'A');
+        var otherTenant = Record("pending-b", "tenant-b", "target-b", 'F');
+        Assert.Equal(OperationsActionCreateStatus.Created, (await store.CreateAsync(first, 1)).Status);
+        Assert.Equal(OperationsActionCreateStatus.Created, (await store.CreateAsync(otherTenant, 1)).Status);
+        var acquired = await store.TryAcquireReviewAsync("tenant-a", first.Id, 1, "reviewer", true,
+            new string('D', 64), now);
+        await store.CompleteAsync("tenant-a", first.Id, acquired.Record!.Version,
+            OperationsActionStatus.OutcomeUnknown, "OPERATIONS_ACTION_OUTCOME_UNKNOWN", now);
+        Assert.Equal(OperationsActionCreateStatus.Created,
+            (await store.CreateAsync(Record("pending-a", "tenant-a", "target-a-2", 'K'), 1)).Status);
+
+        clock.Advance(TimeSpan.FromMinutes(2));
+        var archived = Assert.Single(await store.ListAsync("tenant-a", 10), item => item.Id == first.Id);
+        var taskState = Assert.Single(await store.ListTaskStateAsync("tenant-a"), item => item.Id == first.Id);
+        var sameTarget = await store.CreateAsync(Record("replay-a", "tenant-a", "target-a", 'P'), 10);
+        var auditCapacity = await store.CreateAsync(Record("capacity-a", "tenant-a", "target-a-3", 'U'), 10);
+
+        Assert.Equal(OperationsActionStatus.OutcomeUnknownArchived, archived.Status);
+        Assert.Equal("OPERATIONS_ACTION_OUTCOME_UNKNOWN", archived.OutcomeCode);
+        Assert.Equal(OperationsActionStatus.OutcomeUnknownArchived, taskState.Status);
+        Assert.Equal(OperationsActionCreateStatus.TargetBusy, sameTarget.Status);
+        Assert.Equal(OperationsActionCreateStatus.Capacity, auditCapacity.Status);
     }
 
     private sealed class Fixture

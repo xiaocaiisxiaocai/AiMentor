@@ -10,7 +10,7 @@
 - RAG：支持本地 Markdown 词法沙箱和 OpenSearch 3.5 混合检索两种适配器。OpenSearch 路径使用 BM25 + 256 维向量 + 分数归一化加权融合，并在两个召回分支中都执行租户和 ACL 前置过滤；召回结果再按原始检索分、文档词项覆盖率和最佳句子覆盖率重排。
 - 安全审核：策略版本 `2026-07-13.4` 覆盖输入、检索内容、工具参数和模型输出。工具执行采用服务器注册表、默认拒绝、风险不可由客户端覆盖、嵌套敏感字段、跨租户参数、人在回路审批和公网 HTTPS 目标白名单。修改性工具审批强制申请人与审批人分离，并绑定租户、申请人、工具名、规范化参数摘要和 15 分钟有效期，批准后只能消费一次。
 - 工具与规划：服务器注册表已转换为 Agent Framework `AIFunction`；只读工具自动进入安全执行器，修改工具以原生 `ApprovalRequiredAIFunction` 暂停并返回 `AwaitingApproval`，人工裁决后通过同一 `AgentSession` 恢复。模型可选择 `knowledge.stats` 或请求 `memory.delete`，但看不到、生成不了服务端批准凭据。函数委托只能调用 `IToolExecutor`，并叠加单次 4 轮模型迭代、3 次工具调用、10 秒总时限、重复调用熔断、16 KB 累计结果预算和结果再审核。官方的 [`ApprovalRequiredAIFunction` 设计说明](https://github.com/microsoft/agent-framework/blob/main/docs/decisions/0006-userapproval.md) 明确审批标记不负责强制执行，因此框架恢复后仍由服务端执行器做最终校验。
-- 记忆：已实现会话记忆、用户偏好和长期事实的显式授权工作流，包括待批准提案、批准、查看、更正、删除、过期、乐观并发和租户/用户隔离。开发默认使用 AES-GCM 加密快照持久化，键和值均不以明文落盘；问答只注入当前用户最小相关的已批准记忆，并把记忆标记为只读数据而非系统指令或事实引用来源。
+- 记忆：已实现会话记忆、用户偏好和长期事实的显式授权工作流，包括待批准提案、批准、查看、更正、删除、过期、乐观并发和租户/用户隔离。开发默认使用 AES-GCM 加密文件快照；SQL Server 模式把提案和正式记忆以版本化认证密文及不可逆键指纹写入共享表，以可串行化事务保证多实例批准单胜者，并用跨副本应用锁有界清理过期密文。键和值均不以明文落盘；旧密钥密文在合法读取后在线升级，问答只注入当前用户最小相关的已批准记忆，并把记忆标记为只读数据而非系统指令或事实引用来源。
 - 知识：默认加载 `AI-Agent-V1合成数据包\knowledge` 中 23 份已发布合成文档，共 74 个分块。
 - 测评：v1 严格读取锁定的 150 条 JSONL 题目与独立主体配置，v2 独立运行已结构化的 critical Oracle；按动作、决策、安全结果、claims、引用、轨迹和 Fixture 分维度输出 `Pass / Fail / NotReady / NotApplicable`，缺少可执行 Ground Truth 不再自动算通过。
 
@@ -58,7 +58,7 @@ flowchart LR
     MA -->|否或超时| MX["不生效"]
     MA -->|是| MS["隔离记忆存储：范围 / 版本 / 过期"]
     MS --> ME["AES-GCM 密文快照：临时文件 + 原子替换"]
-    ME --> MV["查看 / 更正 / 删除"]
+    ME --> MV["查看 / 更正 / 删除；Production 使用共享 SQL 密文行"]
     ME --> MR["相关记忆选择：租户 / 用户 / 会话 / 数量预算"]
     MR --> MRS["注入前二次审核：data-only"]
     MRS --> M
@@ -146,7 +146,7 @@ OpenSearch 的 `VectorDimensions`、`IndexName` 一致；模型或维度变化�
 
 退出码 `0` 表示严格质量门禁通过，`2` 表示题集有效但质量或 Oracle 覆盖不足，`3` 表示题集或套件配置本身无效。当前 v1 150 题基线预期返回 `2`；CI 应把它视为真实阻断，不能改写为成功。v2 小套件必须通过才能接受新的策略变更。
 
-执行真实 SQL Server 多实例对账验收（会创建并自动销毁临时容器、数据库，最多并发七个 API 实例）：
+执行真实 SQL Server 多实例对账验收（会创建并自动销毁临时容器、数据库，最多并发八个 API 实例）：
 
 ```powershell
 .\scripts\Test-DistributedReconciliation.ps1 `
@@ -155,7 +155,7 @@ OpenSearch 的 `VectorDimensions`、`IndexName` 一致；模型或维度变化�
   -BasePort 5610
 ```
 
-脚本要求 Docker Desktop 已运行，且指定的 SQL 与九个连续 API 端口均可绑定。它真实执行 001–010 迁移，并先验证正向工具的精确强杀窗口；随后创建真实 `memory.correct` 正向操作和加密补偿记录，在补偿账本已提交 `Executing`、快照尚未解密且 `memory.correct.restore` 尚未调用时强杀实例。脚本确认目标记忆仍保持正向值，等待租约过期后由无屏障替代实例查询冻结记录并验证反向重试返回 409；还会执行多实例补偿审批/执行并发单胜者、常规结果不确定探测、跨实例独立审批、第一人复核强杀、两个第二复核实例并发单胜者、Atlas SQL 恢复、运营队列脱敏及 `Reconciled` 滚动回放。脚本不输出数据库密码，失败时保留诊断日志路径，成功后自动删除临时资源。
+脚本要求 Docker Desktop 已运行，且指定的 SQL 与九个连续 API 端口均可绑定。它真实执行 001–013 迁移，并先验证正向工具的精确强杀窗口；随后创建真实 `memory.correct` 正向操作和加密补偿记录，在补偿账本已提交 `Executing`、快照尚未解密且 `memory.correct.restore` 尚未调用时强杀实例。脚本确认目标记忆通过共享 SQL 在替代实例可见且仍保持正向值，等待租约过期后查询冻结记录并验证反向重试返回 409；还会执行多实例补偿审批/执行并发单胜者、常规结果不确定探测、跨实例独立审批、第一人复核强杀、两个第二复核实例并发单胜者、Atlas SQL 恢复、运营队列脱敏及 `Reconciled` 滚动回放。脚本不输出数据库密码，失败时保留诊断日志路径，成功后自动删除临时资源。
 
 2026-07-14 的严格测量基线：150 条全部执行，0 条完整通过、72 条失败、78 条 `NotReady`；可判定动作准确率 46.40%，动作 Oracle 覆盖率 83.33%，必需来源 micro recall 79.59%，完整可执行 Oracle 覆盖率 0%，28 条 critical 用例全部阻断，质量门禁正确失败。当前独立 v2 critical 套件为 16 Pass / 0 Fail / 0 NotReady，动作、引用和 Oracle 覆盖率均为 100%，门禁退出码 0；除输入安全、ACL 和间接注入外，还覆盖跨用户记忆、删除后无旧缓存、工具精确参数/替换/重放/过期以及 PII Transform、凭证和身份证失败关闭。此前的“决策 90%、引用 75%、安全/ACL 100%”使用了宽泛动作兜底、全权限主体和无来源即引用成功等错误口径，已经废止，不能用于版本比较。
 
@@ -240,9 +240,9 @@ Invoke-RestMethod http://127.0.0.1:5080/api/v1/memories
 
 会话记忆必须提供 `sessionId`，默认保留 8 小时且最长 24 小时；用户偏好默认 180 天，长期事实默认 90 天，两者最长 365 天。相同用户、范围、会话和键只能存在一条有效记忆，避免冲突偏好。身份证号、银行卡号、可用凭证和提示词注入内容不能写入记忆。所有状态操作写入不含记忆正文的审计轨迹。
 
-开发环境首次启动会在 `src\AiMentor.Api\data` 生成被 Git 忽略的记忆快照和本地密钥。Production 环境禁止自动生成密钥，必须通过 `AIMENTOR_MEMORY_ENCRYPTION_KEY` 提供 Base64 编码的 32 字节主密钥；也可通过 `Memory__StorePath` 指定快照位置。主密钥经用途隔离派生后分别用于 AES-GCM 认证加密和 HMAC 键指纹，密钥轮换前必须先设计重加密流程，不能直接替换环境变量。
+开发环境首次启动会在 `src\AiMentor.Api\data` 生成被 Git 忽略的记忆快照和本地兼容密钥。Production 禁止自动生成密钥：新部署应配置 `Memory:Encryption:Keys` 版本化密钥环和独立、跨加密轮换保持稳定的 `AIMENTOR_MEMORY_FINGERPRINT_KEY`；旧部署可暂时保留 `AIMENTOR_MEMORY_ENCRYPTION_KEY` 作为 `v1` 兼容读取密钥。认证上下文绑定租户、用户、范围、会话、记录和字段，复制或篡改密文会失败关闭。
 
-当前加密快照适配器面向单实例部署：进程内串行化写入，并通过“临时文件写完后原子替换”避免半写文件。多副本部署不能共享该文件，生产横向扩展时应替换 `IMemoryStore` 为支持事务和行级租户策略的 PostgreSQL 或 SQL Server 适配器，应用层授权与记忆注入契约无需改变。
+文件快照适配器只面向单实例开发部署：进程内串行化写入，并通过“临时文件写完后原子替换”避免半写文件。多副本 Production 必须使用内置 SQL Server 适配器；它与工作流共享连接，在数据库中提供事务、序数身份隔离、租户边界和跨副本保留期协调，应用层授权与记忆注入契约保持不变。
 
 ### 工具执行示例
 
@@ -296,12 +296,26 @@ docker exec aimentor-sqlserver /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa 
 
 $env:Workflow__Provider = 'SqlServer'
 $env:ConnectionStrings__WorkflowSqlServer = 'Server=127.0.0.1,1433;Database=AiMentor;User ID=sa;Password=<本地强密码>;Encrypt=True;TrustServerCertificate=True'
-# 生产环境必须从密钥系统提供固定主密钥；不得依赖本地自动生成的 data\memory.key。
+# 生产环境必须从密钥系统提供；不得依赖本地自动生成的 data\memory.key。
 $env:AIMENTOR_MEMORY_ENCRYPTION_KEY = '<至少32字节的Base64密钥>'
+$env:AIMENTOR_MEMORY_FINGERPRINT_KEY = '<独立且稳定的32字节Base64密钥>'
 dotnet run --project src\AiMentor.Api
 ```
 
-开发环境 SQL Server 模式会按需创建工具审批、Agent 检查点、执行/补偿对账、Atlas 排查和运营动作审计表，并用数据库应用锁避免多个实例同时建表。Production 强制 `Workflow:Provider=SqlServer`、`Encrypt=True`、`TrustServerCertificate=False`，且默认关闭运行时建表；发布账号应按编号依次执行 [`001_workflow.sql`](deploy/sql/001_workflow.sql) 至 [`010_operations_actions.sql`](deploy/sql/010_operations_actions.sql) 的全部迁移，应用账号只授予表级读写权限。
+开发环境 SQL Server 模式会按需创建工具审批、Agent 检查点、执行/补偿对账、Atlas 排查、运营动作审计以及加密记忆表，并用数据库应用锁避免多个实例同时建表。Production 强制 `Workflow:Provider=SqlServer`、记忆使用同一共享 SQL、`Encrypt=True`、`TrustServerCertificate=False`，且默认关闭运行时建表；发布账号应按编号依次执行 [`001_workflow.sql`](deploy/sql/001_workflow.sql) 至 [`013_workflow_ordinal_identities.sql`](deploy/sql/013_workflow_ordinal_identities.sql) 的全部迁移，应用账号只授予表级读写权限。013 会把历史审批、Agent 运行、工具执行/对账、补偿和 Atlas 的身份列全部升级为二进制序数语义；发现仅大小写不同的身份别名时会整笔失败关闭，必须先人工核实归属。
+
+### 记忆密钥轮换
+
+记忆密文把版本写入认证信封，不依赖明文列。轮换使用“先加、再切、合法读取重加密、确认后删旧密钥”；指纹密钥独立且不随加密密钥切换：
+
+```powershell
+$env:Memory__Encryption__ActiveKeyVersion = '2026_07'
+$env:Memory__Encryption__Keys__2026_01 = '<旧32字节主密钥的Base64>'
+$env:Memory__Encryption__Keys__2026_07 = '<新32字节主密钥的Base64>'
+$env:AIMENTOR_MEMORY_FINGERPRINT_KEY = '<保持不变的独立32字节Base64密钥>'
+```
+
+新提案和更新立即使用活动版本；已批准记忆在合法列表、读取或修改时以条件更新在线重加密，旧待批准提案在批准后转为活动版本，过期密文由后台有界清理。`012_memory_store.sql` 会为两张表维护 `KeyVersion` 和窄索引，Production readiness 在接收流量前确认数据库中的每个版本都能由当前密钥环读取。保留旧版本直到两表的旧 `KeyVersion` 计数均为零且至少经过最长批准窗口；升级前的四段 `v1.*` 密文还要求暂时提供原 `AIMENTOR_MEMORY_ENCRYPTION_KEY`。确认旧密文为零后可移除旧版本和兼容环境变量。未知版本、错误上下文和过早删除旧密钥均失败关闭。
 
 ### 工作流密钥轮换
 
@@ -452,15 +466,32 @@ $env:AIMENTOR_OIDC_TOKEN_B = '<subject-b-token>'
 - AtlasID Workflow 在 SQL Server 模式使用 `009_atlas_incident_runs.sql`、加密载荷、版本号和短租约；测试通过独立 Helper 进程强杀验证租约到期接管。
 - Provider 对比使用 `AiMentor.Evaluation --compare --output <path>`，Chat、Embedding、Reranker 必须分别配置。缺少任一远端配置时 candidate 为 `NotReady` 并退出 `2`，不会回退确定性实现；用量未知为 `null`，成本只按显式带版本价格计算。
 - OpenSearch 发布使用 `scripts/Publish-OpenSearchIndex.ps1` 创建不可变物理索引，全部校验通过后原子切换 `current/previous` Alias；`scripts/Rollback-OpenSearchIndex.ps1` 原子回滚。Production 禁止启动时同步写索引。
-- 运营工作台位于 `/ops/`，统一展示审批、`OutcomeUnknown`、补偿和 AtlasID 运行的脱敏任务摘要。批准、拒绝和 SLA 升级不再由页面直接调用目标工作流，而是由服务端校验任务 `ETag` 与 `Idempotency-Key` 后持久化为待复核动作；独立第二人原子占位成功后才执行。提出人不能自审，并发复核只有一个胜者，异常结果冻结为 `OutcomeUnknown`，理由只保存 SHA-256 摘要。SQL Server 模式由 [`010_operations_actions.sql`](deploy/sql/010_operations_actions.sql) 保存完整状态和审计终态；前端不会获得额外授权。
+- 运营工作台位于 `/ops/`，统一展示审批、`OutcomeUnknown`、补偿和 AtlasID 运行的脱敏任务摘要。浏览器通过服务端 OIDC Authorization Code + PKCE 建立 HttpOnly 会话，访问 `/ops/api` BFF，既不获得也不持久化上游访问令牌；所有写操作同时校验会话、同源防伪令牌、任务 `ETag` 与 `Idempotency-Key`。批准、拒绝和 SLA 升级会持久化为待复核动作，独立第二人原子占位成功后才执行。提出人不能自审，并发复核只有一个胜者，异常结果冻结为 `OutcomeUnknown`，理由只保存 SHA-256 摘要。SQL Server 模式由 [`010_operations_actions.sql`](deploy/sql/010_operations_actions.sql) 建表，并由 [`011_operations_action_ordinal_identifiers.sql`](deploy/sql/011_operations_action_ordinal_identifiers.sql) 将租户、主体和资源标识升级为与 .NET `Ordinal` 一致的二进制区分。
+
+Production 必须为运营台提供机密 OIDC 客户端和所有副本共享的 Data Protection 密钥目录。客户端机密只能来自 Secret 注入；`sub`、`tenant_id`、`groups` 必须进入经过签名验证的 ID Token，歧义主体会在建立会话前失败关闭：
+
+```powershell
+$env:Operations__Web__Enabled = 'true'
+$env:Operations__Web__ClientId = 'aimentor-operations-web'
+$env:AIMENTOR_OPERATIONS_OIDC_CLIENT_SECRET = '<来自密钥系统>'
+$env:Operations__Web__DataProtectionKeyPath = '/var/lib/aimentor/dataprotection'
+$env:Operations__Web__DataProtectionClusterId = '<部署流程生成并持久化的唯一GUID>'
+$env:Operations__Web__DataProtectionKeyRingFingerprint = '<预置key标识排序后SHA-256十六进制>'
+$env:Operations__Web__DataProtectionCertificatePath = '/run/secrets/aimentor-dp-protection.pfx'
+# 轮换期间保留旧证书仅用于解密已有 key ring；新 key 只由上面的活动证书保护。
+$env:Operations__Web__DataProtectionDecryptionCertificatePaths__0 = '/run/secrets/aimentor-dp-old.pfx'
+$env:AIMENTOR_OPERATIONS_DATA_PROTECTION_CERTIFICATE_PASSWORD = '<来自密钥系统>'
+```
+
+发布流程必须先在唯一共享卷的 Data Protection 目录写入只含上述 GUID 的 `.aimentor-cluster-id`，并用活动证书预生成至少一个 key；应用不会自行创建 marker，Production 也已关闭自动 key 生成。把全部 `key-*.xml` 文件名中的 GUID 按序排序、以换行连接后计算 SHA-256，作为 `DataProtectionKeyRingFingerprint` 随发布注入。轮换必须由受控 init job 先在共享卷增加 key，再同步更新指纹并滚动部署；这使各副本误挂空本地卷、缺 key 或出现分叉 key ring 时启动失败，而完整复制同一 key ring 的等价卷仍具备跨副本解密能力。启动会真实读取 OIDC discovery，校验 issuer、authorization/token/JWKS HTTPS 端点和签名密钥；共享目录必须位于静态目录之外且可写，活动 RSA 证书必须有效，未撤销历史 key 会逐一创建加密器，撤销 key 则允许退役旧证书，最后完成 Protect/Unprotect 往返。旧解密证书环支持无损轮换，过早移除仍在用证书会阻止启动。运营静态资源只按精确白名单发布 `/ops` 下的 HTML、JS 和两份 CSS，不会把 WebRoot 中的其他文件暴露为下载。SQL 记忆 readiness 还会验证 012 的必需列、BIN2 排序规则、索引键顺序、现存密钥版本及样本认证解密、DML 权限和保留期应用锁；后台清理失败会把 `/health/ready` 降为 503，成功恢复后自动转绿。任一启动检查失败时 Production 在接收流量前退出。运营审计每租户同时受待复核容量和总记录容量约束；归档的未知副作用仍保留可见冻结记录，但不会造成无界扫描。
 
 Linux 容器门禁位于 `.github/workflows/linux-containers.yml`，在 PR、`main` 推送和手工触发时执行三个独立任务：
 
-- Ubuntu Release 构建和除外部 SQL 分类外的 266 条自动化测试；
-- SQL Server 2022 service container 上的 Atlas 加密、租约强杀恢复、多实例补偿审批/执行单胜者、对账、Atlas 持久恢复和运营任务队列脱敏验收；
+- Ubuntu Release 构建和除外部 SQL 分类外的 280 条自动化测试；
+- SQL Server 2022 service container 上的 12 条记忆/Atlas/运营/完整工作流 SQL 用例，以及租约强杀恢复、多实例补偿审批/执行单胜者、对账、持久恢复和运营任务队列脱敏验收；
 - OpenSearch 3.5.0 真实容器上的双物理索引、Alias 发布/查询/切换和回滚验收。
 
-SQL job 使用 GitHub Actions 的动态宿主端口和 service container ID，不依赖 Windows LocalDB。三个 `RequiresSqlServer` 测试从通用 Linux job 显式排除，再在 SQL job 中通过 `AIMENTOR_SQLSERVER_TEST_CONNECTION` 全部真实执行；一旦显式配置，连接、迁移或断言失败都会让门禁失败，不会退回跳过。分布式入口支持 Release：
+SQL job 使用 GitHub Actions 的动态宿主端口和 service container ID，不依赖 Windows LocalDB。12 条 `RequiresSqlServer` 用例从通用 Linux job 显式排除，再在 SQL job 中通过 `AIMENTOR_SQLSERVER_TEST_CONNECTION` 全部真实执行；一旦显式配置，连接、迁移或断言失败都会让门禁失败，不会退回跳过。分布式入口支持 Release：
 
 ```powershell
 ./scripts/Test-DistributedReconciliation.ps1 `
@@ -475,8 +506,8 @@ SQL job 使用 GitHub Actions 的动态宿主端口和 service container ID，�
 
 ## 验证状态
 
-- 2026-07-15 本地自动化测试 269/269 通过；独立 v2 critical 套件为 16/16 Pass，动作、引用和 Oracle 覆盖率均为 100%。OIDC discovery/JWKS 与 Provider Chat/Embedding/Reranker 均有独立进程网络验收；运营动作的双人复核、SLA 升级、最小权限审计、SQL 持久化、并发单胜者和硬崩溃冻结已加入回归。真实 SQL Server 2022 分布式验收通过 Atlas 恢复、运营队列脱敏以及补偿审批/执行并发单胜者。
-- 2026-07-15 本机从官方仓库及 Public ECR 拉取 `opensearchproject/opensearch:3.5.0` 仍有界超时，因此本机路径保持 `NotReady`；同日 GitHub Ubuntu 容器门禁运行 `29391464970` 已真实通过固定 3.5.0 的 mapping、bulk、count、Alias 发布/查询/切换和回滚。拉取超时会树级终止进程，且不落盘或回显 Registry/代理错误；本机事后无残留进程、临时日志或容器。
+- 2026-07-15 本地自动化测试 292/292 通过（非 SQL 280、真实 SQL Server 2022 容器 SQL 12）；独立 v2 critical 套件为 16/16 Pass，动作、引用和 Oracle 覆盖率均为 100%。OIDC discovery/JWKS 与 Provider Chat/Embedding/Reranker 均有独立进程网络验收；运营台 BFF、防伪校验、运营动作双人复核、终态 SLA、全工作流大小写租户隔离、按租户容量、SQL 记忆版本化密钥轮换、过期清理、并发单胜者和硬崩溃冻结已加入回归。真实 SQL Server 2022 分布式验收通过 001–013、共享记忆、Atlas 恢复、运营队列脱敏以及补偿审批/执行并发单胜者。
+- 2026-07-15 本机此前从官方仓库及 Public ECR 拉取 `opensearchproject/opensearch:3.5.0` 有界超时；同日 GitHub Ubuntu 容器门禁运行 `29392014780` 已真实通过固定 3.5.0 的 mapping、bulk、count、Alias 发布/查询/切换和回滚。拉取超时会树级终止进程，且不落盘或回显 Registry/代理错误；本机事后无残留进程、临时日志或容器。
 
 - 2026-07-14 本地自动化测试 179/179 通过；新增严格题集哈希与套件完整性校验、v1/v2 schema 隔离、结构化 Oracle、Runner 侧可信 Fixture Registry、知识检索/内容安全/重排/回答四边界记录、真实输入安全、ACL 双主体及间接注入 CLEAN/MIXED 回归、精确引用 provenance、critical 阻断，以及 Target 自报 Ready、错误主体、未召回假绿、伪造安全轨迹、接受或错误拒绝恶意块、同 ID 替换正文、重复 Evidence、隔离后继续传播、输出 canary、恶意引用、always-refuse 等负向控制。InMemory 与 SQL Server 补偿路径继续覆盖加密快照、职责分离、幂等、结果不确定冻结和双人结案。严格 150 题基线为 0 Pass / 72 Fail / 78 NotReady，动作准确率 46.4%、动作覆盖率 83.33%、必需来源 micro recall 79.59%、完整 Oracle 覆盖率 0%，门禁按预期失败；独立 v2 critical 套件为 6/6 Pass，动作、引用和 Oracle 覆盖率均为 100%，门禁退出码 0；NuGet 直接与传递依赖未发现已知漏洞。
 - OpenSearch 请求契约已由自动化测试验证：索引映射、搜索管线、批量摄取，以及 BM25/k-NN 两个分支中的租户和 ACL 过滤。

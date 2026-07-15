@@ -68,6 +68,10 @@ public sealed record AtlasIncidentCheckpoint(
 
 public sealed record AtlasIncidentLeaseResult(bool Acquired, string? LeaseToken, AtlasIncidentCheckpoint? Checkpoint);
 
+/// <summary>仅供服务端校验运营快照，不包含所有者标识、排查输入、发现或密文。</summary>
+public sealed record AtlasIncidentTaskState(string RunId, string TenantId, AtlasIncidentStatus Status, long Version,
+    DateTimeOffset CreatedAt, DateTimeOffset UpdatedAt, DateTimeOffset ExpiresAt);
+
 /// <summary>可替换的状态存储；租约与版本号共同保证同一运行只有一个推进者。</summary>
 public interface IAtlasIncidentStore
 {
@@ -75,6 +79,8 @@ public interface IAtlasIncidentStore
     Task<IReadOnlyList<AtlasIncidentCheckpoint>> ListAsync(AccessContext access, int limit,
         CancellationToken cancellationToken = default);
     Task<AtlasIncidentCheckpoint?> GetAsync(string runId, AccessContext access,
+        CancellationToken cancellationToken = default);
+    Task<AtlasIncidentTaskState?> GetTaskStateAsync(string tenantId, string runId,
         CancellationToken cancellationToken = default);
     Task<AtlasIncidentLeaseResult> TryAcquireAsync(string runId, AccessContext access, long expectedVersion,
         TimeSpan leaseDuration, CancellationToken cancellationToken = default);

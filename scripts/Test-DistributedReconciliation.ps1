@@ -181,7 +181,9 @@ try {
             '003_tool_execution_ledger.sql', '004_tool_execution_reconciliation.sql',
             '005_tool_reconciliation_reviews.sql', '006_agent_run_cancellation.sql',
             '007_tool_compensations.sql', '008_tool_compensation_reconciliation.sql',
-            '009_atlas_incident_runs.sql', '010_operations_actions.sql')) {
+            '009_atlas_incident_runs.sql', '010_operations_actions.sql',
+            '011_operations_action_ordinal_identifiers.sql', '012_memory_store.sql',
+            '013_workflow_ordinal_identities.sql')) {
         docker exec -e "SQLCMDPASSWORD=$password" $SqlContainer /opt/mssql-tools18/bin/sqlcmd `
             -S localhost -U sa -C -b -d $database -i "$remoteMigrations/$migration" | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "迁移失败：$migration" }

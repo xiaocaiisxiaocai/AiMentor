@@ -29,7 +29,18 @@ public sealed class MemoryWorkflowService(
         var proposal = new MemoryProposal(Guid.NewGuid().ToString("N"), access.TenantId, access.SubjectId,
             command.Scope, sessionId, key, value, now, now.Add(options.ApprovalWindow), memoryExpiresAt,
             MemoryProposalStatus.PendingApproval);
-        await store.SaveProposalAsync(proposal, cancellationToken);
+        try
+        {
+            await store.SaveProposalAsync(proposal, cancellationToken);
+        }
+        catch (MemoryStoreCapacityException)
+        {
+            await AuditAsync("memory.propose", "capacity", access, command.Scope,
+                "MEMORY_PROPOSAL_CAPACITY_EXCEEDED", null, cancellationToken);
+            throw new MemoryWorkflowException("MEMORY_PROPOSAL_CAPACITY_EXCEEDED",
+                "当前租户待批准记忆提案已达到容量上限，请等待过期或完成现有提案。",
+                MemoryWorkflowErrorKind.Capacity);
+        }
         await AuditAsync("memory.propose", "pending_approval", access, command.Scope, "MEMORY_APPROVAL_REQUIRED",
             proposal.Id, cancellationToken);
         return proposal;

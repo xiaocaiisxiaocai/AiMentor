@@ -10,22 +10,52 @@ namespace AiMentor.Infrastructure;
 public sealed class EncryptedFileMemoryStoreOptions
 {
     public required string FilePath { get; init; }
+    public int MaximumPendingProposalsPerTenant { get; init; } = 10_000;
 }
 
 /// <summary>隔离记忆正文加密与不可逆键指纹，避免存储层接触明文实现细节。</summary>
 public interface IMemoryCipher
 {
+    string ActiveKeyVersion { get; }
     string Protect(string plaintext, string context);
     string Unprotect(string protectedValue, string context);
-    string Fingerprint(string value);
+    bool RequiresReencryption(string protectedValue);
+    bool SupportsCiphertextVersion(string envelopeVersion, string keyVersion);
+    string Fingerprint(string value, string? context = null);
 }
 
-/// <summary>使用独立派生密钥完成 AES-GCM 认证加密和 HMAC 键指纹。</summary>
-public sealed class AesGcmMemoryCipher(byte[] masterKey) : IMemoryCipher
+/// <summary>使用版本化密钥环完成 AES-GCM 认证加密，并用独立稳定密钥生成 HMAC 指纹。</summary>
+public sealed class AesGcmMemoryCipher : IMemoryCipher
 {
-    private const string Version = "v1";
-    private readonly byte[] _encryptionKey = DeriveKey(masterKey, "AiMentor.Memory.Encryption.v1");
-    private readonly byte[] _fingerprintKey = DeriveKey(masterKey, "AiMentor.Memory.Fingerprint.v1");
+    private const string LegacyEnvelopeVersion = "v1";
+    private const string EnvelopeVersion = "mem1";
+    private readonly Dictionary<string, byte[]> _encryptionKeys;
+    private readonly byte[]? _legacyEncryptionKey;
+    private readonly byte[] _fingerprintKey;
+
+    public AesGcmMemoryCipher(byte[] masterKey)
+        : this("v1", new Dictionary<string, byte[]> { ["v1"] = masterKey }, masterKey)
+    {
+    }
+
+    public AesGcmMemoryCipher(string activeKeyVersion, IReadOnlyDictionary<string, byte[]> masterKeys,
+        byte[] fingerprintMasterKey)
+    {
+        ActiveKeyVersion = ValidateVersion(activeKeyVersion);
+        if (masterKeys.Count == 0 || !masterKeys.ContainsKey(ActiveKeyVersion))
+            throw new ArgumentException("记忆密钥环必须包含活动密钥版本。", nameof(masterKeys));
+        _encryptionKeys = masterKeys.ToDictionary(
+            pair => ValidateVersion(pair.Key),
+            pair => DeriveKey(pair.Value, $"AiMentor.Memory.Encryption.{EnvelopeVersion}.{pair.Key}"),
+            StringComparer.Ordinal);
+        _legacyEncryptionKey = masterKeys.TryGetValue("v1", out var legacyMasterKey)
+            ? DeriveKey(legacyMasterKey, "AiMentor.Memory.Encryption.v1")
+            : null;
+        _fingerprintKey = DeriveKey(fingerprintMasterKey, "AiMentor.Memory.Fingerprint.v1");
+    }
+
+    /// <inheritdoc />
+    public string ActiveKeyVersion { get; }
 
     public string Protect(string plaintext, string context)
     {
@@ -35,31 +65,75 @@ public sealed class AesGcmMemoryCipher(byte[] masterKey) : IMemoryCipher
         var source = Encoding.UTF8.GetBytes(plaintext);
         var ciphertext = new byte[source.Length];
         var tag = new byte[16];
-        using var aes = new AesGcm(_encryptionKey, tag.Length);
-        aes.Encrypt(nonce, source, ciphertext, tag, AdditionalData(context));
-        return string.Join('.', Version, Convert.ToBase64String(nonce), Convert.ToBase64String(ciphertext),
-            Convert.ToBase64String(tag));
+        using var aes = new AesGcm(_encryptionKeys[ActiveKeyVersion], tag.Length);
+        aes.Encrypt(nonce, source, ciphertext, tag, AdditionalData(ActiveKeyVersion, context));
+        return string.Join('.', EnvelopeVersion, ActiveKeyVersion, Convert.ToBase64String(nonce),
+            Convert.ToBase64String(ciphertext), Convert.ToBase64String(tag));
     }
 
     public string Unprotect(string protectedValue, string context)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(context);
+        ArgumentException.ThrowIfNullOrWhiteSpace(protectedValue);
         var parts = protectedValue.Split('.', StringSplitOptions.None);
-        if (parts.Length != 4 || !string.Equals(parts[0], Version, StringComparison.Ordinal))
-            throw new CryptographicException("不支持的记忆密文格式。");
-        var nonce = Convert.FromBase64String(parts[1]);
-        var ciphertext = Convert.FromBase64String(parts[2]);
-        var tag = Convert.FromBase64String(parts[3]);
+        byte[] key;
+        string keyVersion;
+        int offset;
+        bool legacyEnvelope;
+        if (parts.Length == 4 && string.Equals(parts[0], LegacyEnvelopeVersion, StringComparison.Ordinal))
+        {
+            key = _legacyEncryptionKey
+                ?? throw new CryptographicException("记忆密文使用旧 v1 密钥，但当前密钥环未保留该版本。");
+            keyVersion = LegacyEnvelopeVersion;
+            offset = 1;
+            legacyEnvelope = true;
+        }
+        else if (parts.Length == 5 && string.Equals(parts[0], EnvelopeVersion, StringComparison.Ordinal)
+                 && _encryptionKeys.TryGetValue(parts[1], out var versionedKey))
+        {
+            key = versionedKey;
+            keyVersion = parts[1];
+            offset = 2;
+            legacyEnvelope = false;
+        }
+        else
+        {
+            throw new CryptographicException("不支持的记忆密文格式或密钥版本。");
+        }
+        var nonce = Convert.FromBase64String(parts[offset]);
+        var ciphertext = Convert.FromBase64String(parts[offset + 1]);
+        var tag = Convert.FromBase64String(parts[offset + 2]);
         var plaintext = new byte[ciphertext.Length];
-        using var aes = new AesGcm(_encryptionKey, tag.Length);
-        aes.Decrypt(nonce, ciphertext, tag, plaintext, AdditionalData(context));
+        using var aes = new AesGcm(key, tag.Length);
+        aes.Decrypt(nonce, ciphertext, tag, plaintext,
+            legacyEnvelope
+                ? LegacyAdditionalData(context)
+                : AdditionalData(keyVersion, context));
         return Encoding.UTF8.GetString(plaintext);
     }
 
-    public string Fingerprint(string value)
+    /// <inheritdoc />
+    public bool RequiresReencryption(string protectedValue)
+    {
+        var parts = protectedValue.Split('.', StringSplitOptions.None);
+        return parts.Length != 5
+            || !string.Equals(parts[0], EnvelopeVersion, StringComparison.Ordinal)
+            || !string.Equals(parts[1], ActiveKeyVersion, StringComparison.Ordinal);
+    }
+
+    /// <inheritdoc />
+    public bool SupportsCiphertextVersion(string envelopeVersion, string keyVersion) =>
+        string.Equals(envelopeVersion, LegacyEnvelopeVersion, StringComparison.Ordinal)
+            ? _legacyEncryptionKey is not null
+            : string.Equals(envelopeVersion, EnvelopeVersion, StringComparison.Ordinal)
+              && _encryptionKeys.ContainsKey(keyVersion);
+
+    public string Fingerprint(string value, string? context = null)
     {
         using var hmac = new HMACSHA256(_fingerprintKey);
-        return Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(value.Trim().ToUpperInvariant())));
+        var normalized = value.Trim().ToUpperInvariant();
+        return Convert.ToHexString(hmac.ComputeHash(Encoding.UTF8.GetBytes(
+            string.IsNullOrWhiteSpace(context) ? normalized : $"{context}\n{normalized}")));
     }
 
     private static byte[] DeriveKey(byte[] masterKey, string purpose)
@@ -68,7 +142,16 @@ public sealed class AesGcmMemoryCipher(byte[] masterKey) : IMemoryCipher
         return HMACSHA256.HashData(masterKey, Encoding.UTF8.GetBytes(purpose));
     }
 
-    private static byte[] AdditionalData(string context) => Encoding.UTF8.GetBytes($"{Version}\n{context}");
+    private static byte[] AdditionalData(string keyVersion, string context) =>
+        Encoding.UTF8.GetBytes($"{EnvelopeVersion}\n{keyVersion}\n{context}");
+
+    private static byte[] LegacyAdditionalData(string context) =>
+        Encoding.UTF8.GetBytes($"{LegacyEnvelopeVersion}\n{context}");
+
+    private static string ValidateVersion(string value) =>
+        !string.IsNullOrWhiteSpace(value) && value.Length <= 64
+        && value.All(character => char.IsLetterOrDigit(character) || character is '-' or '_')
+            ? value : throw new ArgumentException("记忆密钥版本格式无效。", nameof(value));
 }
 
 /// <summary>
@@ -80,11 +163,15 @@ public sealed class EncryptedFileMemoryStore : IMemoryStore, IDisposable
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly string _filePath;
     private readonly IMemoryCipher _cipher;
+    private readonly int _maximumPendingProposalsPerTenant;
 
     public EncryptedFileMemoryStore(EncryptedFileMemoryStoreOptions options, IMemoryCipher cipher)
     {
         if (string.IsNullOrWhiteSpace(options.FilePath)) throw new ArgumentException("记忆文件路径不能为空。", nameof(options));
         _filePath = Path.GetFullPath(options.FilePath);
+        if (options.MaximumPendingProposalsPerTenant <= 0)
+            throw new ArgumentOutOfRangeException(nameof(options), "记忆提案容量必须大于 0。");
+        _maximumPendingProposalsPerTenant = options.MaximumPendingProposalsPerTenant;
         Directory.CreateDirectory(Path.GetDirectoryName(_filePath)!);
         _cipher = cipher;
     }
@@ -93,6 +180,11 @@ public sealed class EncryptedFileMemoryStore : IMemoryStore, IDisposable
     {
         await MutateAsync(snapshot =>
         {
+            snapshot.Proposals.RemoveAll(item => item.Status != MemoryProposalStatus.PendingApproval
+                || item.ApprovalExpiresAt <= proposal.CreatedAt || item.MemoryExpiresAt <= proposal.CreatedAt);
+            if (snapshot.Proposals.Count(item => string.Equals(item.TenantId, proposal.TenantId,
+                    StringComparison.Ordinal)) >= _maximumPendingProposalsPerTenant)
+                throw new MemoryStoreCapacityException();
             if (snapshot.Proposals.Any(item => string.Equals(item.Id, proposal.Id, StringComparison.Ordinal)))
                 throw new InvalidOperationException("记忆提案标识发生冲突。");
             snapshot.Proposals.Add(ToStored(proposal));
@@ -108,21 +200,30 @@ public sealed class EncryptedFileMemoryStore : IMemoryStore, IDisposable
             var proposal = snapshot.Proposals.FirstOrDefault(item => item.Id == proposalId && OwnedBy(item, access));
             if (proposal is null) return new MemoryStoreResult<MemoryRecord>(MemoryStoreStatus.NotFound);
             if (proposal.Status != MemoryProposalStatus.PendingApproval)
+            {
+                snapshot.Proposals.Remove(proposal);
                 return new MemoryStoreResult<MemoryRecord>(MemoryStoreStatus.Conflict);
+            }
             if (proposal.ApprovalExpiresAt <= now || proposal.MemoryExpiresAt <= now)
+            {
+                snapshot.Proposals.Remove(proposal);
                 return new MemoryStoreResult<MemoryRecord>(MemoryStoreStatus.Expired);
+            }
 
             snapshot.Memories.RemoveAll(item => item.ExpiresAt <= now);
             if (snapshot.Memories.Any(item => OwnedBy(item, access) && item.Scope == proposal.Scope
                 && string.Equals(item.SessionId, proposal.SessionId, StringComparison.Ordinal)
                 && string.Equals(item.KeyHash, proposal.KeyHash, StringComparison.Ordinal)))
+            {
+                snapshot.Proposals.Remove(proposal);
                 return new MemoryStoreResult<MemoryRecord>(MemoryStoreStatus.AlreadyExists);
+            }
 
             var memory = new MemoryRecord(Guid.NewGuid().ToString("N"), proposal.TenantId, proposal.SubjectId,
                 proposal.Scope, proposal.SessionId, _cipher.Unprotect(proposal.KeyCipher, Context(proposal, "key")),
                 _cipher.Unprotect(proposal.ValueCipher, Context(proposal, "value")), 1, now, now, proposal.MemoryExpiresAt);
             snapshot.Memories.Add(ToStored(memory));
-            proposal.Status = MemoryProposalStatus.Approved;
+            snapshot.Proposals.Remove(proposal);
             return new MemoryStoreResult<MemoryRecord>(MemoryStoreStatus.Success, memory);
         }, cancellationToken);
     }
@@ -266,10 +367,36 @@ public sealed class EncryptedFileMemoryStore : IMemoryStore, IDisposable
         if (!File.Exists(_filePath)) return new StoreSnapshot();
         await using var stream = new FileStream(_filePath, FileMode.Open, FileAccess.Read, FileShare.Read,
             16 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-        return await JsonSerializer.DeserializeAsync<StoreSnapshot>(stream, JsonOptions, cancellationToken)
-            is { SchemaVersion: 1 } snapshot
-                ? snapshot
+        var snapshot = await JsonSerializer.DeserializeAsync<StoreSnapshot>(stream, JsonOptions, cancellationToken)
+            is { SchemaVersion: 1 } loaded
+                ? loaded
                 : throw new InvalidDataException("记忆持久化文件为空或版本不受支持。");
+        // 兼容早期全局指纹和旧密钥密文：在内存中升级，下一次变更会原子落盘。
+        foreach (var proposal in snapshot.Proposals)
+        {
+            var keyContext = Context(proposal, "key");
+            var valueContext = Context(proposal, "value");
+            var key = _cipher.Unprotect(proposal.KeyCipher, keyContext);
+            proposal.KeyHash = _cipher.Fingerprint(key, FingerprintContext(proposal));
+            if (_cipher.RequiresReencryption(proposal.KeyCipher))
+                proposal.KeyCipher = _cipher.Protect(key, keyContext);
+            if (_cipher.RequiresReencryption(proposal.ValueCipher))
+                proposal.ValueCipher = _cipher.Protect(
+                    _cipher.Unprotect(proposal.ValueCipher, valueContext), valueContext);
+        }
+        foreach (var memory in snapshot.Memories)
+        {
+            var keyContext = Context(memory, "key");
+            var valueContext = Context(memory, "value");
+            var key = _cipher.Unprotect(memory.KeyCipher, keyContext);
+            memory.KeyHash = _cipher.Fingerprint(key, FingerprintContext(memory));
+            if (_cipher.RequiresReencryption(memory.KeyCipher))
+                memory.KeyCipher = _cipher.Protect(key, keyContext);
+            if (_cipher.RequiresReencryption(memory.ValueCipher))
+                memory.ValueCipher = _cipher.Protect(
+                    _cipher.Unprotect(memory.ValueCipher, valueContext), valueContext);
+        }
+        return snapshot;
     }
 
     private async Task SaveAsync(StoreSnapshot snapshot, CancellationToken cancellationToken)
@@ -300,7 +427,7 @@ public sealed class EncryptedFileMemoryStore : IMemoryStore, IDisposable
         Scope = proposal.Scope,
         SessionId = proposal.SessionId,
         KeyCipher = _cipher.Protect(proposal.Key, Context(proposal, "key")),
-        KeyHash = _cipher.Fingerprint(proposal.Key),
+        KeyHash = _cipher.Fingerprint(proposal.Key, FingerprintContext(proposal)),
         ValueCipher = _cipher.Protect(proposal.Value, Context(proposal, "value")),
         CreatedAt = proposal.CreatedAt,
         ApprovalExpiresAt = proposal.ApprovalExpiresAt,
@@ -316,7 +443,7 @@ public sealed class EncryptedFileMemoryStore : IMemoryStore, IDisposable
         Scope = memory.Scope,
         SessionId = memory.SessionId,
         KeyCipher = _cipher.Protect(memory.Key, Context(memory, "key")),
-        KeyHash = _cipher.Fingerprint(memory.Key),
+        KeyHash = _cipher.Fingerprint(memory.Key, FingerprintContext(memory)),
         ValueCipher = _cipher.Protect(memory.Value, Context(memory, "value")),
         Version = memory.Version,
         CreatedAt = memory.CreatedAt,
@@ -338,8 +465,17 @@ public sealed class EncryptedFileMemoryStore : IMemoryStore, IDisposable
     private static string Context(StoredOwner memory, string field) => string.Join('\u001f', memory.TenantId,
         memory.SubjectId, memory.Scope, memory.SessionId ?? string.Empty, memory.Id, field);
 
+    private static string FingerprintContext(MemoryProposal memory) => string.Join('\u001f', memory.TenantId,
+        memory.SubjectId, memory.Scope, memory.SessionId ?? string.Empty);
+
+    private static string FingerprintContext(MemoryRecord memory) => string.Join('\u001f', memory.TenantId,
+        memory.SubjectId, memory.Scope, memory.SessionId ?? string.Empty);
+
+    private static string FingerprintContext(StoredOwner memory) => string.Join('\u001f', memory.TenantId,
+        memory.SubjectId, memory.Scope, memory.SessionId ?? string.Empty);
+
     private static bool OwnedBy(StoredOwner item, AccessContext access) =>
-        string.Equals(item.TenantId, access.TenantId, StringComparison.OrdinalIgnoreCase)
+        string.Equals(item.TenantId, access.TenantId, StringComparison.Ordinal)
         && string.Equals(item.SubjectId, access.SubjectId, StringComparison.Ordinal);
 
     private sealed class StoreSnapshot
@@ -357,8 +493,8 @@ public sealed class EncryptedFileMemoryStore : IMemoryStore, IDisposable
         public required string SubjectId { get; init; }
         public MemoryScope Scope { get; init; }
         public string? SessionId { get; init; }
-        public required string KeyCipher { get; init; }
-        public required string KeyHash { get; init; }
+        public required string KeyCipher { get; set; }
+        public required string KeyHash { get; set; }
         public required string ValueCipher { get; set; }
     }
 

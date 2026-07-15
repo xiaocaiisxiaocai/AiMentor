@@ -16,6 +16,9 @@ public sealed class LinuxContainerCiTests
         Assert.Contains("job.services.sqlserver.id", workflow, StringComparison.Ordinal);
         Assert.Contains("SqlServerAtlasIncidentStoreTests", workflow, StringComparison.Ordinal);
         Assert.Contains("SqlServerOperationsActionStoreTests", workflow, StringComparison.Ordinal);
+        Assert.Contains("SqlServerMemoryStoreTests", workflow, StringComparison.Ordinal);
+        Assert.Contains("SqlServerOrdinalIdentityIsolationTests", workflow, StringComparison.Ordinal);
+        Assert.Contains("SqlServerWorkflowIntegrationTests", workflow, StringComparison.Ordinal);
         Assert.Contains("Category!=RequiresSqlServer", workflow, StringComparison.Ordinal);
         Assert.Contains("Test-DistributedReconciliation.ps1", workflow, StringComparison.Ordinal);
         Assert.Contains("-Configuration Release", workflow, StringComparison.Ordinal);
@@ -37,6 +40,8 @@ public sealed class LinuxContainerCiTests
             "SqlServerAtlasIncidentStoreTests.cs"));
         var operationsTests = File.ReadAllText(Path.Combine(root, "tests", "AiMentor.Tests",
             "SqlServerOperationsActionStoreTests.cs"));
+        var workflowIntegrationTests = File.ReadAllText(Path.Combine(root, "tests", "AiMentor.Tests",
+            "SqlServerWorkflowIntegrationTests.cs"));
 
         Assert.Contains("[ValidateSet('Debug', 'Release')]", script, StringComparison.Ordinal);
         Assert.Contains("[IO.Path]::Combine", script, StringComparison.Ordinal);
@@ -46,6 +51,9 @@ public sealed class LinuxContainerCiTests
         Assert.Contains("docker port $SqlContainer 1433/tcp", script, StringComparison.Ordinal);
         Assert.Contains("009_atlas_incident_runs.sql", script, StringComparison.Ordinal);
         Assert.Contains("010_operations_actions.sql", script, StringComparison.Ordinal);
+        Assert.Contains("011_operations_action_ordinal_identifiers.sql", script, StringComparison.Ordinal);
+        Assert.Contains("012_memory_store.sql", script, StringComparison.Ordinal);
+        Assert.Contains("013_workflow_ordinal_identities.sql", script, StringComparison.Ordinal);
         Assert.Contains("Authentication__Development__Groups__*", script, StringComparison.Ordinal);
         Assert.DoesNotContain("Remove-Item Env:Authentication__Development__Groups__0", script,
             StringComparison.Ordinal);
@@ -59,6 +67,11 @@ public sealed class LinuxContainerCiTests
         Assert.DoesNotContain("if (!OperatingSystem.IsWindows()) return;", atlasTests, StringComparison.Ordinal);
         Assert.Contains("AIMENTOR_SQLSERVER_TEST_CONNECTION", operationsTests, StringComparison.Ordinal);
         Assert.DoesNotContain("if (!OperatingSystem.IsWindows()) return;", operationsTests, StringComparison.Ordinal);
+        Assert.Contains("[Trait(\"Category\", \"RequiresSqlServer\")]", workflowIntegrationTests,
+            StringComparison.Ordinal);
+        Assert.Contains("AIMENTOR_SQLSERVER_TEST_CONNECTION", workflowIntegrationTests, StringComparison.Ordinal);
+        Assert.DoesNotContain("if (!OperatingSystem.IsWindows()) return;", workflowIntegrationTests,
+            StringComparison.Ordinal);
     }
 
     private static string FindRoot()

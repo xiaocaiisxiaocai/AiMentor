@@ -130,7 +130,7 @@ public sealed class SqlServerToolApprovalService(
         };
         await using var update = connection.CreateCommand();
         update.Transaction = transaction;
-        update.CommandText = $"UPDATE dbo.[{TableName}] SET Status=@status,ApproverSubjectId=@approver,DecidedAt=@decided,DecisionReason=@reason WHERE Id=@id AND Status=@pending;";
+        update.CommandText = $"UPDATE dbo.[{TableName}] SET Status=@status,ApproverSubjectId=@approver,DecidedAt=@decided,DecisionReason=@reason WHERE Id COLLATE Latin1_General_100_BIN2=@id AND Status=@pending;";
         AddInt(update, "@status", (int)decided.Status); AddString(update, "@approver", 256, approver.SubjectId);
         AddDateTimeOffset(update, "@decided", now); AddString(update, "@reason", 500, normalizedReason);
         AddString(update, "@id", 128, id); AddInt(update, "@pending", (int)ToolApprovalStatus.Pending);
@@ -152,7 +152,7 @@ public sealed class SqlServerToolApprovalService(
         await using var connection = await OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
         var canApprove = access.Groups.Overlaps(approvalOptions.ApproverGroups);
-        command.CommandText = $"SELECT * FROM dbo.[{TableName}] WHERE TenantId=@tenant AND (@canApprove=1 OR RequesterSubjectId=@subject) AND (@status IS NULL OR Status=@status) ORDER BY CreatedAt DESC;";
+        command.CommandText = $"SELECT * FROM dbo.[{TableName}] WHERE TenantId COLLATE Latin1_General_100_BIN2=@tenant AND (@canApprove=1 OR RequesterSubjectId COLLATE Latin1_General_100_BIN2=@subject) AND (@status IS NULL OR Status=@status) ORDER BY CreatedAt DESC;";
         AddString(command, "@tenant", 128, access.TenantId); AddString(command, "@subject", 256, access.SubjectId);
         command.Parameters.Add("@canApprove", SqlDbType.Bit).Value = canApprove;
         command.Parameters.Add("@status", SqlDbType.Int).Value = status is null ? DBNull.Value : (int)status.Value;
@@ -180,7 +180,7 @@ public sealed class SqlServerToolApprovalService(
         await ExpireDueAsync(cancellationToken);
         await using var connection = await OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"SELECT * FROM dbo.[{TableName}] WHERE Id=@id AND TenantId=@tenant AND (RequesterSubjectId=@subject OR @canApprove=1);";
+        command.CommandText = $"SELECT * FROM dbo.[{TableName}] WHERE Id COLLATE Latin1_General_100_BIN2=@id AND TenantId COLLATE Latin1_General_100_BIN2=@tenant AND (RequesterSubjectId COLLATE Latin1_General_100_BIN2=@subject OR @canApprove=1);";
         AddString(command, "@id", 128, id); AddString(command, "@tenant", 128, access.TenantId);
         AddString(command, "@subject", 256, access.SubjectId);
         command.Parameters.Add("@canApprove", SqlDbType.Bit).Value = access.Groups.Overlaps(approvalOptions.ApproverGroups);
@@ -225,7 +225,7 @@ public sealed class SqlServerToolApprovalService(
             else
             {
                 await using var update = connection.CreateCommand(); update.Transaction = transaction;
-                update.CommandText = $"UPDATE dbo.[{TableName}] SET Status=@consumed,ConsumedAt=@now WHERE Id=@id AND Status=@approved;";
+                update.CommandText = $"UPDATE dbo.[{TableName}] SET Status=@consumed,ConsumedAt=@now WHERE Id COLLATE Latin1_General_100_BIN2=@id AND Status=@approved;";
                 AddInt(update, "@consumed", (int)ToolApprovalStatus.Consumed); AddDateTimeOffset(update, "@now", now);
                 AddString(update, "@id", 128, id); AddInt(update, "@approved", (int)ToolApprovalStatus.Approved);
                 decision = await update.ExecuteNonQueryAsync(cancellationToken) == 1
@@ -265,11 +265,14 @@ public sealed class SqlServerToolApprovalService(
                 IF OBJECT_ID(N'dbo.{TableName}',N'U') IS NULL
                 BEGIN
                   CREATE TABLE dbo.[{TableName}] (
-                    Id nvarchar(128) NOT NULL CONSTRAINT PK_{TableName} PRIMARY KEY,TenantId nvarchar(128) NOT NULL,
-                    RequesterSubjectId nvarchar(256) NOT NULL,ToolName nvarchar(128) NOT NULL,Risk int NOT NULL,
+                    Id nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL CONSTRAINT PK_{TableName} PRIMARY KEY,
+                    TenantId nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                    RequesterSubjectId nvarchar(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                    ToolName nvarchar(128) NOT NULL,Risk int NOT NULL,
                     ArgumentsHash char(64) NOT NULL,ArgumentNamesJson nvarchar(max) NOT NULL,Justification nvarchar(500) NOT NULL,
                     CreatedAt datetimeoffset(7) NOT NULL,ExpiresAt datetimeoffset(7) NOT NULL,Status int NOT NULL,
-                    ApproverSubjectId nvarchar(256) NULL,DecidedAt datetimeoffset(7) NULL,DecisionReason nvarchar(500) NULL,
+                    ApproverSubjectId nvarchar(256) COLLATE Latin1_General_100_BIN2 NULL,
+                    DecidedAt datetimeoffset(7) NULL,DecisionReason nvarchar(500) NULL,
                     ConsumedAt datetimeoffset(7) NULL,RowVersion rowversion NOT NULL);
                   CREATE INDEX IX_{TableName}_TenantStatus ON dbo.[{TableName}](TenantId,Status,CreatedAt DESC);
                 END;
@@ -293,7 +296,7 @@ public sealed class SqlServerToolApprovalService(
         string id, CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand(); command.Transaction = transaction;
-        command.CommandText = $"SELECT * FROM dbo.[{TableName}] WITH (UPDLOCK,HOLDLOCK) WHERE Id=@id;";
+        command.CommandText = $"SELECT * FROM dbo.[{TableName}] WITH (UPDLOCK,HOLDLOCK) WHERE Id COLLATE Latin1_General_100_BIN2=@id;";
         AddString(command, "@id", 128, id); await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         return await reader.ReadAsync(cancellationToken) ? Read(reader) : null;
     }
@@ -302,7 +305,7 @@ public sealed class SqlServerToolApprovalService(
         DateTimeOffset now, CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand(); command.Transaction = transaction;
-        command.CommandText = $"UPDATE dbo.[{TableName}] SET Status=@expired WHERE Id=@id AND Status IN (@pending,@approved) AND ExpiresAt<=@now;";
+        command.CommandText = $"UPDATE dbo.[{TableName}] SET Status=@expired WHERE Id COLLATE Latin1_General_100_BIN2=@id AND Status IN (@pending,@approved) AND ExpiresAt<=@now;";
         AddInt(command, "@expired", (int)ToolApprovalStatus.Expired); AddString(command, "@id", 128, id);
         AddInt(command, "@pending", (int)ToolApprovalStatus.Pending); AddInt(command, "@approved", (int)ToolApprovalStatus.Approved);
         AddDateTimeOffset(command, "@now", now); await command.ExecuteNonQueryAsync(cancellationToken);

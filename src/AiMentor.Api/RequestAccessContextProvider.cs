@@ -20,6 +20,25 @@ public sealed class AiMentorAuthenticationOptions
     public string[] DevelopmentGroups { get; init; } = ["all-rnd"];
 }
 
+/// <summary>运营台服务端 OIDC 会话配置；浏览器不会接收上游访问令牌。</summary>
+public sealed class OperationsWebAuthenticationOptions
+{
+    public bool Enabled { get; init; }
+    public string? ClientId { get; init; }
+    public string? ClientSecret { get; init; }
+    public string[] Scopes { get; init; } = ["openid", "profile"];
+    public string CallbackPath { get; init; } = "/signin-oidc";
+    public string SignedOutCallbackPath { get; init; } = "/signout-callback-oidc";
+    public string? DataProtectionKeyPath { get; init; }
+    public string? DataProtectionClusterId { get; init; }
+    public string? DataProtectionKeyRingFingerprint { get; init; }
+    public string? DataProtectionCertificatePath { get; init; }
+    public string[] DataProtectionDecryptionCertificatePaths { get; init; } = [];
+    public string? DataProtectionCertificatePassword { get; init; }
+    public int SessionLifetimeMinutes { get; init; } = 60;
+    public int DiscoveryTimeoutSeconds { get; init; } = 10;
+}
+
 /// <summary>从已验证主体构造应用层访问上下文。</summary>
 public interface IRequestAccessContextProvider
 {

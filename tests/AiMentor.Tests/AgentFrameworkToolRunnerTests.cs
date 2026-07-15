@@ -206,7 +206,7 @@ public sealed class AgentFrameworkToolRunnerTests
             ResumeLeaseRenewalInterval = TimeSpan.FromMilliseconds(30)
         };
         var fixture = CreateApprovalRunner(options: options, recordRenewals: true, allowRenewal: false,
-            mutationDelay: TimeSpan.FromMilliseconds(200));
+            mutationDelay: TimeSpan.FromMilliseconds(200), waitForMutationCancellation: true);
         var initial = await fixture.Runner.RunAsync(
             "请删除记忆 memoryId=memory-lease-loss expectedVersion=1", Access, "agent-lease-loss");
         await fixture.Approvals.DecideAsync(initial.Approval!.ApprovalId, true, "批准租约丢失测试", fixture.Approver);
@@ -231,7 +231,8 @@ public sealed class AgentFrameworkToolRunnerTests
             ResumeLeaseDuration = TimeSpan.FromMilliseconds(180),
             ResumeLeaseRenewalInterval = TimeSpan.FromMilliseconds(40)
         };
-        var fixture = CreateApprovalRunner(options: options, mutationDelay: TimeSpan.FromMilliseconds(500));
+        var fixture = CreateApprovalRunner(options: options, mutationDelay: TimeSpan.FromMilliseconds(500),
+            waitForMutationCancellation: true);
         var initial = await fixture.Runner.RunAsync(
             "请删除记忆 memoryId=memory-cancel expectedVersion=1", Access, "agent-active-cancel");
         await fixture.Approvals.DecideAsync(initial.Approval!.ApprovalId, true, "批准主动取消测试", fixture.Approver);
@@ -303,9 +304,10 @@ public sealed class AgentFrameworkToolRunnerTests
 
     private static ApprovalRunnerFixture CreateApprovalRunner(TimeSpan? approvalLifetime = null,
         int maximumPendingRuns = 1_000, IChatClient? chatClient = null, AgentExecutionOptions? options = null,
-        bool recordRenewals = false, bool allowRenewal = true, TimeSpan? mutationDelay = null)
+        bool recordRenewals = false, bool allowRenewal = true, TimeSpan? mutationDelay = null,
+        bool waitForMutationCancellation = false)
     {
-        var tool = new MutationTool(mutationDelay);
+        var tool = new MutationTool(mutationDelay, waitForMutationCancellation);
         var registry = new ServerToolRegistry([tool]);
         var safety = new RuleBasedToolInvocationSafetyService(new ToolSafetyOptions
         {
@@ -371,7 +373,7 @@ public sealed class AgentFrameworkToolRunnerTests
             throw new InvalidOperationException("Agent 不得绕过 IToolExecutor 直接调用工具实现。");
     }
 
-    private sealed class MutationTool(TimeSpan? executionDelay = null) : IServerTool
+    private sealed class MutationTool(TimeSpan? executionDelay = null, bool waitForCancellation = false) : IServerTool
     {
         private int _executionCount;
         public int ExecutionCount => _executionCount;
@@ -389,7 +391,12 @@ public sealed class AgentFrameworkToolRunnerTests
             _ = context;
             _ = arguments;
             _executionStarted.TrySetResult();
-            if (executionDelay is not null)
+            if (waitForCancellation)
+            {
+                // 取消与租约测试等待真实取消信号，避免并行测试负载把毫秒级定时竞争误判为业务失败。
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            else if (executionDelay is not null)
                 await Task.Delay(executionDelay.Value, cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             Interlocked.Increment(ref _executionCount);

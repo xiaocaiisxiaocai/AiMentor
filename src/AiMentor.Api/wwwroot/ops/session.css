@@ -1,0 +1,16 @@
+.session {
+  display: flex;
+  gap: 9px;
+  align-items: center;
+}
+
+.session > a {
+  color: var(--blue);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.session > a:focus-visible,
+.session > a:hover {
+  text-decoration: underline;
+}

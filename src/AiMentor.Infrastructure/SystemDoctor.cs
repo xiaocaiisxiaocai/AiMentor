@@ -15,6 +15,7 @@ public record SystemDoctorOptions
     public bool TenantClaimConfigured { get; init; }
     public string WorkflowProvider { get; init; } = "InMemory";
     public bool AtlasIncidentStorePersistent { get; init; }
+    public bool MemoryStorePersistent { get; init; }
     public bool MemoryKeyConfigured { get; init; }
     public bool MemoryKeyValid { get; init; } = true;
     public bool WorkflowKeyRingConfigured { get; init; }
@@ -39,7 +40,8 @@ public record SystemDoctorOptions
 }
 
 /// <summary>集中检查身份、密钥、存储、RAG 与 AI 供应商的安全配置，不连接或修改外部系统。</summary>
-public sealed class SystemDoctor(SystemDoctorOptions options, TimeProvider timeProvider) : ISystemDoctor
+public sealed class SystemDoctor(SystemDoctorOptions options, TimeProvider timeProvider,
+    MemoryRetentionHealthState? memoryRetentionHealth = null) : ISystemDoctor
 {
     public Task<SystemDiagnosticReport> RunAsync(CancellationToken cancellationToken = default)
     {
@@ -94,6 +96,23 @@ public sealed class SystemDoctor(SystemDoctorOptions options, TimeProvider timeP
             options.MemoryKeyConfigured ? SystemCheckStatus.Passed : SystemCheckStatus.Warning,
             options.MemoryKeyConfigured ? "MEMORY_KEY_CONFIGURED" : "MEMORY_KEY_DEVELOPMENT_GENERATED",
             options.MemoryKeyConfigured ? "记忆加密密钥已显式配置。" : "当前使用开发环境生成的记忆密钥。");
+
+        if (options.IsProduction && !options.MemoryStorePersistent)
+            AddFailure(checks, "memory.persistence", "MEMORY_SQL_REQUIRED",
+                "生产环境记忆提案和正式记忆必须使用持久化 SQL Store。");
+        else Add(checks, "memory.persistence",
+            options.MemoryStorePersistent ? SystemCheckSeverity.Critical : SystemCheckSeverity.Warning,
+            options.MemoryStorePersistent ? SystemCheckStatus.Passed : SystemCheckStatus.Warning,
+            options.MemoryStorePersistent ? "MEMORY_STORE_PERSISTENT" : "MEMORY_STORE_FILE",
+            options.MemoryStorePersistent ? "记忆使用多实例共享的持久化存储。" : "记忆使用单实例文件存储。");
+
+        if (memoryRetentionHealth is { Enabled: true })
+            Add(checks, "memory.retention", SystemCheckSeverity.Critical,
+                memoryRetentionHealth.IsReady ? SystemCheckStatus.Passed : SystemCheckStatus.Failed,
+                memoryRetentionHealth.IsReady ? "MEMORY_RETENTION_HEALTHY" : "MEMORY_RETENTION_FAILED",
+                memoryRetentionHealth.IsReady
+                    ? "记忆保留期后台清理最近一次执行正常。"
+                    : "记忆保留期后台清理失败，readiness 将保持失败直到清理恢复。");
 
         var sql = Equals(options.WorkflowProvider, "SqlServer");
         var memory = Equals(options.WorkflowProvider, "InMemory");

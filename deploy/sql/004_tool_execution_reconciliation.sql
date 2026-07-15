@@ -6,9 +6,11 @@ IF OBJECT_ID(N'dbo.AiMentorToolExecutions', N'U') IS NULL
 
 -- 旧记录不具备可靠租户归属，字段保持 NULL 并在查询时排除，避免错误暴露给任一租户。
 IF COL_LENGTH(N'dbo.AiMentorToolExecutions', N'TenantId') IS NULL
-    ALTER TABLE dbo.AiMentorToolExecutions ADD TenantId nvarchar(128) NULL;
+    ALTER TABLE dbo.AiMentorToolExecutions ADD TenantId nvarchar(128)
+        COLLATE Latin1_General_100_BIN2 NULL;
 IF COL_LENGTH(N'dbo.AiMentorToolExecutions', N'SubjectId') IS NULL
-    ALTER TABLE dbo.AiMentorToolExecutions ADD SubjectId nvarchar(256) NULL;
+    ALTER TABLE dbo.AiMentorToolExecutions ADD SubjectId nvarchar(256)
+        COLLATE Latin1_General_100_BIN2 NULL;
 IF COL_LENGTH(N'dbo.AiMentorToolExecutions', N'ToolName') IS NULL
     ALTER TABLE dbo.AiMentorToolExecutions ADD ToolName nvarchar(128) NULL;
 

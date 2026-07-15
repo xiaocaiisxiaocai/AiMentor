@@ -116,7 +116,8 @@ public sealed class SqlServerToolCompensationService(
         await EnsureInitializedAsync(cancellationToken);
         await using var connection = await OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"DELETE dbo.{TableName} WHERE Id=@id AND Status=@prepared AND PreparationTokenHash=@hash;";
+        command.CommandText = $"DELETE dbo.{TableName} WHERE Id COLLATE Latin1_General_100_BIN2=@id " +
+            "AND Status=@prepared AND PreparationTokenHash=@hash;";
         AddString(command, "@id", 64, preparation.Id); AddByte(command, "@prepared", ToolCompensationStatus.Prepared);
         AddAnsiString(command, "@hash", 64, Hash(preparation.PreparationToken));
         if (await command.ExecuteNonQueryAsync(cancellationToken) != 1)
@@ -131,8 +132,10 @@ public sealed class SqlServerToolCompensationService(
         await using var command = connection.CreateCommand();
         command.CommandText = $"""
             UPDATE dbo.{TableName} SET Status=@unknown,UpdatedAt=@now
-            WHERE Id=@id AND PreparationTokenHash=@hash AND Status IN (@prepared,@available);
-            IF @@ROWCOUNT=0 AND NOT EXISTS(SELECT 1 FROM dbo.{TableName} WHERE Id=@id AND Status=@unknown)
+            WHERE Id COLLATE Latin1_General_100_BIN2=@id
+              AND PreparationTokenHash=@hash AND Status IN (@prepared,@available);
+            IF @@ROWCOUNT=0 AND NOT EXISTS(SELECT 1 FROM dbo.{TableName}
+                WHERE Id COLLATE Latin1_General_100_BIN2=@id AND Status=@unknown)
                 THROW 51001,'补偿准备状态已经变化。',1;
             """;
         AddByte(command, "@unknown", ToolCompensationStatus.ForwardOutcomeUnknown);
@@ -161,8 +164,9 @@ public sealed class SqlServerToolCompensationService(
         await using var command = connection.CreateCommand();
         command.CommandText = $"""
             SELECT {Columns} FROM dbo.{TableName}
-            WHERE TenantId=@tenant AND Status<>@prepared AND (@status IS NULL OR Status=@status)
-                AND (@canApprove=1 OR RequesterSubjectId=@subject)
+            WHERE TenantId COLLATE Latin1_General_100_BIN2=@tenant
+                AND Status<>@prepared AND (@status IS NULL OR Status=@status)
+                AND (@canApprove=1 OR RequesterSubjectId COLLATE Latin1_General_100_BIN2=@subject)
             ORDER BY CreatedAt DESC;
             """;
         AddString(command, "@tenant", 128, access.TenantId); AddString(command, "@subject", 256, access.SubjectId);
@@ -202,7 +206,7 @@ public sealed class SqlServerToolCompensationService(
             update.CommandText = $"""
                 UPDATE dbo.{TableName} SET Status=@pending,ApprovalId=@approval,Justification=@justification,
                     ApprovalExpiresAt=@approvalExpires,ApproverSubjectId=NULL,DecisionReasonHash=NULL,UpdatedAt=@now
-                WHERE Id=@id AND Status IN (@available,@rejected);
+                WHERE Id COLLATE Latin1_General_100_BIN2=@id AND Status IN (@available,@rejected);
                 """;
             AddByte(update, "@pending", ToolCompensationStatus.AwaitingApproval);
             AddString(update, "@approval", 64, approvalId); AddString(update, "@justification", 500, normalizedJustification);
@@ -258,7 +262,8 @@ public sealed class SqlServerToolCompensationService(
             update.Transaction = transaction;
             update.CommandText = $"""
                 UPDATE dbo.{TableName} SET Status=@next,ApproverSubjectId=@approver,DecisionReasonHash=@reason,UpdatedAt=@now
-                WHERE Id=@id AND Status=@pending AND ApprovalId=@approval;
+                WHERE Id COLLATE Latin1_General_100_BIN2=@id AND Status=@pending
+                  AND ApprovalId COLLATE Latin1_General_100_BIN2=@approval;
                 """;
             AddByte(update, "@next", next); AddString(update, "@approver", 256, approver.SubjectId);
             AddAnsiString(update, "@reason", 64, reasonHash); AddDate(update, "@now", now);
@@ -334,7 +339,8 @@ public sealed class SqlServerToolCompensationService(
             update.CommandText = $"""
                 UPDATE dbo.{TableName} SET Status=@executing,CompensationExecutionKey=@execution,
                     ExecutionLeaseToken=@token,ExecutionLeaseExpiresAt=@leaseExpires,UpdatedAt=@now
-                WHERE Id=@id AND Status=@approved AND ApprovalId=@approval;
+                WHERE Id COLLATE Latin1_General_100_BIN2=@id AND Status=@approved
+                  AND ApprovalId COLLATE Latin1_General_100_BIN2=@approval;
                 """;
             AddByte(update, "@executing", ToolCompensationStatus.Executing);
             AddAnsiString(update, "@execution", 64, executionKey); AddString(update, "@token", 64, leaseToken);
@@ -367,7 +373,8 @@ public sealed class SqlServerToolCompensationService(
             complete.CommandText = $"""
                 UPDATE dbo.{TableName} SET Status=@completed,CompletedAt=@now,ExecutionLeaseToken=NULL,
                     ExecutionLeaseExpiresAt=NULL,UpdatedAt=@now
-                WHERE Id=@id AND Status=@executing AND ExecutionLeaseToken=@token AND ExecutionLeaseExpiresAt>@now;
+                WHERE Id COLLATE Latin1_General_100_BIN2=@id AND Status=@executing
+                  AND ExecutionLeaseToken=@token AND ExecutionLeaseExpiresAt>@now;
                 """;
             AddByte(complete, "@completed", ToolCompensationStatus.Completed); AddDate(complete, "@now", completedAt);
             AddString(complete, "@id", 64, id); AddByte(complete, "@executing", ToolCompensationStatus.Executing);
@@ -411,7 +418,8 @@ public sealed class SqlServerToolCompensationService(
         await using (var command = connection.CreateCommand())
         {
             command.CommandText = $"SELECT {Columns} FROM dbo.{TableName} " +
-                "WHERE Id=@id AND TenantId=@tenant AND Status=@unknown;";
+                "WHERE Id COLLATE Latin1_General_100_BIN2=@id " +
+                "AND TenantId COLLATE Latin1_General_100_BIN2=@tenant AND Status=@unknown;";
             AddString(command, "@id", 64, id);
             AddString(command, "@tenant", 128, reconciler.TenantId);
             AddByte(command, "@unknown", ToolCompensationStatus.OutcomeUnknown);
@@ -463,7 +471,8 @@ public sealed class SqlServerToolCompensationService(
         {
             compensation.Transaction = transaction;
             compensation.CommandText = $"SELECT Status FROM dbo.{TableName} WITH (UPDLOCK,HOLDLOCK) " +
-                "WHERE Id=@id AND TenantId=@tenant;";
+                "WHERE Id COLLATE Latin1_General_100_BIN2=@id " +
+                "AND TenantId COLLATE Latin1_General_100_BIN2=@tenant;";
             AddString(compensation, "@id", 64, evidence.CompensationId);
             AddString(compensation, "@tenant", 128, reconciler.TenantId);
             var value = await compensation.ExecuteScalarAsync(cancellationToken);
@@ -478,7 +487,7 @@ public sealed class SqlServerToolCompensationService(
             read.Transaction = transaction;
             read.CommandText = $"SELECT EvidenceState,EvidenceCode,EvidenceExpiresAt," +
                 $"FirstReviewerSubjectId,Status FROM dbo.{ReconciliationTableName} WITH (UPDLOCK,HOLDLOCK) " +
-                "WHERE CompensationId=@id;";
+                "WHERE CompensationId COLLATE Latin1_General_100_BIN2=@id;";
             AddString(read, "@id", 64, evidence.CompensationId);
             await using var reader = await read.ExecuteReaderAsync(cancellationToken);
             current = await reader.ReadAsync(cancellationToken)
@@ -506,7 +515,8 @@ public sealed class SqlServerToolCompensationService(
             // 删除过期首审，返回本次过期结论；下一次调用必须从新的第一人证据开始。
             await using var deleteExpired = connection.CreateCommand();
             deleteExpired.Transaction = transaction;
-            deleteExpired.CommandText = $"DELETE dbo.{ReconciliationTableName} WHERE CompensationId=@id AND Status=0;";
+            deleteExpired.CommandText = $"DELETE dbo.{ReconciliationTableName} " +
+                "WHERE CompensationId COLLATE Latin1_General_100_BIN2=@id AND Status=0;";
             AddString(deleteExpired, "@id", 64, evidence.CompensationId);
             await deleteExpired.ExecuteNonQueryAsync(cancellationToken);
             result = new(evidence.CompensationId, ToolReconciliationReviewStatus.EvidenceExpired,
@@ -523,7 +533,8 @@ public sealed class SqlServerToolCompensationService(
             // 不允许把两次不同观察拼接成双人结论；清除旧首审后必须重新开始。
             await using var deleteChanged = connection.CreateCommand();
             deleteChanged.Transaction = transaction;
-            deleteChanged.CommandText = $"DELETE dbo.{ReconciliationTableName} WHERE CompensationId=@id AND Status=0;";
+            deleteChanged.CommandText = $"DELETE dbo.{ReconciliationTableName} " +
+                "WHERE CompensationId COLLATE Latin1_General_100_BIN2=@id AND Status=0;";
             AddString(deleteChanged, "@id", 64, evidence.CompensationId);
             await deleteChanged.ExecuteNonQueryAsync(cancellationToken);
             result = new(evidence.CompensationId, ToolReconciliationReviewStatus.EvidenceChanged,
@@ -537,7 +548,8 @@ public sealed class SqlServerToolCompensationService(
                 finish.Transaction = transaction;
                 finish.CommandText = $"UPDATE dbo.{ReconciliationTableName} SET " +
                     "SecondReviewerSubjectId=@reviewer,SecondConfirmed=1,SecondReasonHash=@reason," +
-                    "SecondReviewedAt=@now,Status=2,UpdatedAt=@now WHERE CompensationId=@id AND Status=0;";
+                    "SecondReviewedAt=@now,Status=2,UpdatedAt=@now " +
+                    "WHERE CompensationId COLLATE Latin1_General_100_BIN2=@id AND Status=0;";
                 AddString(finish, "@reviewer", 256, reconciler.SubjectId);
                 AddAnsiString(finish, "@reason", 64, reasonHash);
                 AddDate(finish, "@now", now); AddString(finish, "@id", 64, evidence.CompensationId);
@@ -553,7 +565,7 @@ public sealed class SqlServerToolCompensationService(
                 {
                     resolve.CommandText = $"UPDATE dbo.{TableName} SET Status=@completed,CompletedAt=@now," +
                         "ExecutionLeaseToken=NULL,ExecutionLeaseExpiresAt=NULL,UpdatedAt=@now " +
-                        "WHERE Id=@id AND Status=@unknown;";
+                        "WHERE Id COLLATE Latin1_General_100_BIN2=@id AND Status=@unknown;";
                     AddByte(resolve, "@completed", ToolCompensationStatus.Completed);
                 }
                 else
@@ -561,7 +573,8 @@ public sealed class SqlServerToolCompensationService(
                     resolve.CommandText = $"UPDATE dbo.{TableName} SET Status=@available,ApprovalId=NULL," +
                         "Justification=NULL,ApprovalExpiresAt=NULL,ApproverSubjectId=NULL,DecisionReasonHash=NULL," +
                         "CompensationExecutionKey=NULL,ExecutionLeaseToken=NULL,ExecutionLeaseExpiresAt=NULL," +
-                        "CompletedAt=NULL,UpdatedAt=@now WHERE Id=@id AND Status=@unknown;";
+                        "CompletedAt=NULL,UpdatedAt=@now " +
+                        "WHERE Id COLLATE Latin1_General_100_BIN2=@id AND Status=@unknown;";
                     AddByte(resolve, "@available", ToolCompensationStatus.Available);
                 }
                 AddDate(resolve, "@now", now); AddString(resolve, "@id", 64, evidence.CompensationId);
@@ -590,7 +603,8 @@ public sealed class SqlServerToolCompensationService(
     {
         await using var replace = connection.CreateCommand();
         replace.Transaction = transaction;
-        replace.CommandText = $"DELETE dbo.{ReconciliationTableName} WHERE CompensationId=@id; " +
+        replace.CommandText = $"DELETE dbo.{ReconciliationTableName} " +
+            "WHERE CompensationId COLLATE Latin1_General_100_BIN2=@id; " +
             $"INSERT dbo.{ReconciliationTableName} (CompensationId,TenantId,EvidenceState,EvidenceCode," +
             "EvidenceObservedAt,EvidenceExpiresAt,FirstReviewerSubjectId,FirstConfirmed,FirstReasonHash," +
             "FirstReviewedAt,Status,UpdatedAt) VALUES(@id,@tenant,@state,@code,@observed,@expires," +
@@ -614,7 +628,7 @@ public sealed class SqlServerToolCompensationService(
         command.CommandText = $"""
             UPDATE dbo.{TableName} SET Status=@next,UpdatedAt=@now
             OUTPUT inserted.TenantId,inserted.RequesterSubjectId,inserted.ForwardToolName
-            WHERE Id=@id AND Status=@prepared AND PreparationTokenHash=@hash;
+            WHERE Id COLLATE Latin1_General_100_BIN2=@id AND Status=@prepared AND PreparationTokenHash=@hash;
             """;
         AddByte(command, "@next", next); AddDate(command, "@now", timeProvider.GetUtcNow());
         AddString(command, "@id", 64, preparation.Id); AddByte(command, "@prepared", ToolCompensationStatus.Prepared);
@@ -636,7 +650,7 @@ public sealed class SqlServerToolCompensationService(
         await using var command = connection.CreateCommand();
         command.CommandText = $"""
             UPDATE dbo.{TableName} SET KeyVersion=@version,SnapshotCipher=@snapshot,UpdatedAt=@now
-            WHERE Id=@id AND Status=@executing AND ExecutionLeaseToken=@token;
+            WHERE Id COLLATE Latin1_General_100_BIN2=@id AND Status=@executing AND ExecutionLeaseToken=@token;
             """;
         AddString(command, "@version", 64, updated.KeyVersion); AddString(command, "@snapshot", -1, updated.Ciphertext);
         AddDate(command, "@now", timeProvider.GetUtcNow()); AddString(command, "@id", 64, row.Id);
@@ -652,7 +666,7 @@ public sealed class SqlServerToolCompensationService(
         await using var command = connection.CreateCommand();
         command.CommandText = $"""
             UPDATE dbo.{TableName} SET Status=@unknown,ExecutionLeaseToken=NULL,ExecutionLeaseExpiresAt=NULL,UpdatedAt=@now
-            WHERE Id=@id AND Status=@executing AND ExecutionLeaseToken=@token;
+            WHERE Id COLLATE Latin1_General_100_BIN2=@id AND Status=@executing AND ExecutionLeaseToken=@token;
             """;
         AddByte(command, "@unknown", ToolCompensationStatus.OutcomeUnknown); AddDate(command, "@now", timeProvider.GetUtcNow());
         AddString(command, "@id", 64, id); AddByte(command, "@executing", ToolCompensationStatus.Executing);
@@ -691,7 +705,8 @@ public sealed class SqlServerToolCompensationService(
     {
         await using var connection = await OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
-        command.CommandText = $"SELECT TenantId,RequesterSubjectId,ForwardToolName FROM dbo.{TableName} WHERE Id=@id;";
+        command.CommandText = $"SELECT TenantId,RequesterSubjectId,ForwardToolName FROM dbo.{TableName} " +
+            "WHERE Id COLLATE Latin1_General_100_BIN2=@id;";
         AddString(command, "@id", 64, id);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken)) throw PreparationLost();
@@ -729,7 +744,8 @@ public sealed class SqlServerToolCompensationService(
         string id, CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand(); command.Transaction = transaction;
-        command.CommandText = $"SELECT {Columns} FROM dbo.{TableName} WITH (UPDLOCK,HOLDLOCK) WHERE Id=@id;";
+        command.CommandText = $"SELECT {Columns} FROM dbo.{TableName} WITH (UPDLOCK,HOLDLOCK) " +
+            "WHERE Id COLLATE Latin1_General_100_BIN2=@id;";
         AddString(command, "@id", 64, id); await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         return await reader.ReadAsync(cancellationToken) ? Read(reader) : null;
     }
@@ -819,13 +835,18 @@ public sealed class SqlServerToolCompensationService(
         IF OBJECT_ID(N'dbo.AiMentorToolCompensations',N'U') IS NULL
         BEGIN
           CREATE TABLE dbo.AiMentorToolCompensations(
-            Id nvarchar(64) NOT NULL CONSTRAINT PK_AiMentorToolCompensations PRIMARY KEY,
-            ForwardExecutionKey char(64) NOT NULL,TenantId nvarchar(128) NOT NULL,
-            RequesterSubjectId nvarchar(256) NOT NULL,ForwardToolName nvarchar(128) NOT NULL,
+            Id nvarchar(64) COLLATE Latin1_General_100_BIN2 NOT NULL
+              CONSTRAINT PK_AiMentorToolCompensations PRIMARY KEY,
+            ForwardExecutionKey char(64) NOT NULL,
+            TenantId nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+            RequesterSubjectId nvarchar(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
+            ForwardToolName nvarchar(128) NOT NULL,
             CompensationToolName nvarchar(128) NOT NULL,Status tinyint NOT NULL,PreparationTokenHash char(64) NOT NULL,
             KeyVersion nvarchar(64) NOT NULL,SnapshotCipher nvarchar(max) NOT NULL,CreatedAt datetimeoffset(7) NOT NULL,
-            ExpiresAt datetimeoffset(7) NOT NULL,ApprovalId nvarchar(64) NULL,Justification nvarchar(500) NULL,
-            ApprovalExpiresAt datetimeoffset(7) NULL,ApproverSubjectId nvarchar(256) NULL,DecisionReasonHash char(64) NULL,
+            ExpiresAt datetimeoffset(7) NOT NULL,
+            ApprovalId nvarchar(64) COLLATE Latin1_General_100_BIN2 NULL,Justification nvarchar(500) NULL,
+            ApprovalExpiresAt datetimeoffset(7) NULL,
+            ApproverSubjectId nvarchar(256) COLLATE Latin1_General_100_BIN2 NULL,DecisionReasonHash char(64) NULL,
             CompensationExecutionKey char(64) NULL,ExecutionLeaseToken nvarchar(64) NULL,
             ExecutionLeaseExpiresAt datetimeoffset(7) NULL,CompletedAt datetimeoffset(7) NULL,
             UpdatedAt datetimeoffset(7) NOT NULL,RowVersion rowversion NOT NULL,
@@ -838,12 +859,14 @@ public sealed class SqlServerToolCompensationService(
         IF OBJECT_ID(N'dbo.AiMentorToolCompensationReconciliations',N'U') IS NULL
         BEGIN
           CREATE TABLE dbo.AiMentorToolCompensationReconciliations(
-            CompensationId nvarchar(64) NOT NULL CONSTRAINT PK_AiMentorToolCompensationReconciliations PRIMARY KEY,
-            TenantId nvarchar(128) NOT NULL,EvidenceState tinyint NOT NULL,EvidenceCode nvarchar(128) NOT NULL,
+            CompensationId nvarchar(64) COLLATE Latin1_General_100_BIN2 NOT NULL
+              CONSTRAINT PK_AiMentorToolCompensationReconciliations PRIMARY KEY,
+            TenantId nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+            EvidenceState tinyint NOT NULL,EvidenceCode nvarchar(128) NOT NULL,
             EvidenceObservedAt datetimeoffset(7) NOT NULL,EvidenceExpiresAt datetimeoffset(7) NOT NULL,
-            FirstReviewerSubjectId nvarchar(256) NOT NULL,FirstConfirmed bit NOT NULL,
+            FirstReviewerSubjectId nvarchar(256) COLLATE Latin1_General_100_BIN2 NOT NULL,FirstConfirmed bit NOT NULL,
             FirstReasonHash char(64) NOT NULL,FirstReviewedAt datetimeoffset(7) NOT NULL,
-            SecondReviewerSubjectId nvarchar(256) NULL,SecondConfirmed bit NULL,
+            SecondReviewerSubjectId nvarchar(256) COLLATE Latin1_General_100_BIN2 NULL,SecondConfirmed bit NULL,
             SecondReasonHash char(64) NULL,SecondReviewedAt datetimeoffset(7) NULL,
             Status tinyint NOT NULL,UpdatedAt datetimeoffset(7) NOT NULL,RowVersion rowversion NOT NULL,
             CONSTRAINT FK_AiMentorToolCompensationReconciliations_Compensation FOREIGN KEY(CompensationId)

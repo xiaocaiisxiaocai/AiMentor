@@ -314,7 +314,9 @@ public sealed class SqlServerAgentRunCheckpointStore(
             UPDATE dbo.[{TableName}]
             SET Status=1, LeaseToken=@token, LeaseOwner=@owner, LeaseExpiresAt=@leaseExpiresAt, UpdatedAt=@now
             OUTPUT inserted.PayloadCipher,inserted.KeyVersion
-            WHERE RunId=@runId AND TenantId=@tenantId AND SubjectId=@subjectId
+            WHERE RunId COLLATE Latin1_General_100_BIN2=@runId
+              AND TenantId COLLATE Latin1_General_100_BIN2=@tenantId
+              AND SubjectId COLLATE Latin1_General_100_BIN2=@subjectId
               AND CancelRequestedAt IS NULL
               AND (Status=0 OR (Status=1 AND LeaseExpiresAt<=@now));
             """;
@@ -532,16 +534,17 @@ public sealed class SqlServerAgentRunCheckpointStore(
                 IF OBJECT_ID(N'dbo.{TableName}', N'U') IS NULL
                 BEGIN
                     CREATE TABLE dbo.[{TableName}] (
-                        RunId nvarchar(128) NOT NULL CONSTRAINT PK_{TableName} PRIMARY KEY,
-                        TenantId nvarchar(128) NOT NULL,
-                        SubjectId nvarchar(256) NOT NULL,
-                        ApprovalId nvarchar(128) NOT NULL,
+                        RunId nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL
+                            CONSTRAINT PK_{TableName} PRIMARY KEY,
+                        TenantId nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                        SubjectId nvarchar(256) COLLATE Latin1_General_100_BIN2 NOT NULL,
+                        ApprovalId nvarchar(128) COLLATE Latin1_General_100_BIN2 NOT NULL,
                         ExpiresAt datetimeoffset(7) NOT NULL,
                         KeyVersion nvarchar(64) NULL,
                         PayloadCipher nvarchar(max) NOT NULL,
                         Status tinyint NOT NULL,
                         LeaseToken nvarchar(64) NULL,
-                        LeaseOwner nvarchar(256) NULL,
+                        LeaseOwner nvarchar(256) COLLATE Latin1_General_100_BIN2 NULL,
                         LeaseExpiresAt datetimeoffset(7) NULL,
                         CancelRequestedAt datetimeoffset(7) NULL,
                         CancellationReasonHash char(64) NULL,

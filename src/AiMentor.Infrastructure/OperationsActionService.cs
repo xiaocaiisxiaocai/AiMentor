@@ -144,9 +144,20 @@ public sealed class OperationsActionService(
         var finalized = false;
         try
         {
-            // SLA 升级只提交与首次授权快照绑定的运营标记，不读取或修改目标载荷，也不冒充目标所有者。
-            // 其他动作会改变底层工作流，仍必须以实际复核人身份重新校验目标版本与访问权。
-            if (executing.Action != "escalate")
+            if (executing.Action == "escalate")
+            {
+                // 只通过服务端最小状态快照复核当前版本和 SLA，不读取 Atlas 载荷，也不冒充所有者。
+                if (!await tasks.IsEscalationCurrentAsync(executing.TargetType, executing.TargetId,
+                        executing.TargetETag, access, cancellationToken))
+                {
+                    await FinishAsync(executing, OperationsActionStatus.Failed,
+                        "OPERATIONS_TARGET_VERSION_CONFLICT");
+                    finalized = true;
+                    throw Failure("OPERATIONS_TARGET_VERSION_CONFLICT", "复核前任务已经变化或不再允许升级。",
+                        OperationsActionErrorKind.Conflict);
+                }
+            }
+            else
             {
                 var target = await FindTaskAsync(executing.TargetType, executing.TargetId, access, cancellationToken);
                 if (!FixedEquals(target.ETag, executing.TargetETag))
@@ -204,6 +215,21 @@ public sealed class OperationsActionService(
         return (await store.ListAsync(access.TenantId, 500, cancellationToken))
             .Where(item => CanAccessAudit(item, access))
             .Select(item => Summary(item, false)).ToArray();
+    }
+
+    public async Task<OperationsActionSummary> GetAsync(string requestId, AccessContext access,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateAccess(access);
+        if (!access.Groups.Overlaps(options.ReviewerGroups) && !access.Groups.Overlaps(options.EscalatorGroups))
+            throw Failure("OPERATIONS_REVIEWER_ROLE_REQUIRED", "当前身份无权访问运营动作审计。",
+                OperationsActionErrorKind.Forbidden);
+        var id = Required(requestId, 64, "OPERATIONS_ACTION_ID_INVALID", "运营动作请求标识无效。");
+        var record = await store.GetAsync(access.TenantId, id, cancellationToken);
+        if (record is null || !CanAccessAudit(record, access))
+            throw Failure("OPERATIONS_ACTION_NOT_FOUND", "没有找到当前租户可访问的运营动作。",
+                OperationsActionErrorKind.NotFound);
+        return Summary(record, false);
     }
 
     private async Task<string> DispatchAsync(OperationsActionRecord record, AccessContext access,
@@ -311,6 +337,8 @@ public sealed class OperationsActionService(
     private void ValidateOptions()
     {
         if (options.ReviewLifetime <= TimeSpan.Zero || options.MaximumEntries <= 0
+            || options.MaximumAuditEntriesPerTenant < options.MaximumEntries
+            || options.OutcomeUnknownRetention <= TimeSpan.Zero
             || options.ReviewerGroups.Count == 0 || options.EscalatorGroups.Count == 0)
             throw new InvalidOperationException("运营动作配置无效。");
     }
