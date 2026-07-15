@@ -2,13 +2,16 @@ param(
     [string]$Endpoint = 'http://127.0.0.1:9200',
     [string]$Image = 'opensearchproject/opensearch:3.5.0',
     [string]$ContainerName = 'aimentor-opensearch-acceptance',
+    [string]$DockerCommand = 'docker',
+    [ValidateRange(1, 300)][int]$DockerCommandTimeoutSeconds = 30,
     [ValidateRange(10, 1800)][int]$StartupTimeoutSeconds = 180,
-    [ValidateRange(10, 3600)][int]$PullTimeoutSeconds = 600,
+    [ValidateRange(1, 3600)][int]$PullTimeoutSeconds = 600,
     [switch]$PullImage
 )
 
 $ErrorActionPreference = 'Stop'
 $scriptRoot = $PSScriptRoot
+$scriptExitCode = 0
 $startedContainer = $false
 $createdIndexes = [System.Collections.Generic.List[string]]::new()
 $suffix = "$(Get-Date -Format 'yyyyMMddHHmmss')-$PID"
@@ -21,9 +24,8 @@ $manifestV2 = Join-Path ([System.IO.Path]::GetTempPath()) "aimentor-opensearch-v
 $base = $Endpoint.TrimEnd('/')
 $http = @{ TimeoutSec = 10 }
 
-function Write-NotReady([string]$Code) {
-    Write-Output "OPENSEARCH_ACCEPTANCE_NOT_READY code=$Code"
-    exit 2
+function Throw-NotReady([string]$Code) {
+    throw "OPENSEARCH_ACCEPTANCE_NOT_READY:$Code"
 }
 
 function Require-Acceptance([bool]$Condition, [string]$Code) {
@@ -39,46 +41,94 @@ function Test-Endpoint {
 }
 
 function Invoke-Docker([string[]]$Arguments) {
-    # PowerShell 7 可把原生命令 stderr 提升为 ErrorRecord；先保留退出码，再统一转换为稳定错误码。
-    $previousPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        & docker @Arguments
-        $exitCode = $LASTEXITCODE
-    }
-    finally { $ErrorActionPreference = $previousPreference }
-    if ($exitCode -ne 0) { throw "DOCKER_COMMAND_FAILED:$($Arguments[0])" }
+    $result = Invoke-DockerProcess $Arguments $DockerCommandTimeoutSeconds
+    if ($result.TimedOut) { throw "DOCKER_COMMAND_TIMEOUT:$($Arguments[0])" }
+    if ($result.ExitCode -ne 0) { throw "DOCKER_COMMAND_FAILED:$($Arguments[0])" }
 }
 
 function Test-DockerCommand([string[]]$Arguments) {
-    $previousPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        & docker @Arguments *> $null
-        return $LASTEXITCODE -eq 0
+    $result = Invoke-DockerProcess $Arguments $DockerCommandTimeoutSeconds
+    return -not $result.TimedOut -and $result.ExitCode -eq 0
+}
+
+function Stop-ProcessTree([System.Diagnostics.Process]$Process) {
+    if ($Process.HasExited) { return }
+
+    if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+        # Docker Desktop 的 CLI 可能保留子进程；taskkill /T 可确保超时后不再后台拉取。
+        $previousPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            & "$env:SystemRoot\System32\taskkill.exe" /PID $Process.Id /T /F *> $null
+        }
+        finally { $ErrorActionPreference = $previousPreference }
     }
-    finally { $ErrorActionPreference = $previousPreference }
+    else {
+        $Process.Kill($true)
+    }
+
+    if (-not $Process.WaitForExit(5000)) { throw 'DOCKER_PROCESS_TERMINATION_TIMEOUT' }
+}
+
+function Invoke-DockerProcess([string[]]$Arguments, [int]$TimeoutSeconds) {
+    $process = $null
+    $stdoutTask = $null
+    $stderrTask = $null
+    try {
+        $safeArguments = @($Arguments | ForEach-Object {
+            if ($_.Contains('"')) { throw 'DOCKER_ARGUMENT_INVALID' }
+            if ($_ -match '\s') { '"' + $_ + '"' } else { $_ }
+        })
+        $processCommand = $DockerCommand
+        $processArguments = $safeArguments
+        if (($IsWindows -or $env:OS -eq 'Windows_NT') -and
+            [System.IO.Path]::GetExtension($DockerCommand) -in @('.cmd', '.bat')) {
+            # Windows PowerShell 对批处理文件返回的 Process 不提供 ExitCode，显式经 cmd.exe 执行。
+            $commandLine = '"' + $DockerCommand + '" ' + ($safeArguments -join ' ')
+            $processCommand = "$env:SystemRoot\System32\cmd.exe"
+            $processArguments = @('/d', '/s', '/c', '"' + $commandLine + '"')
+        }
+
+        $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $startInfo.FileName = $processCommand
+        $startInfo.Arguments = $processArguments -join ' '
+        $startInfo.UseShellExecute = $false
+        $startInfo.CreateNoWindow = $true
+        $startInfo.RedirectStandardOutput = $true
+        $startInfo.RedirectStandardError = $true
+        $process = [System.Diagnostics.Process]::new()
+        $process.StartInfo = $startInfo
+        if (-not $process.Start()) { throw 'DOCKER_PROCESS_START_FAILED' }
+        # 同时抽干两个管道，避免 Docker 进度输出填满缓冲区后与父进程互相等待。
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            Stop-ProcessTree $process
+            $timedOut = $true
+            $exitCode = -1
+        }
+        else {
+            $timedOut = $false
+            $exitCode = $process.ExitCode
+        }
+        if (-not $stdoutTask.Wait(5000) -or -not $stderrTask.Wait(5000)) {
+            throw 'DOCKER_OUTPUT_DRAIN_TIMEOUT'
+        }
+        return [pscustomobject]@{ TimedOut = $timedOut; ExitCode = $exitCode }
+    }
+    finally {
+        if ($null -ne $process) { $process.Dispose() }
+        # 原生命令输出可能包含代理、认证或容器环境，只在内存中抽干且永不回显。
+        $stdoutTask = $null
+        $stderrTask = $null
+    }
 }
 
 function Pull-ImageBounded {
-    $stdout = Join-Path ([System.IO.Path]::GetTempPath()) "aimentor-opensearch-pull-$suffix.out"
-    $stderr = Join-Path ([System.IO.Path]::GetTempPath()) "aimentor-opensearch-pull-$suffix.err"
-    try {
-        $process = Start-Process docker -ArgumentList @('pull', $Image) -NoNewWindow -PassThru `
-            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-        if (-not $process.WaitForExit($PullTimeoutSeconds * 1000)) {
-            $process.Kill($true)
-            $process.WaitForExit()
-            Write-NotReady "IMAGE_PULL_TIMEOUT timeoutSeconds=$PullTimeoutSeconds"
-        }
-        if ($process.ExitCode -ne 0) {
-            # Registry/代理错误正文可能包含内部地址或认证信息，验收输出只保留稳定状态码。
-            Write-NotReady 'IMAGE_PULL_FAILED'
-        }
-    }
-    finally {
-        Remove-Item -LiteralPath $stdout, $stderr -Force -ErrorAction SilentlyContinue
-    }
+    $result = Invoke-DockerProcess @('pull', $Image) $PullTimeoutSeconds
+    if ($result.TimedOut) { Throw-NotReady "IMAGE_PULL_TIMEOUT timeoutSeconds=$PullTimeoutSeconds" }
+    # Registry/代理错误正文可能包含内部地址或认证信息，验收输出只保留稳定状态码。
+    if ($result.ExitCode -ne 0) { Throw-NotReady 'IMAGE_PULL_FAILED' }
 }
 
 function New-PhysicalIndex([string]$Index, [string]$DocumentId, [string]$Content) {
@@ -130,25 +180,26 @@ function Assert-AliasDocument([string]$Alias, [string]$DocumentId) {
 
 try {
     if (-not (Test-Endpoint)) {
-        if ($null -eq (Get-Command docker -ErrorAction SilentlyContinue)) { Write-NotReady 'DOCKER_CLI_MISSING' }
+        if ($null -eq (Get-Command $DockerCommand -ErrorAction SilentlyContinue)) { Throw-NotReady 'DOCKER_CLI_MISSING' }
         if (-not (Test-DockerCommand -Arguments @('info', '--format', '{{.ServerVersion}}'))) {
-            Write-NotReady 'DOCKER_ENGINE_UNAVAILABLE'
+            Throw-NotReady 'DOCKER_ENGINE_UNAVAILABLE'
         }
         if (-not (Test-DockerCommand -Arguments @('image', 'inspect', $Image))) {
-            if (-not $PullImage) { Write-NotReady 'IMAGE_MISSING' }
+            if (-not $PullImage) { Throw-NotReady 'IMAGE_MISSING' }
             Pull-ImageBounded
         }
         Test-DockerCommand -Arguments @('rm', '-f', $ContainerName) | Out-Null
+        # 在 run 前取得该唯一容器名的清理责任，覆盖 CLI 超时但引擎已完成创建的窗口。
+        $startedContainer = $true
         Invoke-Docker -Arguments @('run', '--detach', '--rm', '--name', $ContainerName,
             '--publish', '9200:9200', '--publish', '9600:9600',
             '--env', 'discovery.type=single-node', '--env', 'DISABLE_SECURITY_PLUGIN=true',
             '--env', 'OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m', $Image) | Out-Null
-        $startedContainer = $true
         $deadline = [DateTimeOffset]::UtcNow.AddSeconds($StartupTimeoutSeconds)
         while (-not (Test-Endpoint) -and [DateTimeOffset]::UtcNow -lt $deadline) { Start-Sleep -Seconds 2 }
         if (-not (Test-Endpoint)) {
-            & docker logs --tail 80 $ContainerName 2>&1 | Write-Output
-            Write-NotReady 'OPENSEARCH_STARTUP_TIMEOUT'
+            # 容器日志可能包含环境或插件细节，公开输出保持为稳定状态码。
+            Throw-NotReady 'OPENSEARCH_STARTUP_TIMEOUT'
         }
     }
 
@@ -195,11 +246,17 @@ try {
     Assert-AliasDocument $currentAlias 'DOC-V1'
 
     Write-Output "OPENSEARCH_ACCEPTANCE_PASSED version=$($root.version.number) current=$indexV1 previous=$indexV2"
-    exit 0
 }
 catch {
-    Write-Output "OPENSEARCH_ACCEPTANCE_FAILED code=$($_.Exception.Message)"
-    exit 1
+    if ($_.Exception.Message.StartsWith('OPENSEARCH_ACCEPTANCE_NOT_READY:', [StringComparison]::Ordinal)) {
+        $code = $_.Exception.Message.Substring('OPENSEARCH_ACCEPTANCE_NOT_READY:'.Length)
+        Write-Output "OPENSEARCH_ACCEPTANCE_NOT_READY code=$code"
+        $scriptExitCode = 2
+    }
+    else {
+        Write-Output "OPENSEARCH_ACCEPTANCE_FAILED code=$($_.Exception.Message)"
+        $scriptExitCode = 1
+    }
 }
 finally {
     foreach ($index in $createdIndexes) {
@@ -208,3 +265,5 @@ finally {
     Remove-Item -LiteralPath $manifestV1, $manifestV2 -Force -ErrorAction SilentlyContinue
     if ($startedContainer) { Test-DockerCommand -Arguments @('rm', '-f', $ContainerName) | Out-Null }
 }
+
+exit $scriptExitCode

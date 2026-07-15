@@ -348,7 +348,29 @@ if (string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreC
 else
     builder.Services.AddSingleton<IAtlasIncidentStore, InMemoryAtlasIncidentStore>();
 builder.Services.AddSingleton<IAtlasIncidentWorkflow, AtlasIncidentWorkflow>();
+var operationsReviewerGroups = builder.Configuration.GetSection("Operations:ReviewerGroups").Get<string[]>()
+    ?? ["tool-approvers"];
+var operationsEscalatorGroups = builder.Configuration.GetSection("Operations:EscalatorGroups").Get<string[]>()
+    ?? ["operations-escalators"];
+var operationsReviewLifetimeSeconds = builder.Configuration.GetValue("Operations:ReviewLifetimeSeconds", 900);
+var operationsMaximumPendingActions = builder.Configuration.GetValue("Operations:MaximumPendingActions", 10_000);
+if (operationsReviewerGroups.Length == 0 || operationsReviewerGroups.Any(string.IsNullOrWhiteSpace)
+    || operationsEscalatorGroups.Length == 0 || operationsEscalatorGroups.Any(string.IsNullOrWhiteSpace)
+    || operationsReviewLifetimeSeconds is < 30 or > 86_400 || operationsMaximumPendingActions <= 0)
+    throw new InvalidOperationException("Operations 复核组、升级组或复核期限配置无效。");
+builder.Services.AddSingleton(new OperationsActionOptions
+{
+    ReviewerGroups = new HashSet<string>(operationsReviewerGroups, StringComparer.OrdinalIgnoreCase),
+    EscalatorGroups = new HashSet<string>(operationsEscalatorGroups, StringComparer.OrdinalIgnoreCase),
+    ReviewLifetime = TimeSpan.FromSeconds(operationsReviewLifetimeSeconds),
+    MaximumEntries = operationsMaximumPendingActions
+});
+builder.Services.AddSingleton<IOperationsActionStore>(services =>
+    string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase)
+        ? ActivatorUtilities.CreateInstance<SqlServerOperationsActionStore>(services)
+        : ActivatorUtilities.CreateInstance<InMemoryOperationsActionStore>(services));
 builder.Services.AddSingleton<IOperationsTaskService, OperationsTaskService>();
+builder.Services.AddSingleton<IOperationsActionService, OperationsActionService>();
 
 var configuredWorkflowKeys = builder.Configuration.GetSection("Workflow:Encryption:Keys").GetChildren().ToArray();
 var openSearchUsername = builder.Configuration["OpenSearch:Username"]
@@ -459,6 +481,17 @@ if (jwtAuthenticationEnabled) v1.RequireAuthorization("question-api");
 v1.MapGet("/operations/tasks", ListOperationsTasksAsync)
     .WithName("ListOperationsTasksV1").WithTags("AiMentor operations v1")
     .Produces<OperationsTaskPage>();
+v1.MapGet("/operations/actions", ListOperationsActionsAsync)
+    .WithName("ListOperationsActionsV1").WithTags("AiMentor operations v1")
+    .Produces<IReadOnlyList<OperationsActionSummary>>();
+v1.MapPost("/operations/tasks/{targetType}/{targetId}/actions", RequestOperationsActionAsync)
+    .WithName("RequestOperationsActionV1").WithTags("AiMentor operations v1")
+    .Produces<OperationsActionSummary>(StatusCodes.Status202Accepted)
+    .ProducesProblem(StatusCodes.Status409Conflict);
+v1.MapPost("/operations/actions/{requestId}/review", ReviewOperationsActionAsync)
+    .WithName("ReviewOperationsActionV1").WithTags("AiMentor operations v1")
+    .Produces<OperationsActionSummary>()
+    .ProducesProblem(StatusCodes.Status409Conflict);
 app.MapGet("/ops", () => Results.Redirect("/ops/index.html", permanent: false)).ExcludeFromDescription();
 v1.MapGet("/knowledge/stats", () => Results.Ok(repository.Statistics))
     .WithName("GetKnowledgeStatisticsV1").Produces<KnowledgeStatistics>();
@@ -893,6 +926,62 @@ static async Task<IResult> ListOperationsTasksAsync(string? type, string? status
         return Results.Problem(statusCode: StatusCodes.Status400BadRequest, title: "运营任务查询参数无效",
             detail: exception.Message, type: "https://httpstatuses.com/400");
     }
+}
+
+static async Task<IResult> ListOperationsActionsAsync(IOperationsActionService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        return Results.Ok(await service.ListAsync(accessProvider.GetAccessContext(context.User), cancellationToken));
+    }
+    catch (OperationsActionException exception) { return OperationsActionProblem(exception, context); }
+}
+
+static async Task<IResult> RequestOperationsActionAsync(string targetType, string targetId,
+    RequestOperationsActionRequest request, IOperationsActionService service,
+    IRequestAccessContextProvider accessProvider, HttpContext context, CancellationToken cancellationToken)
+{
+    try
+    {
+        var etag = context.Request.Headers.IfMatch.ToString();
+        var idempotencyKey = context.Request.Headers["Idempotency-Key"].ToString();
+        var result = await service.RequestAsync(targetType, targetId, request.Action, etag, request.Reason,
+            idempotencyKey, accessProvider.GetAccessContext(context.User), cancellationToken);
+        return Results.Accepted($"/api/v1/operations/actions/{result.Id}", result);
+    }
+    catch (OperationsActionException exception) { return OperationsActionProblem(exception, context); }
+}
+
+static async Task<IResult> ReviewOperationsActionAsync(string requestId, ReviewOperationsActionRequest request,
+    IOperationsActionService service, IRequestAccessContextProvider accessProvider, HttpContext context,
+    CancellationToken cancellationToken)
+{
+    try
+    {
+        var result = await service.ReviewAsync(requestId, request.ExpectedVersion,
+            context.Request.Headers.IfMatch.ToString(), request.Approved, request.Reason,
+            accessProvider.GetAccessContext(context.User), cancellationToken);
+        return Results.Ok(result);
+    }
+    catch (OperationsActionException exception) { return OperationsActionProblem(exception, context); }
+}
+
+static IResult OperationsActionProblem(OperationsActionException exception, HttpContext context)
+{
+    var status = exception.Kind switch
+    {
+        OperationsActionErrorKind.Validation => StatusCodes.Status400BadRequest,
+        OperationsActionErrorKind.Forbidden => StatusCodes.Status403Forbidden,
+        OperationsActionErrorKind.NotFound => StatusCodes.Status404NotFound,
+        OperationsActionErrorKind.Conflict => StatusCodes.Status409Conflict,
+        OperationsActionErrorKind.Capacity or OperationsActionErrorKind.Unavailable =>
+            StatusCodes.Status503ServiceUnavailable,
+        _ => StatusCodes.Status500InternalServerError
+    };
+    return Results.Problem(statusCode: status, title: "运营动作失败", detail: exception.Message,
+        type: $"https://httpstatuses.com/{status}", instance: context.Request.Path,
+        extensions: new Dictionary<string, object?> { ["code"] = exception.Code });
 }
 
 static async Task<IResult> DecideToolApprovalAsync(string approvalId, DecideToolApprovalRequest request,

@@ -155,9 +155,9 @@ OpenSearch 的 `VectorDimensions`、`IndexName` 一致；模型或维度变化�
   -BasePort 5610
 ```
 
-脚本要求 Docker Desktop 已运行，且指定的 SQL 与七个连续 API 端口均可绑定。它真实执行 001–008 迁移，并先验证正向工具的精确强杀窗口；随后创建真实 `memory.correct` 正向操作和加密补偿记录，在补偿账本已提交 `Executing`、快照尚未解密且 `memory.correct.restore` 尚未调用时强杀实例。脚本确认目标记忆仍保持正向值，等待租约过期后由无屏障替代实例通过 `GET /api/v1/tool-compensations?status=OutcomeUnknown` 查询冻结记录，并验证反向重试返回 409。后续仍会完成常规结果不确定探测、跨实例独立审批、第一人复核强杀、两个第二复核实例并发单胜者及 `Reconciled` 滚动回放。脚本不输出数据库密码，失败时保留诊断日志路径，成功后自动删除临时资源。
+脚本要求 Docker Desktop 已运行，且指定的 SQL 与九个连续 API 端口均可绑定。它真实执行 001–010 迁移，并先验证正向工具的精确强杀窗口；随后创建真实 `memory.correct` 正向操作和加密补偿记录，在补偿账本已提交 `Executing`、快照尚未解密且 `memory.correct.restore` 尚未调用时强杀实例。脚本确认目标记忆仍保持正向值，等待租约过期后由无屏障替代实例查询冻结记录并验证反向重试返回 409；还会执行多实例补偿审批/执行并发单胜者、常规结果不确定探测、跨实例独立审批、第一人复核强杀、两个第二复核实例并发单胜者、Atlas SQL 恢复、运营队列脱敏及 `Reconciled` 滚动回放。脚本不输出数据库密码，失败时保留诊断日志路径，成功后自动删除临时资源。
 
-2026-07-14 的严格测量基线：150 条全部执行，0 条完整通过、72 条失败、78 条 `NotReady`；可判定动作准确率 46.40%，动作 Oracle 覆盖率 83.33%，必需来源 micro recall 79.59%，完整可执行 Oracle 覆盖率 0%，28 条 critical 用例全部阻断，质量门禁正确失败。独立 v2 critical 小套件为 6 Pass / 0 Fail / 0 NotReady，动作、引用和 Oracle 覆盖率均为 100%，门禁退出码 0；其中 `BK-POL-009 v1.2` 使用同一问题的授权/未授权主体实测文档级 ACL，隔离 corpus 使用 CLEAN/MIXED 同问配对实测恶意分块召回、隔离及下游不传播。此前的“决策 90%、引用 75%、安全/ACL 100%”使用了宽泛动作兜底、全权限主体和无来源即引用成功等错误口径，已经废止，不能用于版本比较。
+2026-07-14 的严格测量基线：150 条全部执行，0 条完整通过、72 条失败、78 条 `NotReady`；可判定动作准确率 46.40%，动作 Oracle 覆盖率 83.33%，必需来源 micro recall 79.59%，完整可执行 Oracle 覆盖率 0%，28 条 critical 用例全部阻断，质量门禁正确失败。当前独立 v2 critical 套件为 16 Pass / 0 Fail / 0 NotReady，动作、引用和 Oracle 覆盖率均为 100%，门禁退出码 0；除输入安全、ACL 和间接注入外，还覆盖跨用户记忆、删除后无旧缓存、工具精确参数/替换/重放/过期以及 PII Transform、凭证和身份证失败关闭。此前的“决策 90%、引用 75%、安全/ACL 100%”使用了宽泛动作兜底、全权限主体和无来源即引用成功等错误口径，已经废止，不能用于版本比较。
 
 评测执行器同时是严格质量门禁：可判定动作准确率不得低于 89%，动作 Oracle 覆盖率和完整 Oracle 覆盖率都必须达到 100%，必需来源 micro recall 不得低于 71%，任一 critical 用例 `Fail` 或 `NotReady` 都会无条件阻断。旧 `expected_behavior` 自由文本只保留给人工迁移，不参与自动通过判定；没有实际恶意文档、工具参数、缓存、撤权或跨用户状态的场景只能标为 `NotReady`。
 
@@ -301,7 +301,7 @@ $env:AIMENTOR_MEMORY_ENCRYPTION_KEY = '<至少32字节的Base64密钥>'
 dotnet run --project src\AiMentor.Api
 ```
 
-开发环境 SQL Server 模式会按需创建 `AiMentorToolApprovals`、`AiMentorAgentRuns`、`AiMentorToolExecutions`、`AiMentorToolReconciliations`、`AiMentorToolCompensations` 和 `AiMentorToolCompensationReconciliations`，并用数据库应用锁避免多个实例同时建表。Production 强制 `Workflow:Provider=SqlServer`、`Encrypt=True`、`TrustServerCertificate=False`，且默认关闭运行时建表；发布账号应依次执行 [`001_workflow.sql`](deploy/sql/001_workflow.sql)、[`002_workflow_key_version.sql`](deploy/sql/002_workflow_key_version.sql)、[`003_tool_execution_ledger.sql`](deploy/sql/003_tool_execution_ledger.sql)、[`004_tool_execution_reconciliation.sql`](deploy/sql/004_tool_execution_reconciliation.sql)、[`005_tool_reconciliation_reviews.sql`](deploy/sql/005_tool_reconciliation_reviews.sql)、[`006_agent_run_cancellation.sql`](deploy/sql/006_agent_run_cancellation.sql)、[`007_tool_compensations.sql`](deploy/sql/007_tool_compensations.sql) 和 [`008_tool_compensation_reconciliation.sql`](deploy/sql/008_tool_compensation_reconciliation.sql)，应用账号只授予表级读写权限。
+开发环境 SQL Server 模式会按需创建工具审批、Agent 检查点、执行/补偿对账、Atlas 排查和运营动作审计表，并用数据库应用锁避免多个实例同时建表。Production 强制 `Workflow:Provider=SqlServer`、`Encrypt=True`、`TrustServerCertificate=False`，且默认关闭运行时建表；发布账号应按编号依次执行 [`001_workflow.sql`](deploy/sql/001_workflow.sql) 至 [`010_operations_actions.sql`](deploy/sql/010_operations_actions.sql) 的全部迁移，应用账号只授予表级读写权限。
 
 ### 工作流密钥轮换
 
@@ -442,7 +442,7 @@ $env:AIMENTOR_OIDC_TOKEN_B = '<subject-b-token>'
 .\scripts\Test-OidcAcceptance.ps1
 ```
 
-脚本只输出 Token 的短 SHA-256 哈希和稳定结果码；缺少环境变量或外部服务不可达时退出码为 `2`（NotReady），策略失败为 `1`，通过为 `0`。
+脚本只输出 Token 的短 SHA-256 哈希和稳定结果码；所有 HTTP 请求都有界超时，创建的 Atlas 验收运行必须由原主体取消，无法清理时返回 `NotReady`。缺少环境变量或外部服务不可达时退出码为 `2`（NotReady），策略失败为 `1`，通过为 `0`。
 
 依赖审计曾阻止引入存在 CVE-2026-49451 的 `Microsoft.OpenApi 2.0.0`，当前已显式固定到官方修复版本 2.7.5，并通过全解决方案传递依赖漏洞检查。
 
@@ -452,18 +452,31 @@ $env:AIMENTOR_OIDC_TOKEN_B = '<subject-b-token>'
 - AtlasID Workflow 在 SQL Server 模式使用 `009_atlas_incident_runs.sql`、加密载荷、版本号和短租约；测试通过独立 Helper 进程强杀验证租约到期接管。
 - Provider 对比使用 `AiMentor.Evaluation --compare --output <path>`，Chat、Embedding、Reranker 必须分别配置。缺少任一远端配置时 candidate 为 `NotReady` 并退出 `2`，不会回退确定性实现；用量未知为 `null`，成本只按显式带版本价格计算。
 - OpenSearch 发布使用 `scripts/Publish-OpenSearchIndex.ps1` 创建不可变物理索引，全部校验通过后原子切换 `current/previous` Alias；`scripts/Rollback-OpenSearchIndex.ps1` 原子回滚。Production 禁止启动时同步写索引。
-- 运营工作台位于 `/ops/`，统一展示审批、`OutcomeUnknown`、补偿和 AtlasID 运行的脱敏任务摘要；服务端仍是唯一授权边界。
+- 运营工作台位于 `/ops/`，统一展示审批、`OutcomeUnknown`、补偿和 AtlasID 运行的脱敏任务摘要。批准、拒绝和 SLA 升级不再由页面直接调用目标工作流，而是由服务端校验任务 `ETag` 与 `Idempotency-Key` 后持久化为待复核动作；独立第二人原子占位成功后才执行。提出人不能自审，并发复核只有一个胜者，异常结果冻结为 `OutcomeUnknown`，理由只保存 SHA-256 摘要。SQL Server 模式由 [`010_operations_actions.sql`](deploy/sql/010_operations_actions.sql) 保存完整状态和审计终态；前端不会获得额外授权。
 
-## 下一阶段
+Linux 容器门禁位于 `.github/workflows/linux-containers.yml`，在 PR、`main` 推送和手工触发时执行三个独立任务：
 
-1. 在已授权环境运行真实 OIDC 双主体脚本、真实 Provider 对比和 OpenSearch 容器验收；缺少外部凭据或 Docker 引擎时必须保持 `NotReady`。
-2. 为 Atlas SQL、OpenSearch Alias 和运营任务队列增加 Linux 容器 CI，避免仅依赖 Windows LocalDB。
-3. 将运营工作台的动作面继续绑定双人复核、SLA 升级和持久审计，不在前端放宽任何权限。
+- Ubuntu Release 构建和全量自动化测试；
+- SQL Server 2022 service container 上的 Atlas 加密、租约强杀恢复、多实例补偿审批/执行单胜者、对账、Atlas 持久恢复和运营任务队列脱敏验收；
+- OpenSearch 3.5.0 真实容器上的双物理索引、Alias 发布/查询/切换和回滚验收。
+
+SQL job 使用 GitHub Actions 的动态宿主端口和 service container ID，不依赖 Windows LocalDB。`SqlServerAtlasIncidentStoreTests` 仅在显式提供 `AIMENTOR_SQLSERVER_TEST_CONNECTION` 时使用外部 SQL；一旦显式配置，连接、迁移或断言失败都会让门禁失败，不会退回跳过。分布式入口支持 Release：
+
+```powershell
+./scripts/Test-DistributedReconciliation.ps1 `
+  -SqlContainer '<container-id-or-name>' `
+  -SqlHostPort 1433 `
+  -Configuration Release
+```
+
+## 外部上线验收
+
+在已授权环境运行真实 OIDC 双主体脚本、真实 Provider 对比和 OpenSearch 容器验收；缺少外部凭据、镜像或服务连通性时必须保持 `NotReady`，不能用本地 Fixture 代替外部系统上线结论。
 
 ## 验证状态
 
-- 2026-07-15 本地自动化测试 256/256 通过；独立 v2 critical 套件为 16/16 Pass，动作、引用和 Oracle 覆盖率均为 100%。OIDC discovery/JWKS 与 Provider Chat/Embedding/Reranker 均增加独立进程网络验收；PII Transform、跨用户记忆、工具精确参数/重放/过期、SQL Atlas 强杀恢复、OpenSearch Alias 生命周期及运营任务脱敏均有自动化回归。
-- 2026-07-15 已恢复 Docker Desktop Linux Engine，并修复“只启动 OpenSearch 也被 SQL profile 密码插值阻断”的 Compose 回归；`opensearchproject/opensearch:3.5.0` 经官方仓库及备用入口拉取仍遭遇超时、EOF、TLS 或限流，未产生镜像和容器，真实集群验收保持 `NotReady`。缺镜像负向入口已验证稳定返回退出码 `2`，没有把 HTTP 契约测试描述为真实集群通过。
+- 2026-07-15 本地自动化测试 269/269 通过；独立 v2 critical 套件为 16/16 Pass，动作、引用和 Oracle 覆盖率均为 100%。OIDC discovery/JWKS 与 Provider Chat/Embedding/Reranker 均有独立进程网络验收；运营动作的双人复核、SLA 升级、最小权限审计、SQL 持久化、并发单胜者和硬崩溃冻结已加入回归。真实 SQL Server 2022 分布式验收通过 Atlas 恢复、运营队列脱敏以及补偿审批/执行并发单胜者。
+- 2026-07-15 已恢复 Docker Desktop Linux Engine，并修复“只启动 OpenSearch 也被 SQL profile 密码插值阻断”的 Compose 回归；`opensearchproject/opensearch:3.5.0` 经官方仓库及官方 Public ECR 拉取仍遭遇有界超时，未产生镜像和容器，真实集群验收保持 `NotReady`。拉取超时现在会树级终止进程，且不落盘或回显 Registry/代理错误；事后无残留进程、临时日志或容器。
 
 - 2026-07-14 本地自动化测试 179/179 通过；新增严格题集哈希与套件完整性校验、v1/v2 schema 隔离、结构化 Oracle、Runner 侧可信 Fixture Registry、知识检索/内容安全/重排/回答四边界记录、真实输入安全、ACL 双主体及间接注入 CLEAN/MIXED 回归、精确引用 provenance、critical 阻断，以及 Target 自报 Ready、错误主体、未召回假绿、伪造安全轨迹、接受或错误拒绝恶意块、同 ID 替换正文、重复 Evidence、隔离后继续传播、输出 canary、恶意引用、always-refuse 等负向控制。InMemory 与 SQL Server 补偿路径继续覆盖加密快照、职责分离、幂等、结果不确定冻结和双人结案。严格 150 题基线为 0 Pass / 72 Fail / 78 NotReady，动作准确率 46.4%、动作覆盖率 83.33%、必需来源 micro recall 79.59%、完整 Oracle 覆盖率 0%，门禁按预期失败；独立 v2 critical 套件为 6/6 Pass，动作、引用和 Oracle 覆盖率均为 100%，门禁退出码 0；NuGet 直接与传递依赖未发现已知漏洞。
 - OpenSearch 请求契约已由自动化测试验证：索引映射、搜索管线、批量摄取，以及 BM25/k-NN 两个分支中的租户和 ACL 过滤。

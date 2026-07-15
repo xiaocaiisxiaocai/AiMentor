@@ -15,6 +15,8 @@ public sealed class OperationsTaskService(
     ToolApprovalOptions approvalOptions,
     ToolCompensationOptions compensationOptions,
     ToolExecutionReconciliationOptions executionOptions,
+    IOperationsActionStore actionStore,
+    OperationsActionOptions actionOptions,
     TimeProvider timeProvider) : IOperationsTaskService
 {
     public async Task<OperationsTaskPage> ListAsync(AccessContext access, string? type, string? status,
@@ -23,17 +25,32 @@ public sealed class OperationsTaskService(
         if (limit is < 1 or > 100) throw new ArgumentOutOfRangeException(nameof(limit), "limit 必须在 1 到 100 之间。");
         var now = timeProvider.GetUtcNow();
         var tasks = new List<OperationsTaskSummary>();
+        var actionRows = await actionStore.ListTaskStateAsync(access.TenantId, cancellationToken);
         var approvalRows = await approvals.ListAsync(access, cancellationToken: cancellationToken);
-        tasks.AddRange(approvalRows.Select(item => Summary(item, access, now)));
+        tasks.AddRange(approvalRows.Select(item => Decorate(Summary(item, access, now), actionRows, access, now)));
         var compensationRows = await compensations.ListAsync(access, cancellationToken: cancellationToken);
-        tasks.AddRange(compensationRows.Select(item => Summary(item, access, now)));
+        tasks.AddRange(compensationRows.Select(item => Decorate(Summary(item, access, now), actionRows, access, now)));
         if (access.Groups.Overlaps(executionOptions.ReconcilerGroups))
         {
             var executionRows = await executions.ListOutcomeUnknownAsync(access, 100, cancellationToken);
-            tasks.AddRange(executionRows.Select(item => Summary(item, now)));
+            tasks.AddRange(executionRows.Select(item => Decorate(Summary(item, now), actionRows, access, now)));
         }
         var atlasRows = await atlas.ListAsync(access, 100, cancellationToken);
-        tasks.AddRange(atlasRows.Select(item => Summary(item, now)));
+        tasks.AddRange(atlasRows.Select(item => Decorate(Summary(item, now), actionRows, access, now)));
+        tasks.AddRange(actionRows.Where(item => (item.Status == OperationsActionStatus.AwaitingReview
+                    && item.RequesterSubjectId != access.SubjectId
+                    || item.Status is OperationsActionStatus.Executing or OperationsActionStatus.OutcomeUnknown)
+                && CanReview(item, access))
+            .Select(item => Create(item.Id, "action-review", item.Status.ToString(), item.CreatedAt, item.CreatedAt,
+                item.ExpiresAt, item.Status == OperationsActionStatus.AwaitingReview ? ["confirm", "decline"] : [],
+                now, $"{item.Status}|{item.Version}") with
+            {
+                Version = item.Version,
+                TargetType = item.TargetType,
+                TargetId = item.TargetId,
+                RequestedAction = item.Action,
+                ETag = OperationsActionService.ETag(item)
+            }));
 
         if (!string.IsNullOrWhiteSpace(type))
             tasks = tasks.Where(item => item.Type.Equals(type, StringComparison.OrdinalIgnoreCase)).ToList();
@@ -52,7 +69,9 @@ public sealed class OperationsTaskService(
 
     private OperationsTaskSummary Summary(ToolApprovalRequest item, AccessContext access, DateTimeOffset now)
     {
-        var actions = item.Status == ToolApprovalStatus.Pending && access.Groups.Overlaps(approvalOptions.ApproverGroups)
+        var actions = item.Status == ToolApprovalStatus.Pending
+            && !string.Equals(item.RequesterSubjectId, access.SubjectId, StringComparison.Ordinal)
+            && access.Groups.Overlaps(approvalOptions.ApproverGroups)
             ? new[] { "approve", "reject" } : [];
         return Create(item.Id, "approval", item.Status.ToString(), item.CreatedAt,
             item.DecidedAt ?? item.ConsumedAt ?? item.CreatedAt, item.ExpiresAt, actions, now,
@@ -65,8 +84,6 @@ public sealed class OperationsTaskService(
         {
             ToolCompensationStatus.AwaitingApproval when access.Groups.Overlaps(compensationOptions.ApproverGroups)
                 => ["approve", "reject"],
-            ToolCompensationStatus.OutcomeUnknown when access.Groups.Overlaps(compensationOptions.ReconcilerGroups)
-                => ["probe", "review"],
             _ => []
         };
         return Create(item.Id, "compensation", item.Status.ToString(), item.CreatedAt,
@@ -76,13 +93,47 @@ public sealed class OperationsTaskService(
 
     private static OperationsTaskSummary Summary(OutcomeUnknownToolExecution item, DateTimeOffset now) =>
         Create(item.ExecutionKey, "execution", "OutcomeUnknown", item.CreatedAt, item.UpdatedAt, null,
-            ["probe", "review"], now, $"{item.UpdatedAt:O}");
+            [], now, $"{item.UpdatedAt:O}");
 
     private static OperationsTaskSummary Summary(AtlasIncidentCheckpoint item, DateTimeOffset now)
     {
         var terminal = item.Status is AtlasIncidentStatus.Cancelled or AtlasIncidentStatus.Expired;
         return Create(item.RunId, "incident", item.Status.ToString(), item.CreatedAt, item.UpdatedAt,
-            item.ExpiresAt, terminal ? [] : ["resume", "cancel"], now, $"{item.Status}|{item.Version}");
+            item.ExpiresAt, [], now, $"{item.Status}|{item.Version}");
+    }
+
+    private OperationsTaskSummary Decorate(OperationsTaskSummary task, IReadOnlyList<OperationsActionRecord> actions,
+        AccessContext access, DateTimeOffset now)
+    {
+        var related = actions.Where(item => item.TargetType == task.Type && item.TargetId == task.Id).ToArray();
+        var escalated = related.Any(item => item.Action == "escalate"
+            && item.Status == OperationsActionStatus.Completed);
+        var active = related.Any(item => item.Status is OperationsActionStatus.AwaitingReview
+            or OperationsActionStatus.Executing or OperationsActionStatus.OutcomeUnknown);
+        var sla = task.DueAt is null || task.DueAt > now ? "OnTrack" : escalated ? "Escalated" : "Breached";
+        IReadOnlyList<string> allowed = active ? [] : task.AllowedActions;
+        if (!access.Groups.Overlaps(actionOptions.ReviewerGroups))
+            allowed = allowed.Where(item => item is not ("approve" or "reject")).ToArray();
+        if (!active && sla == "Breached" && access.Groups.Overlaps(actionOptions.EscalatorGroups))
+            allowed = allowed.Concat(["escalate"]).Distinct(StringComparer.Ordinal).ToArray();
+        return task with
+        {
+            Overdue = task.DueAt is not null && task.DueAt <= now,
+            SlaStatus = sla,
+            AllowedActions = allowed
+        };
+    }
+
+    private bool CanReview(OperationsActionRecord action, AccessContext access)
+    {
+        if (action.Action == "escalate") return access.Groups.Overlaps(actionOptions.EscalatorGroups);
+        if (!access.Groups.Overlaps(actionOptions.ReviewerGroups)) return false;
+        return action.TargetType switch
+        {
+            "approval" => access.Groups.Overlaps(approvalOptions.ApproverGroups),
+            "compensation" => access.Groups.Overlaps(compensationOptions.ApproverGroups),
+            _ => false
+        };
     }
 
     private static OperationsTaskSummary Create(string id, string type, string status, DateTimeOffset createdAt,
@@ -91,7 +142,7 @@ public sealed class OperationsTaskService(
     {
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"{type}\u001f{id}\u001f{version}")));
         return new OperationsTaskSummary(id, type, status, createdAt, updatedAt, dueAt,
-            dueAt is not null && dueAt < now, actions, $"\"{hash}\"");
+            dueAt is not null && dueAt <= now, actions, $"\"{hash}\"");
     }
 
     private static int Compare(OperationsTaskSummary left, OperationsTaskSummary right) =>

@@ -22,6 +22,7 @@
       <button data-type="execution">结果不确定 <span id="count-execution">0</span></button>
       <button data-type="compensation">补偿处置 <span id="count-compensation">0</span></button>
       <button data-type="incident">故障运行 <span id="count-incident">0</span></button>
+      <button data-type="action-review">动作复核 <span id="count-action-review">0</span></button>
     </nav>
     <p class="hint">列表仅显示脱敏摘要。工具参数、审批理由和运行载荷不会发送到此页面。</p>
   </aside>
@@ -29,7 +30,7 @@
     <div class="section-head"><div><p class="eyebrow">ACTIVE QUEUE</p><h2 id="queue-title">待处理任务</h2></div><button id="refresh">刷新</button></div>
     <div id="status" role="status" aria-live="polite">正在加载任务</div>
     <div class="table-wrap">
-      <table id="task-list"><thead><tr><th>类型</th><th>状态</th><th>截止时间</th><th>任务标识</th></tr></thead><tbody></tbody></table>
+      <table id="task-list"><thead><tr><th>类型</th><th>状态</th><th>SLA</th><th>截止时间</th><th>任务标识</th></tr></thead><tbody></tbody></table>
     </div>
     <button id="more" hidden>加载更多</button>
   </section>

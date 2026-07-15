@@ -14,16 +14,10 @@ public sealed class SqlServerAtlasIncidentStoreTests
     [Fact]
     public async Task KilledLeaseOwnerIsBusyBeforeExpiryAndAnotherProcessRecoversAfterExpiry()
     {
-        if (!OperatingSystem.IsWindows())
-            throw SkipException.ForSkip("真正的强杀验收当前使用 Windows LocalDB；其他平台需运行外部 SQL 验收脚本。");
         var database = $"AiMentorAtlasKillTest_{Guid.NewGuid():N}";
-        var master = new SqlConnectionStringBuilder
-        {
-            DataSource = @"(localdb)\MSSQLLocalDB", InitialCatalog = "master",
-            IntegratedSecurity = true, Encrypt = false
-        };
+        var (master, externalSqlConfigured) = MasterConnection();
         try { await ExecuteAsync(master.ConnectionString, $"CREATE DATABASE [{database}]"); }
-        catch (SqlException)
+        catch (SqlException) when (!externalSqlConfigured)
         {
             throw SkipException.ForSkip("LocalDB 不可用，强杀验收为 NotReady；没有把未执行记为通过。");
         }
@@ -100,13 +94,9 @@ public sealed class SqlServerAtlasIncidentStoreTests
     [Fact]
     public async Task SqlStoreEncryptsAndRecoversWithLeaseAndOwnerBoundaries()
     {
-        if (!OperatingSystem.IsWindows()) return;
         var database = $"AiMentorAtlasTest_{Guid.NewGuid():N}";
-        var master = new SqlConnectionStringBuilder
-        {
-            DataSource = @"(localdb)\MSSQLLocalDB", InitialCatalog = "master",
-            IntegratedSecurity = true, Encrypt = false
-        };
+        var (master, _) = MasterConnection();
+        // CI 显式提供外部 SQL 时连接或建库失败必须失败，不能退回平台跳过并形成假绿。
         await ExecuteAsync(master.ConnectionString, $"CREATE DATABASE [{database}]");
         var connectionString = new SqlConnectionStringBuilder(master.ConnectionString)
         {
@@ -145,12 +135,15 @@ public sealed class SqlServerAtlasIncidentStoreTests
             Assert.Equal("ATLAS_LEASE_LOST", stale.Code);
             var saved = await second.SaveAndReleaseAsync(checkpoint with
             {
-                Version = 2, Status = AtlasIncidentStatus.DiagnosisReady, UpdatedAt = clock.GetUtcNow()
+                Version = 2,
+                Status = AtlasIncidentStatus.DiagnosisReady,
+                UpdatedAt = clock.GetUtcNow()
             }, recovered.LeaseToken!);
 
             var rotatedCipher = new AesGcmWorkflowStateCipher("v2", new Dictionary<string, byte[]>
             {
-                ["v1"] = key, ["v2"] = RandomNumberGenerator.GetBytes(32)
+                ["v1"] = key,
+                ["v2"] = RandomNumberGenerator.GetBytes(32)
             });
             using var reconstructed = new SqlServerAtlasIncidentStore(options, rotatedCipher, clock);
             var restored = await reconstructed.GetAsync(checkpoint.RunId, owner);
@@ -191,6 +184,26 @@ public sealed class SqlServerAtlasIncidentStoreTests
             return (await store.TryAcquireAsync(runId, owner, 1, TimeSpan.FromSeconds(30)), null);
         }
         catch (AtlasIncidentWorkflowException exception) { return (null, exception.Code); }
+    }
+
+    private static (SqlConnectionStringBuilder Connection, bool ExternalSqlConfigured) MasterConnection()
+    {
+        var external = Environment.GetEnvironmentVariable("AIMENTOR_SQLSERVER_TEST_CONNECTION");
+        if (!string.IsNullOrWhiteSpace(external))
+        {
+            var configured = new SqlConnectionStringBuilder(external) { InitialCatalog = "master" };
+            return (configured, true);
+        }
+        if (!OperatingSystem.IsWindows())
+            throw SkipException.ForSkip(
+                "非 Windows 平台需通过 AIMENTOR_SQLSERVER_TEST_CONNECTION 显式提供测试 SQL Server；未执行不能记为通过。");
+        return (new SqlConnectionStringBuilder
+        {
+            DataSource = @"(localdb)\MSSQLLocalDB",
+            InitialCatalog = "master",
+            IntegratedSecurity = true,
+            Encrypt = false
+        }, false);
     }
 
     private static AtlasIncidentCheckpoint CreateCheckpoint(string node, AccessContext owner, DateTimeOffset now)

@@ -1,5 +1,6 @@
 param(
-    [string]$ApiBase = $env:AIMENTOR_OIDC_API_BASE
+    [string]$ApiBase = $env:AIMENTOR_OIDC_API_BASE,
+    [ValidateRange(1, 300)][int]$HttpTimeoutSeconds = 30
 )
 
 $ErrorActionPreference = 'Stop'
@@ -23,6 +24,7 @@ function Invoke-Stable([string]$Method, [string]$Uri, [string]$Token, [string]$B
             Method = $Method
             Uri = $Uri
             Headers = @{ Authorization = "Bearer $Token" }
+            TimeoutSec = $HttpTimeoutSeconds
         }
         if ($null -ne $Body) {
             $parameters.ContentType = 'application/json'
@@ -52,8 +54,17 @@ if ($created.Status -ne 201) {
     Write-Output "OIDC_ACCEPTANCE_FAILED code=RUN_CREATE_FAILED status=$($created.Status) tokenHash=$(Get-TokenHash $tokenA)"
     exit 1
 }
-$runId = ($created.Content | ConvertFrom-Json).runId
+$run = $created.Content | ConvertFrom-Json
+$runId = $run.runId
+$version = [long]$run.version
 $crossUser = Invoke-Stable 'GET' "$base/api/v1/incidents/atlasid/runs/$runId" $tokenB
+$cleanupBody = @{ expectedVersion = $version } | ConvertTo-Json -Compress
+$cleanup = Invoke-Stable 'POST' "$base/api/v1/incidents/atlasid/runs/$runId/cancel" $tokenA $cleanupBody
+if ($cleanup.Status -ne 200) {
+    # 验收不能在目标环境遗留活动运行；无法清理时保持 NotReady，交由运营人员确认状态。
+    Write-Output "OIDC_ACCEPTANCE_NOT_READY code=OIDC_TEST_RUN_CLEANUP_FAILED status=$($cleanup.Status)"
+    exit 2
+}
 if ($crossUser.Status -ne 403) {
     Write-Output "OIDC_ACCEPTANCE_FAILED code=CROSS_USER_NOT_FORBIDDEN status=$($crossUser.Status) tokenHash=$(Get-TokenHash $tokenB)"
     exit 1

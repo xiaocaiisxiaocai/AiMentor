@@ -1790,7 +1790,7 @@ v2 使用独立 JSONL 和 suite，禁止 `expected_behavior` 与旧 `evidence`�
 - 必需/禁止引用、无引用约束，以及必需轨迹子序列和禁止轨迹事件。
 - `fixture_id`。非空时必须由运行时 Observation 证明已准备且标识匹配；题目 JSON 无权自证 Fixture 就绪。缺 Fixture 为 `NotReady`，标识不匹配或验证失败为 `Fail`。
 
-当前 `evaluation-critical-v2.jsonl` 纳入 6 条确定性用例：`N-004` 必须产生 `Refused + Refuse/SECRET_REQUEST`，`SEC-001` 必须产生 `Refused + Refuse/PROMPT_INJECTION`；`ACL2-001-ALLOW/DENY` 以相同问题、真实受限文档 `BK-POL-009 v1.2` 和两个独立主体验证文档级允许与隐藏；`RET2-001-CLEAN/MIXED` 使用隔离 corpus 验证正常回答以及正常、恶意分块同时召回后的选择性隔离。Registry 让同一个被测 Target 按主体路由隔离 corpus，并在知识仓储、检索内容安全、重排和回答生成四个边界核验带重复计数的完整 Evidence 指纹；语料完整正文 SHA-256 被定义锁定，恶意 Chunk 必须绑定 `RETRIEVED_PROMPT_INJECTION` 且不得进入下游。当前问答 Target 不含工具与网络外发边界，因此工具零调用和网络零外发继续保持未验证。其他 critical 用例在真实资源、工具参数、PII 载荷或跨用户状态 Fixture 完成前保持 `NotReady`。
+当前 `evaluation-critical-v2.jsonl` 纳入 16 条确定性用例：除输入安全、ACL 双主体和间接注入 CLEAN/MIXED 外，已增加跨用户记忆、删除后无旧缓存、工具精确参数/替换/重放/过期，以及普通 PII Transform、控制组、凭证和身份证失败关闭。Registry 在知识仓储、检索内容安全、重排、回答、记忆、工具和 PII 传播边界核验可信观察；语料与 Fixture 摘要被锁定，Target 自报状态不受信任。当前没有通用网络外发边界，因此网络零外发继续保持未验证。
 
 ### 24.3 检索指标
 
@@ -2424,7 +2424,7 @@ V1 的最终标准不是“功能都能演示”，而是系统在真实权限�
 16. 已在 InMemory 和 SQL Server 两种模式贯通首个真实补偿闭环。`memory.correct` 在正向副作用前捕获当前用户记忆的旧值、正向后预期版本和原到期时间，使用工作流密钥与 `compensationId + forwardToolName` 认证上下文加密；正向成功后才发布补偿标识。反向操作必须重新申请审批，由不同 `tool-approvers` 在 15 分钟内裁决，并使用独立 `Idempotency-Key`。恢复仍经过所有权、内容安全和乐观版本校验；并发新版本不会被覆盖。相同反向键只回放一次，反向调用后的异常或写回中断冻结为 `OutcomeUnknown`。
 17. `AiMentorToolCompensations` 已持久化准备令牌摘要、密钥版本、快照密文、审批状态、决定理由摘要、反向执行键和短租约。审批与反向执行争抢使用串行化事务；完成写回必须匹配 `Executing + ExecutionLeaseToken + 未过期`，过期租约只冻结为 `OutcomeUnknown`。LocalDB 已真实执行 001–007：实例 A 使用 v1 加密快照，实例 B 使用 v2 审批和反向执行并在线重加密；移除旧状态后相同反向键仍只回放一次。阻塞反向工具跨过租约后，第二实例只能冻结，原实例完成写回被拒绝，后续重试也被禁止。反向租约必须长于工具超时，错误配置在进入工具前失败关闭。
 18. 补偿精确强杀窗口已在真实 SQL Server 2022 容器中通过。仅 `Testing` 环境可启用的执行屏障现在同时覆盖正向和反向执行：补偿事务提交 `Executing + ExecutionLeaseToken` 后，在解密快照和调用 `memory.correct.restore` 前发布信号。验收脚本在信号出现后强杀 API，确认原记忆仍保持正向值 `after`；租约过期后，替代实例通过 `GET /api/v1/tool-compensations?status=OutcomeUnknown` 看到冻结记录，SQL 状态为 `OutcomeUnknown`，相同反向幂等键重试返回 409。迁移 007 也显式开启 Linux `sqlcmd` 创建筛选索引所需的 `QUOTED_IDENTIFIER`。真实脚本还复验了正向强杀、双人复核并发单胜者和滚动 `Reconciled` 回放。
-19. 评测体系已改为严格 Loader、主体配置、Target、Scorer 和 Gate。未知字段、非法动作、重复 CaseId、删减题集、类别分布变化和安全类别风险降级均在执行前失败；动作、引用、输出 Oracle 和执行 Fixture 分别使用 `Pass / Fail / NotReady / NotApplicable`。当前 150 题严格基线为 0 Pass / 72 Fail / 78 NotReady，可判定动作准确率 46.4%、动作覆盖率 83.33%、必需来源 micro recall 79.59%、完整 Oracle 覆盖率 0%，28 条 critical 全部阻断，旧版 90% 假绿口径作废。v2 已独立锁定输入安全两题、`BK-POL-009` ACL 双主体配对和间接注入 CLEAN/MIXED 配对，实测 6 Pass / 0 Fail / 0 NotReady，动作、引用和 Oracle 覆盖率均为 100%、门禁退出码 0，且不改写 v1 题集与基线；其他 critical 题在真实 Fixture 完成前不迁移。
+19. 评测体系已改为严格 Loader、主体配置、Target、Scorer 和 Gate。未知字段、非法动作、重复 CaseId、删减题集、类别分布变化和安全类别风险降级均在执行前失败；动作、引用、输出 Oracle 和执行 Fixture 分别使用 `Pass / Fail / NotReady / NotApplicable`。当前 150 题严格基线为 0 Pass / 72 Fail / 78 NotReady，可判定动作准确率 46.4%、动作覆盖率 83.33%、必需来源 micro recall 79.59%、完整 Oracle 覆盖率 0%，28 条 critical 全部阻断，旧版 90% 假绿口径作废。v2 当前实测 16 Pass / 0 Fail / 0 NotReady，覆盖输入安全、ACL、间接注入、记忆、工具和 PII 传播，动作、引用和 Oracle 覆盖率均为 100%、门禁退出码 0，且不改写 v1 题集与基线。
 
 ```mermaid
 flowchart LR
@@ -2471,4 +2471,4 @@ flowchart LR
     REVIEW -->|"未恢复"| REAPPROVE["清旧凭据 / 重新申请审批"]
 ```
 
-短租约自动续租、持久化主动取消、补偿契约、能力分类、InMemory/SQL 加密补偿闭环，以及正向和补偿两个 `Executing` 精确强杀验收已经完成。反向 `OutcomeUnknown` 的第一条对账纵切也已落地：`memory.correct.restore` 在服务端解密快照，以原所有者身份只读核验版本、旧值和期限；证据只返回状态与稳定代码，并在五分钟内由两名不同 `tool-reconcilers` 原子复核。确认已恢复则结案，确认未恢复则清除旧审批与执行键并要求重新审批，目标漂移则保持冻结。取消是协作式终止，不承诺回滚已经提交的外部副作用；没有完整恢复材料的工具仍由幂等、专属探测与人工对账覆盖。下一阶段增加独立人工任务队列、超时升级和多实例补偿审批/执行争抢压力测试；`memory.delete` 继续人工对账。数据库迁移采用 `001` 至 `008` 顺序发布，生产环境关闭运行时建表。
+短租约自动续租、持久化主动取消、补偿契约、能力分类、InMemory/SQL 加密补偿闭环，以及正向和补偿两个 `Executing` 精确强杀验收已经完成。反向 `OutcomeUnknown` 的第一条对账纵切也已落地：`memory.correct.restore` 在服务端解密快照，以原所有者身份只读核验版本、旧值和期限；证据只返回状态与稳定代码，并在五分钟内由两名不同 `tool-reconcilers` 原子复核。独立运营任务队列现在使用持久化“提出—第二人复核—执行/冻结”状态机，SLA 违约升级、幂等、并发单胜者和理由摘要均由服务端约束；Linux SQL Server 容器验收还覆盖多实例补偿审批/执行争抢。取消是协作式终止，不承诺回滚已经提交的外部副作用；没有完整恢复材料的工具仍由幂等、专属探测与人工对账覆盖。数据库迁移采用 `001` 至 `010` 顺序发布，生产环境关闭运行时建表。

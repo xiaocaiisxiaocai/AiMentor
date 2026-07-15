@@ -27,7 +27,8 @@ public sealed class OperationsTaskServiceTests
             "run-secret", now, now.AddMinutes(1));
         var service = new OperationsTaskService(new ApprovalStub([approval]), new CompensationStub([compensation]),
             new ExecutionStub([execution]), atlas, new ToolApprovalOptions(), new ToolCompensationOptions(),
-            new ToolExecutionReconciliationOptions(), clock);
+            new ToolExecutionReconciliationOptions(), new InMemoryOperationsActionStore(),
+            new OperationsActionOptions(), clock);
 
         var first = await service.ListAsync(access, null, null, null, 2);
         var second = await service.ListAsync(access, null, null, first.NextCursor, 2);
@@ -58,6 +59,13 @@ public sealed class OperationsTaskServiceTests
         Assert.Contains("409", script, StringComparison.Ordinal);
         Assert.Contains("401", script, StringComparison.Ordinal);
         Assert.Contains("403", script, StringComparison.Ordinal);
+        Assert.Contains("Idempotency-Key", script, StringComparison.Ordinal);
+        Assert.Contains("/operations/tasks/", script, StringComparison.Ordinal);
+        Assert.Contains("/operations/actions/", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("/tool-approvals/", script, StringComparison.Ordinal);
+        Assert.Contains("syncDetail()", script, StringComparison.Ordinal);
+        Assert.Contains("clearDetail()", script, StringComparison.Ordinal);
+        Assert.Contains("state.items=[]", script, StringComparison.Ordinal);
     }
 
     private static AtlasIncidentCheckpoint Checkpoint(string id, AccessContext access, DateTimeOffset expires) =>

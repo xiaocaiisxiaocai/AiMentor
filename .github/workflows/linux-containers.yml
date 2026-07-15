@@ -1,0 +1,123 @@
+name: Linux container acceptance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-containers-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  linux-tests:
+    name: Linux build and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.300"
+      - name: Restore
+        run: dotnet restore AiMentor.slnx
+      - name: Build
+        run: dotnet build AiMentor.slnx --configuration Release --no-restore
+      - name: Test
+        run: dotnet test AiMentor.slnx --configuration Release --no-build --logger "console;verbosity=normal"
+      - name: Verify critical quality gate
+        run: >-
+          dotnet run --project src/AiMentor.Evaluation/AiMentor.Evaluation.csproj
+          --configuration Release --no-build --
+          AI-Agent-V1合成数据包/evaluation/evaluation-critical-v2.jsonl
+          AI-Agent-V1合成数据包/knowledge
+          AI-Agent-V1合成数据包/evaluation/evaluation-suite-v2.json
+      - name: Audit vulnerable dependencies
+        shell: pwsh
+        run: |
+          $auditJson = dotnet package list --project AiMentor.slnx --vulnerable --include-transitive --format json --no-restore | Out-String
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $audit = $auditJson | ConvertFrom-Json
+          $vulnerablePackages = @(
+            foreach ($project in @($audit.projects)) {
+              foreach ($framework in @($project.frameworks)) {
+                foreach ($package in @($framework.topLevelPackages) + @($framework.transitivePackages)) {
+                  if ($null -ne $package -and $null -ne $package.vulnerabilities -and
+                      @($package.vulnerabilities).Count -gt 0) { $package }
+                }
+              }
+            }
+          )
+          if ($vulnerablePackages.Count -gt 0) {
+            $vulnerablePackages | ConvertTo-Json -Depth 8
+            throw "VULNERABLE_DEPENDENCIES_FOUND:$($vulnerablePackages.Count)"
+          }
+          Write-Output 'VULNERABLE_DEPENDENCIES=0'
+
+  sql-atlas-operations:
+    name: SQL Atlas and operations queue
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: ${{ format('AiMentor_CI_{0}!9z', github.run_id) }}
+        ports:
+          - 1433/tcp
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$MSSQL_SA_PASSWORD\" -C -b -Q \"SELECT 1\" || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 18
+          --health-start-period 30s
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.300"
+      - name: Restore
+        run: dotnet restore AiMentor.slnx
+      - name: Build Release
+        run: dotnet build AiMentor.slnx --configuration Release --no-restore
+      - name: Verify Atlas SQL leases and encryption
+        shell: pwsh
+        env:
+          AIMENTOR_SQLSERVER_SA_PASSWORD: ${{ format('AiMentor_CI_{0}!9z', github.run_id) }}
+          SQL_HOST_PORT: ${{ job.services.sqlserver.ports[1433] }}
+        run: |
+          $env:AIMENTOR_SQLSERVER_TEST_CONNECTION = "Server=127.0.0.1,$env:SQL_HOST_PORT;Initial Catalog=master;User ID=sa;Password=$env:AIMENTOR_SQLSERVER_SA_PASSWORD;Encrypt=True;TrustServerCertificate=True"
+          dotnet test tests/AiMentor.Tests/AiMentor.Tests.csproj --configuration Release --no-build --filter "FullyQualifiedName~SqlServerAtlasIncidentStoreTests|FullyQualifiedName~SqlServerOperationsActionStoreTests" --logger "console;verbosity=normal"
+      - name: Verify distributed reconciliation and redacted operations queue
+        shell: pwsh
+        env:
+          AIMENTOR_SQLSERVER_SA_PASSWORD: ${{ format('AiMentor_CI_{0}!9z', github.run_id) }}
+          SQL_CONTAINER: ${{ job.services.sqlserver.id }}
+          SQL_HOST_PORT: ${{ job.services.sqlserver.ports[1433] }}
+        run: ./scripts/Test-DistributedReconciliation.ps1 -SqlContainer $env:SQL_CONTAINER -SqlHostPort ([int]$env:SQL_HOST_PORT) -Configuration Release
+
+  opensearch-alias:
+    name: OpenSearch alias lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Prepare OpenSearch host limit
+        run: sudo sysctl -w vm.max_map_count=262144
+      - name: Verify real OpenSearch 3.5 alias publish and rollback
+        shell: pwsh
+        run: ./scripts/Test-OpenSearchContainerAcceptance.ps1 -PullImage -StartupTimeoutSeconds 300 -PullTimeoutSeconds 600

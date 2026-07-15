@@ -1,24 +1,35 @@
 [CmdletBinding()]
 param(
     [string]$SqlContainer = 'aimentor-sqlserver',
-    [int]$SqlHostPort = 1433,
+    [ValidateRange(0, 65535)][int]$SqlHostPort = 0,
     [int]$BasePort = 5510,
+    [ValidateSet('Debug', 'Release')][string]$Configuration = 'Debug',
     [switch]$UseEphemeralSqlServer
 )
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Net.Http
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
-$apiDll = Join-Path $repositoryRoot 'src\AiMentor.Api\bin\Debug\net10.0\AiMentor.Api.dll'
+$apiDll = [IO.Path]::Combine($repositoryRoot, 'src', 'AiMentor.Api', 'bin', $Configuration, 'net10.0',
+    'AiMentor.Api.dll')
 $ownsSqlContainer = $false
 if ($UseEphemeralSqlServer) {
     $SqlContainer = 'aimentor-sqlserver-distributed-' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
     $password = 'Aa1!' + [Guid]::NewGuid().ToString('N')
     $env:AIMENTOR_SQLSERVER_SA_PASSWORD = $password
+    $portBinding = if ($SqlHostPort -eq 0) { '127.0.0.1::1433' } else { "127.0.0.1:${SqlHostPort}:1433" }
     docker run -d --name $SqlContainer -e ACCEPT_EULA=Y -e "MSSQL_SA_PASSWORD=$password" `
-        -p "${SqlHostPort}:1433" mcr.microsoft.com/mssql/server:2022-latest | Out-Null
+        -p $portBinding mcr.microsoft.com/mssql/server:2022-latest | Out-Null
     if ($LASTEXITCODE -ne 0) { throw '无法启动临时 SQL Server 容器。' }
     $ownsSqlContainer = $true
+    if ($SqlHostPort -eq 0) {
+        $publishedPort = docker port $SqlContainer 1433/tcp
+        if ($LASTEXITCODE -ne 0 -or $publishedPort -notmatch ':(\d+)\s*$') {
+            docker rm -f $SqlContainer 2>$null | Out-Null
+            throw '无法解析临时 SQL Server 的动态宿主端口。'
+        }
+        $SqlHostPort = [int]$Matches[1]
+    }
     $ready = $false
     for ($attempt = 0; $attempt -lt 70; $attempt++) {
         try {
@@ -33,6 +44,7 @@ if ($UseEphemeralSqlServer) {
         throw '临时 SQL Server 容器未就绪。'
     }
 } else {
+    if ($SqlHostPort -eq 0) { $SqlHostPort = 1433 }
     $password = $env:AIMENTOR_SQLSERVER_SA_PASSWORD
     if ([string]::IsNullOrWhiteSpace($password)) {
         throw '请通过 AIMENTOR_SQLSERVER_SA_PASSWORD 提供正在运行的测试 SQL Server sa 密码。'
@@ -62,28 +74,30 @@ function Invoke-SqlScalar([string]$Query, [string]$DatabaseName = $database) {
     return (($output | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join '').Trim()
 }
 
+function ConvertTo-SqlConnectionValue([string]$Value) {
+    # 双引号包裹并把内部双引号加倍，遵循 SqlClient 连接字符串语法且不依赖平台专属程序集。
+    return '"' + $Value.Replace('"', '""') + '"'
+}
+
 function Start-Api([string]$Name, [int]$Port, [string]$SubjectId, [string[]]$Groups,
     [string]$Environment = 'Development', [string]$BarrierSignalPath = '',
-    [string]$BarrierReleasePath = '') {
+    [string]$BarrierReleasePath = '', [string]$MemoryStorePath = '') {
     $env:ASPNETCORE_ENVIRONMENT = $Environment
     $env:Workflow__Provider = 'SqlServer'
     $env:Workflow__InitializeSchema = 'false'
-    # 使用构造器处理密码中的分号、引号等保留字符，避免测试脚本产生错误连接字符串。
-    $connection = [System.Data.SqlClient.SqlConnectionStringBuilder]::new()
-    $connection['Data Source'] = "127.0.0.1,$SqlHostPort"
-    $connection['Initial Catalog'] = $database
-    $connection['User ID'] = 'sa'
-    $connection['Password'] = $password
-    $connection['Encrypt'] = $true
-    $connection['TrustServerCertificate'] = $true
-    $env:ConnectionStrings__WorkflowSqlServer = $connection.ConnectionString
+    $quotedDatabase = ConvertTo-SqlConnectionValue $database
+    $quotedPassword = ConvertTo-SqlConnectionValue $password
+    $env:ConnectionStrings__WorkflowSqlServer =
+        "Server=127.0.0.1,$SqlHostPort;Initial Catalog=$quotedDatabase;User ID=sa;" +
+        "Password=$quotedPassword;Encrypt=True;TrustServerCertificate=True"
     $env:AIMENTOR_MEMORY_ENCRYPTION_KEY = $script:masterKey
     $env:Workflow__Encryption__ActiveKeyVersion = 'v1'
     $env:Workflow__Encryption__Keys__v1 = $script:masterKey
     $env:Authentication__Development__TenantId = 'tenant-distributed'
     $env:Authentication__Development__SubjectId = $SubjectId
-    Remove-Item Env:Authentication__Development__Groups__0 -ErrorAction SilentlyContinue
-    Remove-Item Env:Authentication__Development__Groups__1 -ErrorAction SilentlyContinue
+    # 清除宿主可能预置的任意组索引，确保每个验收主体只拥有本次显式声明的权限。
+    Get-ChildItem Env: | Where-Object Name -Like 'Authentication__Development__Groups__*' |
+        Remove-Item -ErrorAction SilentlyContinue
     for ($index = 0; $index -lt $Groups.Count; $index++) {
         Set-Item "Env:Authentication__Development__Groups__$index" $Groups[$index]
     }
@@ -95,10 +109,17 @@ function Start-Api([string]$Name, [int]$Port, [string]$SubjectId, [string[]]$Gro
     }
     $instanceDirectory = Join-Path $temporaryRoot $Name
     New-Item -ItemType Directory -Path $instanceDirectory -Force | Out-Null
-    $env:Memory__StorePath = Join-Path $instanceDirectory 'memory.json'
-    $process = Start-Process dotnet -ArgumentList @($apiDll, '--urls', "http://127.0.0.1:$Port") `
-        -PassThru -WindowStyle Hidden -RedirectStandardOutput (Join-Path $instanceDirectory 'stdout.log') `
-        -RedirectStandardError (Join-Path $instanceDirectory 'stderr.log')
+    $env:Memory__StorePath = if ([string]::IsNullOrWhiteSpace($MemoryStorePath)) {
+        Join-Path $instanceDirectory 'memory.json'
+    } else { $MemoryStorePath }
+    $startParameters = @{
+        FilePath = 'dotnet'; ArgumentList = @($apiDll, '--urls', "http://127.0.0.1:$Port"); PassThru = $true
+        RedirectStandardOutput = Join-Path $instanceDirectory 'stdout.log'
+        RedirectStandardError = Join-Path $instanceDirectory 'stderr.log'
+    }
+    # WindowStyle 只存在于 Windows；Linux pwsh 传入该参数会在 API 尚未启动前失败。
+    if ($PSVersionTable.PSEdition -eq 'Desktop' -or $IsWindows) { $startParameters.WindowStyle = 'Hidden' }
+    $process = Start-Process @startParameters
     $processes.Add($process)
     for ($attempt = 0; $attempt -lt 40; $attempt++) {
         try {
@@ -145,7 +166,7 @@ function Assert-Equal($Expected, $Actual, [string]$Message) {
 
 try {
     New-Item -ItemType Directory -Path $temporaryRoot -Force | Out-Null
-    dotnet build (Join-Path $repositoryRoot 'AiMentor.slnx') --no-restore | Out-Null
+    dotnet build (Join-Path $repositoryRoot 'AiMentor.slnx') --configuration $Configuration --no-restore | Out-Null
     if ($LASTEXITCODE -ne 0) { throw '构建失败。' }
     $keyBytes = New-Object byte[] 32
     $random = [Security.Cryptography.RandomNumberGenerator]::Create()
@@ -153,11 +174,14 @@ try {
     $script:masterKey = [Convert]::ToBase64String($keyBytes)
 
     Invoke-Sql "CREATE DATABASE [$database];"
-    docker cp (Join-Path $repositoryRoot 'deploy\sql\.') "${SqlContainer}:$remoteMigrations" | Out-Null
+    $migrationRoot = [IO.Path]::Combine($repositoryRoot, 'deploy', 'sql')
+    docker cp $migrationRoot "${SqlContainer}:$remoteMigrations" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw '无法把 SQL 迁移复制到测试容器。' }
     foreach ($migration in @('001_workflow.sql', '002_workflow_key_version.sql',
             '003_tool_execution_ledger.sql', '004_tool_execution_reconciliation.sql',
             '005_tool_reconciliation_reviews.sql', '006_agent_run_cancellation.sql',
-            '007_tool_compensations.sql', '008_tool_compensation_reconciliation.sql')) {
+            '007_tool_compensations.sql', '008_tool_compensation_reconciliation.sql',
+            '009_atlas_incident_runs.sql', '010_operations_actions.sql')) {
         docker exec -e "SQLCMDPASSWORD=$password" $SqlContainer /opt/mssql-tools18/bin/sqlcmd `
             -S localhost -U sa -C -b -d $database -i "$remoteMigrations/$migration" | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "迁移失败：$migration" }
@@ -168,6 +192,22 @@ try {
     $reviewerA = Start-Api 'reviewer-a' ($BasePort + 2) 'reviewer-a' @('tool-reconcilers')
     $reviewerB = Start-Api 'reviewer-b' ($BasePort + 3) 'reviewer-b' @('tool-reconcilers')
     $reviewerC = Start-Api 'reviewer-c' ($BasePort + 4) 'reviewer-c' @('tool-reconcilers')
+
+    # Atlas 检查点必须进入共享 SQL；运营队列只返回任务摘要，不得泄露安全输入中的节点名。
+    $atlasPrivateNode = 'atlas-private-node-distributed'
+    $atlasRun = Send-Request 'POST' "http://127.0.0.1:$BasePort/api/v1/incidents/atlasid/runs" @{
+        region = 'cn'; node = $atlasPrivateNode
+    }
+    Assert-Equal 201 $atlasRun.StatusCode 'Atlas SQL 运行创建失败'
+    Assert-Equal 'RequiredInputs' $atlasRun.Json.status 'Atlas SQL 初始状态异常'
+    $atlasOperations = Send-Request 'GET' `
+        "http://127.0.0.1:$BasePort/api/v1/operations/tasks?type=incident&limit=10"
+    Assert-Equal 200 $atlasOperations.StatusCode '运营任务队列查询失败'
+    $atlasTask = @($atlasOperations.Json.items | Where-Object { $_.id -eq $atlasRun.Json.runId })
+    Assert-Equal 1 $atlasTask.Count '运营任务队列没有聚合 Atlas SQL 运行'
+    if (([string]$atlasOperations.Content).IndexOf($atlasPrivateNode, [StringComparison]::Ordinal) -ge 0) {
+        throw '运营任务队列泄露 Atlas 安全输入。'
+    }
 
     # 仅 Testing 实例启用执行屏障，在 SQL 已持久化 Executing 后、真实工具调用前暴露确定窗口。
     $barrierDirectory = Join-Path $temporaryRoot 'executing-kill-barrier'
@@ -321,6 +361,98 @@ try {
         "SELECT Status FROM dbo.AiMentorToolCompensations WHERE Id='$compensationId';") `
         '补偿账本没有持久化 OutcomeUnknown'
 
+    # 新建独立补偿，让两个审批实例和两个执行实例同时争抢；SQL 状态机必须各自产生唯一胜者。
+    $stressCorrectArguments = @{
+        memoryId = $memory.Json.id; expectedVersion = $memoryAfterKill[0].version; value = 'stress-after'
+    }
+    $stressForwardApproval = Send-Request 'POST' "http://127.0.0.1:$BasePort/api/v1/tool-approvals" @{
+        toolName = 'memory.correct'; arguments = $stressCorrectArguments; justification = '并发补偿单胜者验收'
+    }
+    Assert-Equal 202 $stressForwardApproval.StatusCode '并发补偿正向审批申请失败'
+    $stressForwardDecision = Send-Request 'POST' `
+        "http://127.0.0.1:$($BasePort + 1)/api/v1/tool-approvals/$($stressForwardApproval.Json.id)/decision" @{
+        approved = $true; reason = '批准并发补偿正向操作'
+    }
+    Assert-Equal 200 $stressForwardDecision.StatusCode '并发补偿正向审批失败'
+    $stressForward = Send-Request 'POST' "http://127.0.0.1:$BasePort/api/v1/tools/memory.correct/execute" @{
+        arguments = $stressCorrectArguments; approvalId = $stressForwardApproval.Json.id
+    } @{ 'Idempotency-Key' = 'distributed-compensation-stress-forward-001' }
+    Assert-Equal 'Completed' $stressForward.Json.status '并发补偿正向操作未完成'
+    $stressCompensationId = $stressForward.Json.compensationId
+    if ([string]::IsNullOrWhiteSpace($stressCompensationId)) { throw '并发补偿没有生成补偿标识。' }
+    $stressApproval = Send-Request 'POST' `
+        "http://127.0.0.1:$BasePort/api/v1/tool-compensations/$stressCompensationId/approval" @{
+        justification = '并发审批与执行单胜者验收'
+    }
+    Assert-Equal 202 $stressApproval.StatusCode '并发补偿审批申请失败'
+
+    $approverB = Start-Api 'approver-b' ($BasePort + 7) 'approver-b' @('tool-approvers')
+    $stressDecisionBody = @{
+        approvalId = $stressApproval.Json.approvalId; approved = $true; reason = '并发独立批准反向操作'
+    } | ConvertTo-Json -Depth 4 -Compress
+    $stressDecisionRequestA = [System.Net.Http.HttpRequestMessage]::new(
+        [System.Net.Http.HttpMethod]::Post,
+        "http://127.0.0.1:$($BasePort + 1)/api/v1/tool-compensations/$stressCompensationId/decision")
+    $stressDecisionRequestB = [System.Net.Http.HttpRequestMessage]::new(
+        [System.Net.Http.HttpMethod]::Post,
+        "http://127.0.0.1:$($BasePort + 7)/api/v1/tool-compensations/$stressCompensationId/decision")
+    $stressDecisionRequestA.Content = [System.Net.Http.StringContent]::new(
+        $stressDecisionBody, [Text.Encoding]::UTF8, 'application/json')
+    $stressDecisionRequestB.Content = [System.Net.Http.StringContent]::new(
+        $stressDecisionBody, [Text.Encoding]::UTF8, 'application/json')
+    $stressDecisionTaskA = $client.SendAsync($stressDecisionRequestA)
+    $stressDecisionTaskB = $client.SendAsync($stressDecisionRequestB)
+    [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stressDecisionTaskA, $stressDecisionTaskB))
+    $stressDecisionResponses = @($stressDecisionTaskA.Result, $stressDecisionTaskB.Result)
+    $stressDecisionWinners = @($stressDecisionResponses | Where-Object {
+        $_.IsSuccessStatusCode -and
+        ($_.Content.ReadAsStringAsync().Result | ConvertFrom-Json).status -eq 'Approved'
+    })
+    Assert-Equal 1 $stressDecisionWinners.Count '并发补偿审批没有产生唯一胜者'
+    Assert-Equal 1 @($stressDecisionResponses | Where-Object { [int]$_.StatusCode -eq 409 }).Count `
+        '并发补偿审批失败方没有稳定返回冲突'
+    $stressDecisionRequestA.Dispose(); $stressDecisionRequestB.Dispose()
+
+    $requesterMemoryPath = Join-Path (Join-Path $temporaryRoot 'requester') 'memory.json'
+    $stressRequester = Start-Api -Name 'compensation-stress-requester' -Port ($BasePort + 8) `
+        -SubjectId 'requester-a' -Groups @('users') -MemoryStorePath $requesterMemoryPath
+    $stressExecutionBody = @{ approvalId = $stressApproval.Json.approvalId } |
+        ConvertTo-Json -Depth 4 -Compress
+    $stressExecutionRequestA = [System.Net.Http.HttpRequestMessage]::new(
+        [System.Net.Http.HttpMethod]::Post,
+        "http://127.0.0.1:$BasePort/api/v1/tool-compensations/$stressCompensationId/execute")
+    $stressExecutionRequestB = [System.Net.Http.HttpRequestMessage]::new(
+        [System.Net.Http.HttpMethod]::Post,
+        "http://127.0.0.1:$($BasePort + 8)/api/v1/tool-compensations/$stressCompensationId/execute")
+    $null = $stressExecutionRequestA.Headers.TryAddWithoutValidation(
+        'Idempotency-Key', 'distributed-compensation-stress-reverse-a')
+    $null = $stressExecutionRequestB.Headers.TryAddWithoutValidation(
+        'Idempotency-Key', 'distributed-compensation-stress-reverse-b')
+    $stressExecutionRequestA.Content = [System.Net.Http.StringContent]::new(
+        $stressExecutionBody, [Text.Encoding]::UTF8, 'application/json')
+    $stressExecutionRequestB.Content = [System.Net.Http.StringContent]::new(
+        $stressExecutionBody, [Text.Encoding]::UTF8, 'application/json')
+    $stressExecutionTaskA = $client.SendAsync($stressExecutionRequestA)
+    $stressExecutionTaskB = $client.SendAsync($stressExecutionRequestB)
+    [Threading.Tasks.Task]::WaitAll([Threading.Tasks.Task[]]@($stressExecutionTaskA, $stressExecutionTaskB))
+    $stressExecutionResponses = @($stressExecutionTaskA.Result, $stressExecutionTaskB.Result)
+    $stressExecutionWinners = @($stressExecutionResponses | Where-Object {
+        $_.IsSuccessStatusCode -and
+        ($result = $_.Content.ReadAsStringAsync().Result | ConvertFrom-Json).status -eq 'Completed' -and
+        -not $result.idempotentReplay
+    })
+    Assert-Equal 1 $stressExecutionWinners.Count '并发补偿执行没有产生唯一非重放胜者'
+    Assert-Equal 1 @($stressExecutionResponses | Where-Object { [int]$_.StatusCode -eq 409 }).Count `
+        '并发补偿执行失败方没有稳定返回冲突'
+    Assert-Equal '6' (Invoke-SqlScalar `
+        "SELECT Status FROM dbo.AiMentorToolCompensations WHERE Id='$stressCompensationId';") `
+        '并发补偿执行没有持久化 Completed'
+    $stressMemoryResponse = Send-Request 'GET' "http://127.0.0.1:$BasePort/api/v1/memories"
+    $stressMemory = @($stressMemoryResponse.Json | Where-Object { $_.id -eq $memory.Json.id })
+    Assert-Equal 1 $stressMemory.Count '并发补偿后目标记忆不可见'
+    Assert-Equal 'after' $stressMemory[0].value '并发补偿没有精确恢复正向操作前的值'
+    $stressExecutionRequestA.Dispose(); $stressExecutionRequestB.Dispose()
+
     $arguments = @{ memoryId = 'missing-memory-for-distributed-test'; expectedVersion = 1 }
     $approval = Send-Request 'POST' "http://127.0.0.1:$BasePort/api/v1/tool-approvals" @{
         toolName = 'memory.delete'; arguments = $arguments; justification = '分布式故障验收'
@@ -374,22 +506,41 @@ try {
     } @{ 'Idempotency-Key' = 'distributed-reconciliation-001' }
     Assert-Equal 200 $replay.StatusCode '滚动替代实例未能读取裁决终态'
     Assert-Equal 'Reconciled' $replay.Json.status '裁决终态发生了重复工具调用'
+    $atlasRecovered = Send-Request 'GET' `
+        "http://127.0.0.1:$BasePort/api/v1/incidents/atlasid/runs/$($atlasRun.Json.runId)"
+    Assert-Equal 200 $atlasRecovered.StatusCode '滚动替代实例未能读取 Atlas SQL 检查点'
+    Assert-Equal $atlasPrivateNode $atlasRecovered.Json.safeInput.node 'Atlas SQL 检查点内容未持久恢复'
+    $atlasOperationsRecovered = Send-Request 'GET' `
+        "http://127.0.0.1:$BasePort/api/v1/operations/tasks?type=incident&limit=10"
+    $recoveredAtlasTask = @($atlasOperationsRecovered.Json.items |
+        Where-Object { $_.id -eq $atlasRun.Json.runId })
+    Assert-Equal 1 $recoveredAtlasTask.Count '滚动替代实例未恢复运营任务队列中的 Atlas 任务'
+    if (([string]$atlasOperationsRecovered.Content).IndexOf(
+            $atlasPrivateNode, [StringComparison]::Ordinal) -ge 0) {
+        throw '滚动恢复后的运营任务队列泄露 Atlas 安全输入。'
+    }
 
     $succeeded = $true
 
     [pscustomobject]@{
         Database = $database
-        ConcurrentApiInstances = 7
-        ApiProcessesStarted = 10
+        ConcurrentApiInstances = 8
+        ApiProcessesStarted = 12
         ExecutingSignalObserved = $signalObserved
         ExecutingLeaseRecovery = $crashReplay.Json.status
         CompensationSignalObserved = $compensationSignalObserved
         CompensationLeaseRecovery = $frozenCompensation[0].status
         CompensationTargetValueAfterKill = $memoryAfterKill[0].value
+        ConcurrentCompensationApprovalWinners = $stressDecisionWinners.Count
+        ConcurrentCompensationExecutionWinners = $stressExecutionWinners.Count
+        ConcurrentCompensationFinalStatus = 'Completed'
         InitialOutcome = $execution.Json.status
         FirstReview = $firstReview.Json.status
         ConcurrentSecondReviewWinners = $resolved.Count
         RollingReplay = $replay.Json.status
+        AtlasSqlRecovery = $atlasRecovered.Json.status
+        OperationsAtlasTasks = $recoveredAtlasTask.Count
+        OperationsPayloadRedacted = $true
         Passed = $true
     } | ConvertTo-Json -Compress
 }

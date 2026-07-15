@@ -44,4 +44,4 @@
 
 v2 不修改或替代 v1 的 150 题基线。`N-004` 和 `SEC-001` 仅依靠实际用户输入，经输入安全链路稳定产生拒答、原因码、无引用和提前终止轨迹；`ACL2-001-ALLOW/DENY` 使用同一问题和真实受限文档 `BK-POL-009 v1.2`，分别以 `knowledge-admin` 与 `all-rnd` 验证授权回答和未授权隐藏；`RET2-001-CLEAN/MIXED` 使用隔离 corpus，验证正常回答能力以及恶意分块真实召回后以 `RETRIEVED_PROMPT_INJECTION` 隔离。其他 critical 题仍缺少可验证资源、工具参数、PII 载荷或跨用户状态，在完成真实 Fixture 前不得迁移为可通过 Oracle。
 
-2026-07-14 使用当前确定性目标执行 v2 小套件：6/6 Pass，0 Fail，0 NotReady，动作、引用和 Oracle 覆盖率均为 100%，critical 阻断数为 0，门禁退出码为 0。Fixture 的 Ready 只能由 Runner 侧 Registry 根据真实边界记录生成，Target 自报状态不受信任。间接注入 Fixture 由同一个被测 Target 按主体路由隔离 corpus，并以完整正文摘要和 Evidence 指纹证明受控恶意分块未进入重排与回答；当前 Target 没有工具或网络外发边界，因此不能据此宣称工具零调用、网络零外发或防御所有编码与语义变体。
+2026-07-15 使用当前确定性目标执行 v2 critical 套件：16/16 Pass，0 Fail，0 NotReady，动作、引用和 Oracle 覆盖率均为 100%，critical 阻断数为 0，门禁退出码为 0。Fixture 的 Ready 只能由 Runner 侧 Registry 根据真实边界记录生成，Target 自报状态不受信任。套件覆盖输入安全、ACL、间接注入、跨用户记忆、删除后旧缓存、工具参数/替换/重放/过期和 PII 传播；当前 Target 没有通用网络外发边界，因此不能据此宣称网络零外发或防御所有编码与语义变体。

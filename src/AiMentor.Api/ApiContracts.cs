@@ -46,6 +46,17 @@ public sealed record DecideToolApprovalRequest(
     bool Approved,
     [property: Required, StringLength(500, MinimumLength = 1)] string Reason);
 
+/// <summary>运营台只提出动作意图；目标版本和幂等键必须由请求头提供。</summary>
+public sealed record RequestOperationsActionRequest(
+    [property: Required, StringLength(32, MinimumLength = 1)] string Action,
+    [property: Required, StringLength(500, MinimumLength = 1)] string Reason);
+
+/// <summary>独立第二人使用动作记录版本完成原子复核。</summary>
+public sealed record ReviewOperationsActionRequest(
+    [property: Range(1, long.MaxValue)] long ExpectedVersion,
+    bool Approved,
+    [property: Required, StringLength(500, MinimumLength = 1)] string Reason);
+
 /// <summary>为已确认生效且具备加密快照的正向执行申请独立补偿审批。</summary>
 public sealed record RequestToolCompensationApprovalRequest(
     [property: Required, StringLength(500, MinimumLength = 1)] string Justification);
