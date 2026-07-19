@@ -222,6 +222,21 @@ public sealed record OutcomeUnknownToolExecution(
     DateTimeOffset CreatedAt,
     DateTimeOffset UpdatedAt);
 
+/// <summary>公开给 API 调用方的结果不确定执行分页；游标不携带租户和工具参数。</summary>
+public sealed record OutcomeUnknownToolExecutionPage(
+    IReadOnlyList<OutcomeUnknownToolExecution> Items,
+    string? NextCursor);
+
+/// <summary>账本内部使用的稳定 keyset；服务层负责把它编码成经认证的不透明游标。</summary>
+public sealed record OutcomeUnknownToolExecutionPageKey(
+    DateTimeOffset UpdatedAt,
+    string ExecutionKey);
+
+/// <summary>账本分页结果只暴露下一条 keyset，不负责处理外部游标或租户认证。</summary>
+public sealed record OutcomeUnknownToolExecutionLedgerPage(
+    IReadOnlyList<OutcomeUnknownToolExecution> Items,
+    OutcomeUnknownToolExecutionPageKey? NextKey);
+
 /// <summary>供内部目标状态探测使用的结果不确定记录，参数摘要不会由 API 返回。</summary>
 public sealed record OutcomeUnknownToolExecutionDetail(
     OutcomeUnknownToolExecution Execution,
@@ -279,6 +294,14 @@ public interface IToolExecutionLedger
     Task AbandonAsync(string executionKey, string leaseToken, CancellationToken cancellationToken = default);
     Task<IReadOnlyList<OutcomeUnknownToolExecution>> ListOutcomeUnknownAsync(string tenantId, int limit,
         CancellationToken cancellationToken = default);
+    async Task<OutcomeUnknownToolExecutionLedgerPage> ListOutcomeUnknownPageAsync(string tenantId, int limit,
+        OutcomeUnknownToolExecutionPageKey? after = null, CancellationToken cancellationToken = default)
+    {
+        // 兼容仅用于测试替身和旧扩展实现；生产账本必须覆盖此方法以提供真正的 keyset 分页。
+        if (after is not null) throw new NotSupportedException("当前账本实现不支持结果不确定执行游标。");
+        return new OutcomeUnknownToolExecutionLedgerPage(
+            await ListOutcomeUnknownAsync(tenantId, limit, cancellationToken), null);
+    }
     Task<OutcomeUnknownToolExecutionDetail?> GetOutcomeUnknownAsync(string tenantId, string executionKey,
         CancellationToken cancellationToken = default);
     Task<ToolReconciliationReviewResult> SubmitReconciliationReviewAsync(ToolReconciliationReview review,
@@ -290,6 +313,9 @@ public interface IToolExecutionReconciliationService
 {
     Task<IReadOnlyList<OutcomeUnknownToolExecution>> ListOutcomeUnknownAsync(AccessContext access, int limit,
         CancellationToken cancellationToken = default);
+    async Task<OutcomeUnknownToolExecutionPage> ListOutcomeUnknownPageAsync(AccessContext access, int limit,
+        string? cursor = null, CancellationToken cancellationToken = default) =>
+        new(await ListOutcomeUnknownAsync(access, limit, cancellationToken), null);
     Task<ToolOutcomeProbeResult> ProbeOutcomeAsync(AccessContext access, string executionKey, JsonElement arguments,
         CancellationToken cancellationToken = default);
     Task<ToolReconciliationReviewResult> ReviewOutcomeAsync(AccessContext access, string executionKey,
@@ -310,6 +336,11 @@ public sealed class ToolExecutionReconciliationOptions
     public IReadOnlySet<string> ReconcilerGroups { get; init; } =
         new HashSet<string>(["tool-reconcilers"], StringComparer.OrdinalIgnoreCase);
     public int MaximumPageSize { get; init; } = 100;
+    public int MaximumOperationsScan { get; init; } = 10_000;
+    /// <summary>
+    /// 多实例部署必须提供跨实例一致且至少 32 字节的派生密钥；未配置时仅为当前进程生成随机密钥。
+    /// </summary>
+    public byte[]? CursorSigningKey { get; init; }
     public TimeSpan EvidenceLifetime { get; init; } = TimeSpan.FromMinutes(5);
 }
 

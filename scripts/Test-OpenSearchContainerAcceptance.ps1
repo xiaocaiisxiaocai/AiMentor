@@ -24,6 +24,105 @@ $manifestV2 = Join-Path ([System.IO.Path]::GetTempPath()) "aimentor-opensearch-v
 $base = $Endpoint.TrimEnd('/')
 $http = @{ TimeoutSec = 10 }
 
+if (($IsWindows -or $env:OS -eq 'Windows_NT') -and -not ('AiMentor.WindowsProcessJob' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+
+namespace AiMentor
+{
+    public static class WindowsProcessJob
+    {
+        private const uint JobObjectLimitKillOnJobClose = 0x00002000;
+        private const int JobObjectExtendedLimitInformation = 9;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct IoCounters
+        {
+            public ulong ReadOperationCount;
+            public ulong WriteOperationCount;
+            public ulong OtherOperationCount;
+            public ulong ReadTransferCount;
+            public ulong WriteTransferCount;
+            public ulong OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct BasicLimitInformation
+        {
+            public long PerProcessUserTimeLimit;
+            public long PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize;
+            public UIntPtr MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass;
+            public uint SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ExtendedLimitInformation
+        {
+            public BasicLimitInformation BasicLimitInformation;
+            public IoCounters IoInfo;
+            public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed;
+            public UIntPtr PeakJobMemoryUsed;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateJobObject(IntPtr jobAttributes, string name);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetInformationJobObject(
+            IntPtr job, int informationClass, ref ExtendedLimitInformation information, uint length);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        public static IntPtr CreateKillOnClose()
+        {
+            var job = CreateJobObject(IntPtr.Zero, null);
+            if (job == IntPtr.Zero) throw new Win32Exception(Marshal.GetLastWin32Error());
+            var information = new ExtendedLimitInformation();
+            information.BasicLimitInformation.LimitFlags = JobObjectLimitKillOnJobClose;
+            if (SetInformationJobObject(job, JobObjectExtendedLimitInformation, ref information,
+                    (uint)Marshal.SizeOf(typeof(ExtendedLimitInformation)))) return job;
+            var error = Marshal.GetLastWin32Error();
+            CloseHandle(job);
+            throw new Win32Exception(error);
+        }
+
+        public static void Assign(IntPtr job, Process process)
+        {
+            if (!AssignProcessToJobObject(job, process.Handle))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+
+        public static void Terminate(IntPtr job)
+        {
+            if (!TerminateJobObject(job, 1)) throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+
+        public static void Close(IntPtr job)
+        {
+            if (job != IntPtr.Zero) CloseHandle(job);
+        }
+    }
+}
+'@
+}
+
 function Throw-NotReady([string]$Code) {
     throw "OPENSEARCH_ACCEPTANCE_NOT_READY:$Code"
 }
@@ -51,17 +150,22 @@ function Test-DockerCommand([string[]]$Arguments) {
     return -not $result.TimedOut -and $result.ExitCode -eq 0
 }
 
-function Stop-ProcessTree([System.Diagnostics.Process]$Process) {
+function Stop-ProcessTree([System.Diagnostics.Process]$Process, [IntPtr]$JobHandle) {
     if ($Process.HasExited) { return }
 
     if ($IsWindows -or $env:OS -eq 'Windows_NT') {
-        # Docker Desktop 的 CLI 可能保留子进程；taskkill /T 可确保超时后不再后台拉取。
-        $previousPreference = $ErrorActionPreference
-        try {
-            $ErrorActionPreference = 'Continue'
-            & "$env:SystemRoot\System32\taskkill.exe" /PID $Process.Id /T /F *> $null
+        if ($JobHandle -ne [IntPtr]::Zero) {
+            [AiMentor.WindowsProcessJob]::Terminate($JobHandle)
         }
-        finally { $ErrorActionPreference = $previousPreference }
+        else {
+            # 旧系统无法分配嵌套 Job Object 时，保留 taskkill 兼容回退。
+            $previousPreference = $ErrorActionPreference
+            try {
+                $ErrorActionPreference = 'Continue'
+                & "$env:SystemRoot\System32\taskkill.exe" /PID $Process.Id /T /F *> $null
+            }
+            finally { $ErrorActionPreference = $previousPreference }
+        }
     }
     else {
         $Process.Kill($true)
@@ -74,6 +178,7 @@ function Invoke-DockerProcess([string[]]$Arguments, [int]$TimeoutSeconds) {
     $process = $null
     $stdoutTask = $null
     $stderrTask = $null
+    $jobHandle = [IntPtr]::Zero
     try {
         $safeArguments = @($Arguments | ForEach-Object {
             if ($_.Contains('"')) { throw 'DOCKER_ARGUMENT_INVALID' }
@@ -99,11 +204,21 @@ function Invoke-DockerProcess([string[]]$Arguments, [int]$TimeoutSeconds) {
         $process = [System.Diagnostics.Process]::new()
         $process.StartInfo = $startInfo
         if (-not $process.Start()) { throw 'DOCKER_PROCESS_START_FAILED' }
+        if ($IsWindows -or $env:OS -eq 'Windows_NT') {
+            try {
+                $jobHandle = [AiMentor.WindowsProcessJob]::CreateKillOnClose()
+                [AiMentor.WindowsProcessJob]::Assign($jobHandle, $process)
+            }
+            catch {
+                [AiMentor.WindowsProcessJob]::Close($jobHandle)
+                $jobHandle = [IntPtr]::Zero
+            }
+        }
         # 同时抽干两个管道，避免 Docker 进度输出填满缓冲区后与父进程互相等待。
         $stdoutTask = $process.StandardOutput.ReadToEndAsync()
         $stderrTask = $process.StandardError.ReadToEndAsync()
         if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-            Stop-ProcessTree $process
+            Stop-ProcessTree $process $jobHandle
             $timedOut = $true
             $exitCode = -1
         }
@@ -117,6 +232,7 @@ function Invoke-DockerProcess([string[]]$Arguments, [int]$TimeoutSeconds) {
         return [pscustomobject]@{ TimedOut = $timedOut; ExitCode = $exitCode }
     }
     finally {
+        if ($IsWindows -or $env:OS -eq 'Windows_NT') { [AiMentor.WindowsProcessJob]::Close($jobHandle) }
         if ($null -ne $process) { $process.Dispose() }
         # 原生命令输出可能包含代理、认证或容器环境，只在内存中抽干且永不回显。
         $stdoutTask = $null

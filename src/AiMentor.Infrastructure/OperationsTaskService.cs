@@ -35,7 +35,7 @@ public sealed class OperationsTaskService(
             Decorate(Summary(item, access, now), actionsByTarget, access, now)));
         if (access.Groups.Overlaps(executionOptions.ReconcilerGroups))
         {
-            var executionRows = await executions.ListOutcomeUnknownAsync(access, 100, cancellationToken);
+            var executionRows = await ListOutcomeUnknownExecutionsAsync(access, cancellationToken);
             tasks.AddRange(executionRows.Select(item => Decorate(Summary(item, now), actionsByTarget, access, now)));
         }
         var atlasRows = await atlas.ListAsync(access, 100, cancellationToken);
@@ -69,6 +69,41 @@ public sealed class OperationsTaskService(
         var page = tasks.Take(limit).ToArray();
         var next = tasks.Count > limit ? EncodeCursor(Key(page[^1])) : null;
         return new OperationsTaskPage(page, next);
+    }
+
+    private async Task<IReadOnlyList<OutcomeUnknownToolExecution>> ListOutcomeUnknownExecutionsAsync(
+        AccessContext access, CancellationToken cancellationToken)
+    {
+        if (executionOptions.MaximumPageSize <= 0
+            || executionOptions.MaximumOperationsScan < executionOptions.MaximumPageSize)
+            throw new InvalidOperationException("工具执行对账分页或运营扫描上限配置无效。");
+        var records = new List<OutcomeUnknownToolExecution>();
+        var executionKeys = new HashSet<string>(StringComparer.Ordinal);
+        var observedCursors = new HashSet<string>(StringComparer.Ordinal);
+        string? cursor = null;
+        while (true)
+        {
+            var remaining = executionOptions.MaximumOperationsScan - records.Count;
+            if (remaining <= 0)
+                throw new InvalidOperationException("结果不确定执行数量超过运营队列的有界扫描上限。");
+            var pageSize = Math.Min(executionOptions.MaximumPageSize, remaining);
+            var page = await executions.ListOutcomeUnknownPageAsync(
+                access, pageSize, cursor, cancellationToken);
+            if (page.Items.Count > pageSize)
+                throw new InvalidOperationException("工具执行对账服务返回了超过请求上限的分页。");
+            foreach (var item in page.Items)
+            {
+                if (!executionKeys.Add(item.ExecutionKey))
+                    throw new InvalidOperationException("工具执行对账分页出现重复记录，运营队列已失败关闭。");
+                records.Add(item);
+            }
+            if (page.NextCursor is null) return records;
+            if (records.Count >= executionOptions.MaximumOperationsScan)
+                throw new InvalidOperationException("结果不确定执行数量超过运营队列的有界扫描上限。");
+            if (!observedCursors.Add(page.NextCursor))
+                throw new InvalidOperationException("工具执行对账分页游标未向前推进，运营队列已失败关闭。");
+            cursor = page.NextCursor;
+        }
     }
 
     public async Task<bool> IsEscalationCurrentAsync(string targetType, string targetId, string targetETag,

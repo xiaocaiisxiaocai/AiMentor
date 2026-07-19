@@ -5,6 +5,7 @@
     <Project Path="src/AiMentor.Domain/AiMentor.Domain.csproj" />
     <Project Path="src/AiMentor.Infrastructure/AiMentor.Infrastructure.csproj" />
     <Project Path="src/AiMentor.Evaluation/AiMentor.Evaluation.csproj" />
+    <Project Path="src/AiMentor.Migrations/AiMentor.Migrations.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/AiMentor.AtlasCrashHelper/AiMentor.AtlasCrashHelper.csproj" />

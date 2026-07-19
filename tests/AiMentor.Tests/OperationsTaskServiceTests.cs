@@ -48,6 +48,54 @@ public sealed class OperationsTaskServiceTests
     }
 
     [Fact]
+    public async Task UnifiedQueueShouldIncludeOlderOutcomeUnknownExecutionsBeyondFirstHundred()
+    {
+        var now = new DateTimeOffset(2026, 7, 16, 2, 0, 0, TimeSpan.Zero);
+        var clock = new FixedTimeProvider(now);
+        var access = AccessContext.Create("tenant-a", "operator", ["tool-reconcilers"]);
+        var rows = Enumerable.Range(0, 205).Select(index => new OutcomeUnknownToolExecution(
+            index.ToString("X64", System.Globalization.CultureInfo.InvariantCulture), access.TenantId,
+            "owner", "memory.delete", $"run-{index}",
+            now.AddDays(-1), now.AddSeconds(-index))).ToArray();
+        var executionOptions = new ToolExecutionReconciliationOptions
+        {
+            MaximumPageSize = 100,
+            MaximumOperationsScan = 500
+        };
+        var service = new OperationsTaskService(new ApprovalStub([]), new CompensationStub([]),
+            new ExecutionStub(rows), new InMemoryAtlasIncidentStore(clock), new ToolApprovalOptions(),
+            new ToolCompensationOptions(), executionOptions, new InMemoryOperationsActionStore(),
+            new OperationsActionOptions(), clock);
+
+        var all = new List<OperationsTaskSummary>();
+        string? cursor = null;
+        do
+        {
+            var page = await service.ListAsync(access, "execution", null, cursor, 100);
+            all.AddRange(page.Items);
+            cursor = page.NextCursor;
+        } while (cursor is not null);
+
+        Assert.Equal(205, all.Count);
+        Assert.Equal(205, all.Select(item => item.Id).Distinct(StringComparer.Ordinal).Count());
+        Assert.Contains(all, item => item.Id == 204.ToString(
+            "X64", System.Globalization.CultureInfo.InvariantCulture));
+
+        var boundedOptions = new ToolExecutionReconciliationOptions
+        {
+            MaximumPageSize = 100,
+            MaximumOperationsScan = 200
+        };
+        var boundedService = new OperationsTaskService(new ApprovalStub([]), new CompensationStub([]),
+            new ExecutionStub(rows), new InMemoryAtlasIncidentStore(clock), new ToolApprovalOptions(),
+            new ToolCompensationOptions(), boundedOptions, new InMemoryOperationsActionStore(),
+            new OperationsActionOptions(), clock);
+        var overflow = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            boundedService.ListAsync(access, "execution", null, null, 100));
+        Assert.Contains("扫描上限", overflow.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task SlaUsesTerminalCompletionTimeAndNeverEscalatesTerminalIncident()
     {
         var now = new DateTimeOffset(2026, 7, 15, 8, 0, 0, TimeSpan.Zero);
@@ -133,7 +181,20 @@ public sealed class OperationsTaskServiceTests
 
     private sealed class ExecutionStub(IReadOnlyList<OutcomeUnknownToolExecution> rows) : IToolExecutionReconciliationService
     {
-        public Task<IReadOnlyList<OutcomeUnknownToolExecution>> ListOutcomeUnknownAsync(AccessContext access, int limit, CancellationToken cancellationToken = default) => Task.FromResult(rows);
+        public Task<IReadOnlyList<OutcomeUnknownToolExecution>> ListOutcomeUnknownAsync(AccessContext access,
+            int limit, CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<OutcomeUnknownToolExecution>>(rows.Take(limit).ToArray());
+        public Task<OutcomeUnknownToolExecutionPage> ListOutcomeUnknownPageAsync(AccessContext access, int limit,
+            string? cursor = null, CancellationToken cancellationToken = default)
+        {
+            var offset = cursor is null ? 0 : int.Parse(cursor, System.Globalization.CultureInfo.InvariantCulture);
+            var items = rows.Skip(offset).Take(limit).ToArray();
+            var nextOffset = offset + items.Length;
+            return Task.FromResult(new OutcomeUnknownToolExecutionPage(
+                items, nextOffset < rows.Count
+                    ? nextOffset.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                    : null));
+        }
         public Task<ToolOutcomeProbeResult> ProbeOutcomeAsync(AccessContext access, string executionKey, JsonElement arguments, CancellationToken cancellationToken = default) => throw new NotSupportedException();
         public Task<ToolReconciliationReviewResult> ReviewOutcomeAsync(AccessContext access, string executionKey, JsonElement arguments, bool confirmed, string reason, CancellationToken cancellationToken = default) => throw new NotSupportedException();
     }

@@ -1,0 +1,57 @@
+{{- if not .Values.application.operationsWeb.enabled }}
+{{- fail "Production 禁止关闭 application.operationsWeb.enabled" }}
+{{- end }}
+{{- if ne .Values.application.openSearch.indexName "aimentor-knowledge-current" }}
+{{- fail "Production OpenSearch 读路径必须使用 aimentor-knowledge-current alias" }}
+{{- end }}
+{{- if ne .Values.application.ai.embedding.indexVersion .Values.application.openSearch.indexName }}
+{{- fail "application.ai.embedding.indexVersion 必须与 OpenSearch 发布 alias 一致" }}
+{{- end }}
+{{- if eq (lower .Values.application.ai.model.provider) "deterministic" }}
+{{- fail "Production 禁止使用 Deterministic 模型提供方" }}
+{{- end }}
+{{- if eq (lower .Values.application.ai.embedding.provider) "deterministic" }}
+{{- fail "Production 禁止使用 Deterministic 嵌入提供方" }}
+{{- end }}
+{{- if eq (lower .Values.application.ai.reranker.provider) "lexical" }}
+{{- fail "Production 禁止使用 Lexical 重排提供方" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "aimentor.fullname" . }}
+  labels:
+    {{- include "aimentor.labels" . | nindent 4 }}
+data:
+  ASPNETCORE_ENVIRONMENT: Production
+  ASPNETCORE_HTTP_PORTS: "8080"
+  Migrations__Root: /app/deploy/sql
+  Workflow__Provider: SqlServer
+  Workflow__InitializeSchema: "false"
+  Rag__Provider: OpenSearch
+  OpenSearch__Endpoint: {{ required "application.openSearch.endpoint 必须设置" .Values.application.openSearch.endpoint | quote }}
+  OpenSearch__IndexName: {{ required "application.openSearch.indexName 必须设置" .Values.application.openSearch.indexName | quote }}
+  OpenSearch__SynchronizeOnStartup: "false"
+  OpenSearch__VectorDimensions: {{ required "application.ai.embedding.dimensions 必须设置为生产嵌入维度" .Values.application.ai.embedding.dimensions | quote }}
+  Authentication__Mode: OidcJwt
+  Authentication__Authority: {{ required "application.authentication.authority 必须设置" .Values.application.authentication.authority | quote }}
+  Authentication__Audience: {{ required "application.authentication.audience 必须设置" .Values.application.authentication.audience | quote }}
+  Authentication__RequireHttpsMetadata: "true"
+  Telemetry__OtlpEndpoint: {{ required "application.telemetry.otlpEndpoint 必须设置" .Values.application.telemetry.otlpEndpoint | quote }}
+  Operations__Web__Enabled: {{ ternary "true" "false" .Values.application.operationsWeb.enabled | quote }}
+  Operations__Web__ClientId: {{ required "Production 必须设置 application.operationsWeb.clientId" .Values.application.operationsWeb.clientId | quote }}
+  Operations__Web__DataProtectionKeyPath: /var/lib/aimentor/data-protection
+  Operations__Web__DataProtectionCertificatePath: /var/run/aimentor/data-protection/tls.pfx
+  Memory__Encryption__ActiveKeyVersion: v1
+  Workflow__Encryption__ActiveKeyVersion: v1
+  Model__Provider: {{ .Values.application.ai.model.provider | quote }}
+  Model__Endpoint: {{ required "application.ai.model.endpoint 必须设置" .Values.application.ai.model.endpoint | quote }}
+  Model__Model: {{ required "application.ai.model.model 必须设置" .Values.application.ai.model.model | quote }}
+  Embedding__Provider: {{ .Values.application.ai.embedding.provider | quote }}
+  Embedding__Endpoint: {{ required "application.ai.embedding.endpoint 必须设置" .Values.application.ai.embedding.endpoint | quote }}
+  Embedding__Model: {{ required "application.ai.embedding.model 必须设置" .Values.application.ai.embedding.model | quote }}
+  Embedding__Dimensions: {{ required "application.ai.embedding.dimensions 必须大于零" .Values.application.ai.embedding.dimensions | quote }}
+  Embedding__IndexVersion: {{ required "application.ai.embedding.indexVersion 必须绑定已发布索引" .Values.application.ai.embedding.indexVersion | quote }}
+  Reranker__Provider: {{ .Values.application.ai.reranker.provider | quote }}
+  Reranker__Endpoint: {{ required "application.ai.reranker.endpoint 必须设置" .Values.application.ai.reranker.endpoint | quote }}
+  Reranker__Model: {{ required "application.ai.reranker.model 必须设置" .Values.application.ai.reranker.model | quote }}

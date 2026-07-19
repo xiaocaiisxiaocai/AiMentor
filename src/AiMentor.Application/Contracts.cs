@@ -176,6 +176,16 @@ public interface ITraceSink
     Task WriteAsync(string runId, IReadOnlyList<TraceStep> trace, CancellationToken cancellationToken = default);
 }
 
+/// <summary>
+/// 只在真实业务工作流边界发布完成结果和持续时间；通用审计轨迹不得被当成一次业务执行。
+/// 实现必须使用受控低基数分类，且不得因指标后端状态改变业务结果。
+/// </summary>
+public interface IWorkflowMetrics
+{
+    void RecordCompleted(string workflowKind, string outcomeClass, TimeSpan duration,
+        IReadOnlyList<TraceStep> trace);
+}
+
 /// <summary>公开从输入审核到引用审核的完整可信问答用例。</summary>
 public interface ITrustedQuestionService
 {

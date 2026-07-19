@@ -1,0 +1,7 @@
+apiVersion: v2
+name: aimentor
+description: AI Mentor 生产 API 与数据库迁移 Helm chart
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.27.0-0"

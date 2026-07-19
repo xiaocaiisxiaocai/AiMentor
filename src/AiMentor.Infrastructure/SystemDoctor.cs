@@ -24,6 +24,7 @@ public record SystemDoctorOptions
     public bool SqlConnectionConfigured { get; init; }
     public bool SqlEncrypt { get; init; }
     public bool SqlTrustServerCertificate { get; init; }
+    public bool TelemetryExporterConfigured { get; init; }
     public string RagProvider { get; init; } = "Local";
     public string? OpenSearchEndpoint { get; init; }
     public bool OpenSearchAuthenticationConfigured { get; init; }
@@ -51,6 +52,7 @@ public sealed class SystemDoctor(SystemDoctorOptions options, TimeProvider timeP
         CheckKeysAndWorkflow(checks);
         CheckRag(checks);
         CheckAiProviders(checks);
+        CheckTelemetry(checks);
         CheckAgentLease(checks);
         var report = new SystemDiagnosticReport(checks.All(item => item.Status != SystemCheckStatus.Failed),
             timeProvider.GetUtcNow(), checks);
@@ -109,10 +111,14 @@ public sealed class SystemDoctor(SystemDoctorOptions options, TimeProvider timeP
         if (memoryRetentionHealth is { Enabled: true })
             Add(checks, "memory.retention", SystemCheckSeverity.Critical,
                 memoryRetentionHealth.IsReady ? SystemCheckStatus.Passed : SystemCheckStatus.Failed,
-                memoryRetentionHealth.IsReady ? "MEMORY_RETENTION_HEALTHY" : "MEMORY_RETENTION_FAILED",
+                memoryRetentionHealth.IsReady
+                    ? "MEMORY_RETENTION_HEALTHY"
+                    : memoryRetentionHealth.IsStale ? "MEMORY_RETENTION_STALE" : "MEMORY_RETENTION_FAILED",
                 memoryRetentionHealth.IsReady
                     ? "记忆保留期后台清理最近一次执行正常。"
-                    : "记忆保留期后台清理失败，readiness 将保持失败直到清理恢复。");
+                    : memoryRetentionHealth.IsStale
+                        ? "记忆保留期后台清理超过最大允许陈旧时间仍未完成。"
+                        : "记忆保留期后台清理失败，readiness 将保持失败直到清理恢复。");
 
         var sql = Equals(options.WorkflowProvider, "SqlServer");
         var memory = Equals(options.WorkflowProvider, "InMemory");
@@ -200,6 +206,22 @@ public sealed class SystemDoctor(SystemDoctorOptions options, TimeProvider timeP
             && options.AgentResumeLeaseRenewalInterval <= options.AgentResumeLeaseDuration / 2;
         AddBoolean(checks, "agent.lease", valid, "AGENT_LEASE_VALID", "AGENT_LEASE_INVALID",
             "Agent 运行预算与恢复租约关系有效。", "Agent 运行预算或恢复租约关系无效。");
+    }
+
+    private void CheckTelemetry(List<SystemCheckResult> checks)
+    {
+        if (options.IsProduction && !options.TelemetryExporterConfigured)
+            AddFailure(checks, "telemetry.exporter", "TELEMETRY_EXPORTER_REQUIRED",
+                "生产环境必须配置安全的 OTLP 遥测导出端点。");
+        else Add(checks, "telemetry.exporter",
+            options.TelemetryExporterConfigured ? SystemCheckSeverity.Information : SystemCheckSeverity.Warning,
+            options.TelemetryExporterConfigured ? SystemCheckStatus.Passed : SystemCheckStatus.Warning,
+            options.TelemetryExporterConfigured
+                ? "TELEMETRY_EXPORTER_CONFIGURED"
+                : "TELEMETRY_EXPORTER_NOT_CONFIGURED",
+            options.TelemetryExporterConfigured
+                ? "OTLP 轨迹与指标导出已配置。"
+                : "开发环境未配置 OTLP 导出，遥测仅保留本地监听能力。");
     }
 
     private void CheckSandboxProvider(List<SystemCheckResult> checks, string name, string actual, string sandbox,

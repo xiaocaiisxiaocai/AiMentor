@@ -1,0 +1,15 @@
+# 构建上下文采用白名单，避免把 Git 元数据、测试输出或本地凭据送入构建器。
+**
+!Dockerfile
+!.dockerignore
+!Directory.Build.props
+!Directory.Packages.props
+!global.json
+!src/
+!src/**
+!deploy/
+!deploy/sql/
+!deploy/sql/**
+
+**/bin/
+**/obj/

@@ -3,6 +3,8 @@ using System.Net.Http.Json;
 using System.Security.Claims;
 using System.Text.Encodings.Web;
 using System.Text.Json;
+using AiMentor.Application;
+using AiMentor.Infrastructure;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
@@ -86,6 +88,39 @@ public sealed class OperationsHttpContractTests
         Assert.Equal("Completed", completedBody.RootElement.GetProperty("status").GetString());
         Assert.Equal("OPERATIONS_APPROVAL_APPROVED",
             completedBody.RootElement.GetProperty("outcomeCode").GetString());
+
+        var ledger = factory.Services.GetRequiredService<IToolExecutionLedger>();
+        for (var index = 0; index < 51; index++)
+        {
+            var executionKey = index.ToString("X64", System.Globalization.CultureInfo.InvariantCulture);
+            var acquired = await ledger.TryAcquireAsync(new ToolExecutionLedgerRequest(
+                    executionKey, new string('A', 64), $"http-run-{index}", "tenant-http", "owner-a",
+                    "memory.delete"),
+                TimeSpan.FromMinutes(1), TimeSpan.FromHours(1), 100);
+            await ledger.MarkExecutingAsync(executionKey, acquired.LeaseToken!);
+            await ledger.MarkOutcomeUnknownAsync(executionKey, acquired.LeaseToken!);
+        }
+        var legacyPage = await SendAsync(client, HttpMethod.Get,
+            "/api/v1/tool-executions/outcome-unknown?limit=50", "reconciler-a", ["tool-reconcilers"]);
+        Assert.Equal(HttpStatusCode.OK, legacyPage.StatusCode);
+        using var legacyBody = await JsonDocument.ParseAsync(await legacyPage.Content.ReadAsStreamAsync());
+        Assert.Equal(JsonValueKind.Array, legacyBody.RootElement.ValueKind);
+        Assert.Equal(50, legacyBody.RootElement.GetArrayLength());
+        var nextCursor = Assert.Single(legacyPage.Headers.GetValues("X-AiMentor-Next-Cursor"));
+
+        var cursorPage = await SendAsync(client, HttpMethod.Get,
+            $"/api/v1/tool-executions/outcome-unknown?limit=50&cursor={Uri.EscapeDataString(nextCursor)}",
+            "reconciler-a", ["tool-reconcilers"]);
+        Assert.Equal(HttpStatusCode.OK, cursorPage.StatusCode);
+        using var cursorBody = await JsonDocument.ParseAsync(await cursorPage.Content.ReadAsStreamAsync());
+        Assert.Equal(1, cursorBody.RootElement.GetProperty("items").GetArrayLength());
+        Assert.Equal(JsonValueKind.Null, cursorBody.RootElement.GetProperty("nextCursor").ValueKind);
+
+        var tamperedCursor = nextCursor[..^1] + (nextCursor[^1] == 'A' ? 'B' : 'A');
+        var tamperedPage = await SendAsync(client, HttpMethod.Get,
+            $"/api/v1/tool-executions/outcome-unknown?limit=50&cursor={Uri.EscapeDataString(tamperedCursor)}",
+            "reconciler-a", ["tool-reconcilers"]);
+        Assert.Equal(HttpStatusCode.BadRequest, tamperedPage.StatusCode);
     }
 
     private static async Task<HttpResponseMessage> SendAsync(HttpClient client, HttpMethod method, string path,

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Net;
 using System.Text;
 using AiMentor.Domain;
@@ -15,13 +16,18 @@ public sealed class ProductionAiProviderTests
     {
         var exception = Assert.Throws<AiProviderConfigurationException>(() => AiProviderFactory.CreateChat(new()
         {
-            Provider = AiProviderKind.OpenAI, Endpoint = "http://api.example", ApiKey = "secret", Model = "model"
+            Provider = AiProviderKind.OpenAI,
+            Endpoint = "http://api.example",
+            ApiKey = "secret",
+            Model = "model"
         }));
         Assert.Equal("AI_ENDPOINT_HTTPS_REQUIRED", exception.Code);
 
         var missing = Assert.Throws<AiProviderConfigurationException>(() => AiProviderFactory.CreateChat(new()
         {
-            Provider = AiProviderKind.OpenAI, Endpoint = "https://api.example", Model = "model"
+            Provider = AiProviderKind.OpenAI,
+            Endpoint = "https://api.example",
+            Model = "model"
         }));
         Assert.Equal("AI_PROVIDER_CREDENTIALS_MISSING", missing.Code);
     }
@@ -31,20 +37,29 @@ public sealed class ProductionAiProviderTests
     {
         var missingOptIn = Assert.Throws<AiProviderConfigurationException>(() => AiProviderFactory.CreateChat(new()
         {
-            Provider = AiProviderKind.OpenAI, Endpoint = "http://127.0.0.1:5123", ApiKey = "secret", Model = "model"
+            Provider = AiProviderKind.OpenAI,
+            Endpoint = "http://127.0.0.1:5123",
+            ApiKey = "secret",
+            Model = "model"
         }));
         Assert.Equal("AI_ENDPOINT_HTTPS_REQUIRED", missingOptIn.Code);
 
         var nonLoopback = Assert.Throws<AiProviderConfigurationException>(() => AiProviderFactory.CreateChat(new()
         {
-            Provider = AiProviderKind.OpenAI, Endpoint = "http://api.example", ApiKey = "secret", Model = "model",
+            Provider = AiProviderKind.OpenAI,
+            Endpoint = "http://api.example",
+            ApiKey = "secret",
+            Model = "model",
             AllowInsecureLoopback = true
         }));
         Assert.Equal("AI_ENDPOINT_HTTPS_REQUIRED", nonLoopback.Code);
 
         using var accepted = AiProviderFactory.CreateChat(new ModelProviderOptions
         {
-            Provider = AiProviderKind.OpenAI, Endpoint = "http://127.0.0.1:5123", ApiKey = "secret", Model = "model",
+            Provider = AiProviderKind.OpenAI,
+            Endpoint = "http://127.0.0.1:5123",
+            ApiKey = "secret",
+            Model = "model",
             AllowInsecureLoopback = true
         }, new StaticHandler("{\"choices\":[{\"message\":{\"content\":\"ok\"}}]}"));
         Assert.NotNull(accepted);
@@ -92,8 +107,12 @@ public sealed class ProductionAiProviderTests
         var handler = new StaticHandler("{\"data\":[{\"embedding\":[0.1,0.2]}]}");
         var options = new EmbeddingProviderOptions
         {
-            Provider = AiProviderKind.OpenAI, Endpoint = "https://api.example", ApiKey = "key", Model = "embed",
-            Dimensions = 3, IndexVersion = "knowledge-v2"
+            Provider = AiProviderKind.OpenAI,
+            Endpoint = "https://api.example",
+            ApiKey = "key",
+            Model = "embed",
+            Dimensions = 3,
+            IndexVersion = "knowledge-v2"
         };
         var generator = AiProviderFactory.CreateEmbedding(options, handler);
 
@@ -105,6 +124,7 @@ public sealed class ProductionAiProviderTests
     public async Task ActivityTraceUsesAllowlistAndHashesRunId()
     {
         Activity? captured = null;
+        var measurements = new List<(string Name, string Tags)>();
         using var listener = new ActivityListener
         {
             ShouldListenTo = source => source.Name == OpenTelemetryTraceSink.SourceName,
@@ -112,13 +132,34 @@ public sealed class ProductionAiProviderTests
             ActivityStopped = activity => captured = activity
         };
         ActivitySource.AddActivityListener(listener);
+        using var meterListener = new MeterListener
+        {
+            InstrumentPublished = (instrument, activeListener) =>
+            {
+                if (instrument.Meter.Name == AiMentorTelemetry.MeterName)
+                    activeListener.EnableMeasurementEvents(instrument);
+            }
+        };
+        meterListener.SetMeasurementEventCallback<long>((instrument, _, tags, _) =>
+            measurements.Add((instrument.Name, SerializeMetricTags(tags))));
+        meterListener.SetMeasurementEventCallback<int>((instrument, _, tags, _) =>
+            measurements.Add((instrument.Name, SerializeMetricTags(tags))));
+        meterListener.SetMeasurementEventCallback<double>((instrument, _, tags, _) =>
+            measurements.Add((instrument.Name, SerializeMetricTags(tags))));
+        meterListener.Start();
         var sink = new OpenTelemetryTraceSink();
-        await sink.WriteAsync("run-secret", [new TraceStep("stage", "ok", DateTimeOffset.UtcNow,
+        TraceStep[] trace = [new TraceStep("stage", "ok", DateTimeOffset.UtcNow,
             new Dictionary<string, object?>
             {
                 ["code"] = "SAFE_CODE", ["prompt"] = "private prompt", ["tool"] = "sensitive arguments",
                 ["token"] = "secret-token"
-            })]);
+            })];
+        await sink.WriteAsync("run-secret", trace);
+        Assert.DoesNotContain(measurements, item => item.Name == AiMentorTelemetry.WorkflowExecutionsName);
+        new OpenTelemetryWorkflowMetrics().RecordCompleted("trusted_question", "success",
+            TimeSpan.FromSeconds(1), trace);
+        AiMentorTelemetry.RecordMemoryRetention("completed", 2, 3, TimeSpan.FromSeconds(1));
+        meterListener.RecordObservableInstruments();
 
         Assert.NotNull(captured);
         var serialized = string.Join('|', captured!.Tags.Select(x => $"{x.Key}={x.Value}")) + string.Join('|',
@@ -128,12 +169,38 @@ public sealed class ProductionAiProviderTests
         Assert.DoesNotContain("private prompt", serialized);
         Assert.DoesNotContain("sensitive arguments", serialized);
         Assert.DoesNotContain("secret-token", serialized);
+
+        Assert.Contains(measurements, item => item.Name == AiMentorTelemetry.WorkflowExecutionsName);
+        Assert.Contains(measurements, item => item.Name == AiMentorTelemetry.WorkflowStageEventsName);
+        Assert.Contains(measurements, item => item.Name == AiMentorTelemetry.WorkflowDurationName);
+        Assert.Contains(measurements, item => item.Name == AiMentorTelemetry.TelemetryHeartbeatName);
+        Assert.Contains(measurements, item => item.Name == AiMentorTelemetry.MemoryRetentionRunsName);
+        Assert.Contains(measurements, item => item.Name == AiMentorTelemetry.MemoryRetentionDeletedName);
+        Assert.Contains(measurements, item => item.Name == AiMentorTelemetry.MemoryRetentionDurationName);
+        Assert.Contains(measurements, item => item.Name == AiMentorTelemetry.MemoryRetentionLastCompletedAtName);
+        Assert.Contains(measurements, item => item.Name == AiMentorTelemetry.MemoryRetentionMonitoringStartedAtName);
+        var metricTags = string.Join('|', measurements.Select(item => item.Tags));
+        Assert.DoesNotContain("run-secret", metricTags);
+        Assert.DoesNotContain("private prompt", metricTags);
+        Assert.DoesNotContain("sensitive arguments", metricTags);
+        Assert.DoesNotContain("secret-token", metricTags);
+    }
+
+    private static string SerializeMetricTags(ReadOnlySpan<KeyValuePair<string, object?>> tags)
+    {
+        var values = new string[tags.Length];
+        for (var index = 0; index < tags.Length; index++)
+            values[index] = $"{tags[index].Key}={tags[index].Value}";
+        return string.Join(',', values);
     }
 
     private static ModelProviderOptions RemoteOptions(int maximumRetries = 2) => new()
     {
-        Provider = AiProviderKind.OpenAI, Endpoint = "https://api.example", ApiKey = "test-api-key",
-        Model = "model", MaximumRetries = maximumRetries
+        Provider = AiProviderKind.OpenAI,
+        Endpoint = "https://api.example",
+        ApiKey = "test-api-key",
+        Model = "model",
+        MaximumRetries = maximumRetries
     };
 
     private sealed class SequenceHandler(params HttpStatusCode[] statuses) : HttpMessageHandler
@@ -157,9 +224,9 @@ public sealed class ProductionAiProviderTests
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,
             CancellationToken cancellationToken) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
-        {
-            Content = new StringContent(body, Encoding.UTF8, "application/json")
-        });
+            {
+                Content = new StringContent(body, Encoding.UTF8, "application/json")
+            });
     }
 
     private sealed class BlockingHandler : HttpMessageHandler

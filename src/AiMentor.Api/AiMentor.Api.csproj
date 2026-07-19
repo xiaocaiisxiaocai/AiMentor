@@ -5,6 +5,7 @@
   <ItemGroup>
     <ProjectReference Include="..\AiMentor.Application\AiMentor.Application.csproj" />
     <ProjectReference Include="..\AiMentor.Infrastructure\AiMentor.Infrastructure.csproj" />
+    <ProjectReference Include="..\AiMentor.Migrations\AiMentor.Migrations.csproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" />

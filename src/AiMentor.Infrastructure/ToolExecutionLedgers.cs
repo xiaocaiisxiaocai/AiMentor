@@ -115,25 +115,49 @@ public sealed class InMemoryToolExecutionLedger(TimeProvider timeProvider) : ITo
     }
 
     /// <inheritdoc />
-    public Task<IReadOnlyList<OutcomeUnknownToolExecution>> ListOutcomeUnknownAsync(string tenantId, int limit,
-        CancellationToken cancellationToken = default)
+    public async Task<IReadOnlyList<OutcomeUnknownToolExecution>> ListOutcomeUnknownAsync(string tenantId, int limit,
+        CancellationToken cancellationToken = default) =>
+        (await ListOutcomeUnknownPageAsync(tenantId, limit, null, cancellationToken)).Items;
+
+    /// <inheritdoc />
+    public Task<OutcomeUnknownToolExecutionLedgerPage> ListOutcomeUnknownPageAsync(string tenantId, int limit,
+        OutcomeUnknownToolExecutionPageKey? after = null, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentException.ThrowIfNullOrWhiteSpace(tenantId);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
+        ValidatePageKey(after);
         lock (_gate)
         {
-            IReadOnlyList<OutcomeUnknownToolExecution> result = _entries
+            var candidates = _entries
                 .Where(pair => pair.Value.Status == LedgerStatus.OutcomeUnknown
-                    && string.Equals(pair.Value.TenantId, tenantId, StringComparison.Ordinal))
+                    && string.Equals(pair.Value.TenantId, tenantId, StringComparison.Ordinal)
+                    && IsAfter(pair.Key, pair.Value.UpdatedAt, after))
                 .OrderByDescending(pair => pair.Value.UpdatedAt)
-                .Take(limit)
+                .ThenBy(pair => pair.Key, StringComparer.Ordinal)
+                .Take(checked(limit + 1))
                 .Select(pair => new OutcomeUnknownToolExecution(pair.Key, pair.Value.TenantId,
                     pair.Value.SubjectId, pair.Value.ToolName, pair.Value.RunId,
                     pair.Value.CreatedAt, pair.Value.UpdatedAt))
                 .ToArray();
-            return Task.FromResult(result);
+            var items = candidates.Take(limit).ToArray();
+            var next = candidates.Length > limit
+                ? new OutcomeUnknownToolExecutionPageKey(items[^1].UpdatedAt, items[^1].ExecutionKey)
+                : null;
+            return Task.FromResult(new OutcomeUnknownToolExecutionLedgerPage(items, next));
         }
+    }
+
+    private static bool IsAfter(string executionKey, DateTimeOffset updatedAt,
+        OutcomeUnknownToolExecutionPageKey? after) => after is null
+        || updatedAt < after.UpdatedAt
+        || updatedAt == after.UpdatedAt && string.CompareOrdinal(executionKey, after.ExecutionKey) > 0;
+
+    private static void ValidatePageKey(OutcomeUnknownToolExecutionPageKey? after)
+    {
+        if (after is not null && (after.ExecutionKey.Length != 64 || after.ExecutionKey.Any(character =>
+                !Uri.IsHexDigit(character))))
+            throw new ArgumentException("结果不确定执行分页键无效。", nameof(after));
     }
 
     /// <inheritdoc />
@@ -462,28 +486,46 @@ public sealed class SqlServerToolExecutionLedger(
 
     /// <inheritdoc />
     public async Task<IReadOnlyList<OutcomeUnknownToolExecution>> ListOutcomeUnknownAsync(string tenantId, int limit,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default) =>
+        (await ListOutcomeUnknownPageAsync(tenantId, limit, null, cancellationToken)).Items;
+
+    /// <inheritdoc />
+    public async Task<OutcomeUnknownToolExecutionLedgerPage> ListOutcomeUnknownPageAsync(string tenantId, int limit,
+        OutcomeUnknownToolExecutionPageKey? after = null, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(tenantId);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(limit);
+        if (after is not null && (after.ExecutionKey.Length != 64 || after.ExecutionKey.Any(character =>
+                !Uri.IsHexDigit(character))))
+            throw new ArgumentException("结果不确定执行分页键无效。", nameof(after));
         await EnsureInitializedAsync(cancellationToken);
         await using var connection = await OpenAsync(cancellationToken);
         await using var command = connection.CreateCommand();
         command.CommandText = $"""
-            SELECT TOP (@limit) ExecutionKey,TenantId,SubjectId,ToolName,RunId,CreatedAt,UpdatedAt
+            SELECT TOP (@fetch) ExecutionKey,TenantId,SubjectId,ToolName,RunId,CreatedAt,UpdatedAt
             FROM dbo.{TableName}
             WHERE TenantId COLLATE Latin1_General_100_BIN2=@tenantId AND Status=3
-            ORDER BY UpdatedAt DESC;
+              AND (@hasCursor=0 OR UpdatedAt<@cursorUpdatedAt
+                   OR (UpdatedAt=@cursorUpdatedAt
+                       AND ExecutionKey COLLATE Latin1_General_100_BIN2>@cursorExecutionKey))
+            ORDER BY UpdatedAt DESC,ExecutionKey COLLATE Latin1_General_100_BIN2 ASC;
             """;
-        AddInt(command, "@limit", limit);
+        AddInt(command, "@fetch", checked(limit + 1));
         AddString(command, "@tenantId", 128, tenantId);
+        AddInt(command, "@hasCursor", after is null ? 0 : 1);
+        AddDateTimeOffset(command, "@cursorUpdatedAt", after?.UpdatedAt ?? DateTimeOffset.MinValue);
+        AddAnsiString(command, "@cursorExecutionKey", 64, after?.ExecutionKey ?? new string('0', 64));
         var records = new List<OutcomeUnknownToolExecution>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         while (await reader.ReadAsync(cancellationToken))
             records.Add(new OutcomeUnknownToolExecution(reader.GetString(0), reader.GetString(1), reader.GetString(2),
                 reader.GetString(3), reader.GetString(4), reader.GetFieldValue<DateTimeOffset>(5),
                 reader.GetFieldValue<DateTimeOffset>(6)));
-        return records;
+        var items = records.Take(limit).ToArray();
+        var next = records.Count > limit
+            ? new OutcomeUnknownToolExecutionPageKey(items[^1].UpdatedAt, items[^1].ExecutionKey)
+            : null;
+        return new OutcomeUnknownToolExecutionLedgerPage(items, next);
     }
 
     /// <inheritdoc />

@@ -141,8 +141,9 @@ API 的 `Model`、`Embedding`、`Reranker` 配置分别选择 `Deterministic/Ope
 `Deterministic/OpenAI/AzureOpenAI` 和 `Lexical/HttpSemantic`。真实提供方要求 HTTPS Endpoint、模型标识和
 仅由环境变量或 Secret 配置源提供的 API Key。Embedding 的 `Dimensions` 与 `IndexVersion` 必须和
 OpenSearch 的 `VectorDimensions`、`IndexName` 一致；模型或维度变化必须发布新索引，禁止混用旧向量。
-`Telemetry:OtlpEndpoint` 可选启用 OTLP，生产环境要求 HTTPS；遥测默认不记录 prompt、证据正文、记忆、
-工具参数和 Token。
+`Telemetry:OtlpEndpoint` 在开发环境可选、在 Production 必须配置为 HTTPS。OTLP 同时导出 ASP.NET Core、
+HTTP Client、模型与可信工作流 Trace，以及工作流次数/持续时间、阶段结果分类和记忆清理的新鲜度/删除量指标。
+业务指标只使用受控低基数分类；遥测不记录租户、主体、运行 ID、prompt、证据正文、记忆、工具参数和 Token。生产 SLI、PrometheusRule、无数据语义和事故处置见[可观测性运行手册](docs/operations/observability.md)。
 
 退出码 `0` 表示严格质量门禁通过，`2` 表示题集有效但质量或 Oracle 覆盖不足，`3` 表示题集或套件配置本身无效。当前 v1 150 题基线预期返回 `2`；CI 应把它视为真实阻断，不能改写为成功。v2 小套件必须通过才能接受新的策略变更。
 
@@ -155,7 +156,7 @@ OpenSearch 的 `VectorDimensions`、`IndexName` 一致；模型或维度变化�
   -BasePort 5610
 ```
 
-脚本要求 Docker Desktop 已运行，且指定的 SQL 与九个连续 API 端口均可绑定。它真实执行 001–013 迁移，并先验证正向工具的精确强杀窗口；随后创建真实 `memory.correct` 正向操作和加密补偿记录，在补偿账本已提交 `Executing`、快照尚未解密且 `memory.correct.restore` 尚未调用时强杀实例。脚本确认目标记忆通过共享 SQL 在替代实例可见且仍保持正向值，等待租约过期后查询冻结记录并验证反向重试返回 409；还会执行多实例补偿审批/执行并发单胜者、常规结果不确定探测、跨实例独立审批、第一人复核强杀、两个第二复核实例并发单胜者、Atlas SQL 恢复、运营队列脱敏及 `Reconciled` 滚动回放。脚本不输出数据库密码，失败时保留诊断日志路径，成功后自动删除临时资源。
+脚本要求 Docker Desktop 已运行，且指定的 SQL 与九个连续 API 端口均可绑定。它真实执行 001–014 迁移，并先验证正向工具的精确强杀窗口；随后创建真实 `memory.correct` 正向操作和加密补偿记录，在补偿账本已提交 `Executing`、快照尚未解密且 `memory.correct.restore` 尚未调用时强杀实例。脚本确认目标记忆通过共享 SQL 在替代实例可见且仍保持正向值，等待租约过期后查询冻结记录并验证反向重试返回 409；还会执行多实例补偿审批/执行并发单胜者、常规结果不确定探测、跨实例独立审批、第一人复核强杀、两个第二复核实例并发单胜者、Atlas SQL 恢复、运营队列脱敏及 `Reconciled` 滚动回放。最后停止全部写入者，执行带校验和的 SQL 备份、`RESTORE VERIFYONLY`、删库恢复与 `DBCC CHECKDB`，再用统一迁移器的只读模式核验账本哈希及物理架构，随后用原密钥启动替代 API，证明历史密文可读且幂等终态不会重复执行。脚本不输出数据库密码，成功或失败都会删除临时数据库、备份文件和容器；完整恢复依赖与 RPO/RTO 见[灾难恢复运行手册](docs/operations/disaster-recovery.md)。
 
 2026-07-14 的严格测量基线：150 条全部执行，0 条完整通过、72 条失败、78 条 `NotReady`；可判定动作准确率 46.40%，动作 Oracle 覆盖率 83.33%，必需来源 micro recall 79.59%，完整可执行 Oracle 覆盖率 0%，28 条 critical 用例全部阻断，质量门禁正确失败。当前独立 v2 critical 套件为 16 Pass / 0 Fail / 0 NotReady，动作、引用和 Oracle 覆盖率均为 100%，门禁退出码 0；除输入安全、ACL 和间接注入外，还覆盖跨用户记忆、删除后无旧缓存、工具精确参数/替换/重放/过期以及 PII Transform、凭证和身份证失败关闭。此前的“决策 90%、引用 75%、安全/ACL 100%”使用了宽泛动作兜底、全权限主体和无来源即引用成功等错误口径，已经废止，不能用于版本比较。
 
@@ -302,7 +303,16 @@ $env:AIMENTOR_MEMORY_FINGERPRINT_KEY = '<独立且稳定的32字节Base64密钥>
 dotnet run --project src\AiMentor.Api
 ```
 
-开发环境 SQL Server 模式会按需创建工具审批、Agent 检查点、执行/补偿对账、Atlas 排查、运营动作审计以及加密记忆表，并用数据库应用锁避免多个实例同时建表。Production 强制 `Workflow:Provider=SqlServer`、记忆使用同一共享 SQL、`Encrypt=True`、`TrustServerCertificate=False`，且默认关闭运行时建表；发布账号应按编号依次执行 [`001_workflow.sql`](deploy/sql/001_workflow.sql) 至 [`013_workflow_ordinal_identities.sql`](deploy/sql/013_workflow_ordinal_identities.sql) 的全部迁移，应用账号只授予表级读写权限。013 会把历史审批、Agent 运行、工具执行/对账、补偿和 Atlas 的身份列全部升级为二进制序数语义；发现仅大小写不同的身份别名时会整笔失败关闭，必须先人工核实归属。
+开发环境 SQL Server 模式会按需创建工具审批、Agent 检查点、执行/补偿对账、Atlas 排查、运营动作审计以及加密记忆表。Production 强制 `Workflow:Provider=SqlServer`、记忆使用同一共享 SQL、`Encrypt=True`、`TrustServerCertificate=False`，且默认关闭运行时建表。发布必须使用统一迁移器，不能再用无账本的 `sqlcmd` 循环：
+
+```powershell
+$env:ConnectionStrings__WorkflowSqlServer = '<发布账号连接串>'
+$env:AIMENTOR_MIGRATIONS_ROOT = (Resolve-Path deploy/sql)
+$env:AIMENTOR_RELEASE_ID = '<不可变镜像摘要或发布编号>'
+dotnet run --project src/AiMentor.Migrations -c Release
+```
+
+迁移器严格要求从 `001` 开始连续且唯一的 `NNN_*.sql`，为脚本计算 SHA-256，在 session 级应用锁内核对 `dbo.AiMentorSchemaMigrations`，并把每个脚本及其账本行置于同一外层事务。双发布者可安全收敛；脚本或账本篡改、跳号、数据库超前/落后、名称漂移都会失败关闭。Production 启动和每次 readiness 还会只读核对完整账本，以及关键表、列类型、BIN2 排序规则、索引和外键的物理契约；事后删列不能凭一份旧账本假绿。应用账号只授予业务表 DML、记忆清理状态表读写和所需元数据读取权限。013 会把历史审批、Agent 运行、工具执行/对账、补偿和 Atlas 的身份列全部升级为二进制序数语义；发现仅大小写不同的身份别名时会整笔失败关闭，必须先人工核实归属。014 增加数据库共享的记忆清理成功时间，未取得应用锁的副本只能依据该时间判断集群清理新鲜度，不能把争锁空转误报为成功。
 
 ### 记忆密钥轮换
 
@@ -354,7 +364,7 @@ GROUP BY KeyVersion;
 
 ### 结果不确定对账边界
 
-`GET /api/v1/tool-executions/outcome-unknown?limit=50` 是对账闭环的只读入口。应用层再次强制 `tool-reconcilers` 组门禁，存储层按 `TenantId` 过滤，并只返回执行摘要。迁移前的历史记录没有可信租户归属，因此 `TenantId IS NULL` 时对任何租户都不可见。每次查询只记录租户、调用人和数量，不记录参数或结果。
+`GET /api/v1/tool-executions/outcome-unknown?limit=50` 是对账闭环的只读入口。应用层再次强制 `tool-reconcilers` 组门禁，存储层按 `TenantId` 过滤，并只返回执行摘要。结果按 `UpdatedAt DESC + ExecutionKey BIN2 ASC` 做 keyset 分页；首个兼容数组响应通过 `X-AiMentor-Next-Cursor` 返回下一页游标，后续把该值作为 `cursor` 查询参数即可取得带 `items/nextCursor` 的分页响应。游标是绑定租户和排序版本的 HMAC-SHA256 认证 base64url 数据，不携带租户或参数；篡改和跨租户复用返回 400。运营队列会有界遍历全部页，重复、停滞或超过配置上限时失败关闭，因此较旧冻结事故不会因固定 `TOP 100` 永久消失。迁移前的历史记录没有可信租户归属，因此 `TenantId IS NULL` 时对任何租户都不可见。每次查询只记录租户、调用人和数量，不记录参数或结果。
 
 此接口故意不提供“清除状态”“标记成功”或“再次执行”。在目标系统没有可验证状态查询、补偿契约、双人复核与审计原因之前，人工改变 `OutcomeUnknown` 可能制造重复副作用或掩盖真实失败。后续应为每个修改性工具单独实现目标状态适配器，再设计受控裁决状态机，而不是提供通用解冻按钮。
 
@@ -483,15 +493,32 @@ $env:Operations__Web__DataProtectionDecryptionCertificatePaths__0 = '/run/secret
 $env:AIMENTOR_OPERATIONS_DATA_PROTECTION_CERTIFICATE_PASSWORD = '<来自密钥系统>'
 ```
 
-发布流程必须先在唯一共享卷的 Data Protection 目录写入只含上述 GUID 的 `.aimentor-cluster-id`，并用活动证书预生成至少一个 key；应用不会自行创建 marker，Production 也已关闭自动 key 生成。把全部 `key-*.xml` 文件名中的 GUID 按序排序、以换行连接后计算 SHA-256，作为 `DataProtectionKeyRingFingerprint` 随发布注入。轮换必须由受控 init job 先在共享卷增加 key，再同步更新指纹并滚动部署；这使各副本误挂空本地卷、缺 key 或出现分叉 key ring 时启动失败，而完整复制同一 key ring 的等价卷仍具备跨副本解密能力。启动会真实读取 OIDC discovery，校验 issuer、authorization/token/JWKS HTTPS 端点和签名密钥；共享目录必须位于静态目录之外且可写，活动 RSA 证书必须有效，未撤销历史 key 会逐一创建加密器，撤销 key 则允许退役旧证书，最后完成 Protect/Unprotect 往返。旧解密证书环支持无损轮换，过早移除仍在用证书会阻止启动。运营静态资源只按精确白名单发布 `/ops` 下的 HTML、JS 和两份 CSS，不会把 WebRoot 中的其他文件暴露为下载。SQL 记忆 readiness 还会验证 012 的必需列、BIN2 排序规则、索引键顺序、现存密钥版本及样本认证解密、DML 权限和保留期应用锁；后台清理失败会把 `/health/ready` 降为 503，成功恢复后自动转绿。任一启动检查失败时 Production 在接收流量前退出。运营审计每租户同时受待复核容量和总记录容量约束；归档的未知副作用仍保留可见冻结记录，但不会造成无界扫描。
+发布流程必须先在唯一共享卷的 Data Protection 目录写入只含上述 GUID 的 `.aimentor-cluster-id`，并用活动证书预生成至少一个 key；应用不会自行创建 marker，Production 也已关闭自动 key 生成。把全部 `key-*.xml` 文件名中的 GUID 按序排序、以换行连接后计算 SHA-256，作为 `DataProtectionKeyRingFingerprint` 随发布注入。轮换必须由受控 init job 先在共享卷增加 key，再同步更新指纹并滚动部署；这使各副本误挂空本地卷、缺 key 或出现分叉 key ring 时启动失败，而完整复制同一 key ring 的等价卷仍具备跨副本解密能力。启动会真实读取 OIDC discovery，校验 issuer、authorization/token/JWKS HTTPS 端点和签名密钥；共享目录必须位于静态目录之外且可写，活动 RSA 证书必须有效，未撤销历史 key 会逐一创建加密器，撤销 key 则允许退役旧证书，最后完成 Protect/Unprotect 往返。旧解密证书环支持无损轮换，过早移除仍在用证书会阻止启动。运营静态资源只按精确白名单发布 `/ops` 下的 HTML、JS 和两份 CSS，不会把 WebRoot 中的其他文件暴露为下载。SQL 记忆 readiness 还会验证 012 的必需列、BIN2 排序规则、索引键顺序、现存密钥版本及样本认证解密、DML 权限和保留期应用锁；后台清理的连续失败或超过两个清理周期仍未成功都会把 `/health/ready` 降为 503，成功恢复后自动转绿。任一启动检查失败时 Production 在接收流量前退出。运营审计每租户同时受待复核容量和总记录容量约束；归档的未知副作用仍保留可见冻结记录，但不会造成无界扫描。
 
-Linux 容器门禁位于 `.github/workflows/linux-containers.yml`，在 PR、`main` 推送和手工触发时执行三个独立任务：
+根目录 [`Dockerfile`](Dockerfile) 会把 API、迁移器和 SQL manifest 发布到同一个 .NET 10 chiseled 镜像，最终进程固定为非 root UID 1654。[`deploy/helm/aimentor`](deploy/helm/aimentor) 提供两副本 Deployment、PDB、NetworkPolicy、可选 TLS Ingress、只读根文件系统、`/tmp` 临时卷、共享 Data Protection PVC/证书 Secret 和 `pre-install,pre-upgrade` 迁移 Hook。Chart 不创建 Secret；API 使用现有业务 Secret，迁移 Hook 则强制使用独立最小权限 Secret，并且只读取其中的 `ConnectionStrings__WorkflowSqlServer` 键，避免数据库迁移进程继承 API Key、OIDC client secret 或加密密钥。Chart 还会显式要求生产 OIDC、OpenSearch、OTLP 和非沙箱 AI Provider 配置。发布示例：
 
-- Ubuntu Release 构建和除外部 SQL 分类外的 280 条自动化测试；
-- SQL Server 2022 service container 上的 12 条记忆/Atlas/运营/完整工作流 SQL 用例，以及租约强杀恢复、多实例补偿审批/执行单胜者、对账、持久恢复和运营任务队列脱敏验收；
+```powershell
+docker build -t '<registry>/aimentor:<release-tag>' .
+# 推送后从 registry 读取 OCI manifest digest；releaseId 必须使用同一个 digest。
+helm upgrade --install aimentor deploy/helm/aimentor `
+  --set-string image.repository='<registry>/aimentor' `
+  --set-string image.digest='<sha256:64位小写十六进制>' `
+  --set-string releaseId='<与 image.digest 完全相同的值>' `
+  --set-string existingSecret='aimentor-production' `
+  --set-string migration.existingSecret='aimentor-migration' `
+  --set-string dataProtection.existingClaim='aimentor-data-protection' `
+  --set-string dataProtection.existingCertificateSecret='aimentor-data-protection-certificate' `
+  -f '<受控的非敏感生产 values 文件>'
+```
+
+Linux 容器门禁位于 `.github/workflows/linux-containers.yml`，在 PR、`main` 推送和手工触发时执行四个独立任务：
+
+- Ubuntu Release 构建和除外部 SQL 分类外的 292 条自动化测试；
+- 非 root、只读根文件系统的生产镜像构建/健康冒烟，以及 Helm lint/template；
+- SQL Server 2022 service container 上的 16 条记忆/Atlas/运营/完整工作流/迁移/分页 SQL 用例，以及租约强杀恢复、多实例补偿审批/执行单胜者、对账、备份恢复和运营任务队列脱敏验收；
 - OpenSearch 3.5.0 真实容器上的双物理索引、Alias 发布/查询/切换和回滚验收。
 
-SQL job 使用 GitHub Actions 的动态宿主端口和 service container ID，不依赖 Windows LocalDB。12 条 `RequiresSqlServer` 用例从通用 Linux job 显式排除，再在 SQL job 中通过 `AIMENTOR_SQLSERVER_TEST_CONNECTION` 全部真实执行；一旦显式配置，连接、迁移或断言失败都会让门禁失败，不会退回跳过。分布式入口支持 Release：
+SQL job 使用 GitHub Actions 的动态宿主端口和 service container ID，不依赖 Windows LocalDB。16 条 `RequiresSqlServer` 用例从通用 Linux job 显式排除，再在 SQL job 中通过 `AIMENTOR_SQLSERVER_TEST_CONNECTION` 全部真实执行；一旦显式配置，连接、迁移或断言失败都会让门禁失败，不会退回跳过。分布式入口支持 Release：
 
 ```powershell
 ./scripts/Test-DistributedReconciliation.ps1 `
@@ -506,6 +533,7 @@ SQL job 使用 GitHub Actions 的动态宿主端口和 service container ID，�
 
 ## 验证状态
 
+- 2026-07-16 本地自动化测试 308/308 通过（非 SQL 292、真实 LocalDB SQL 16），Release 编译 0 警告/错误，独立 v2 critical 套件保持 16/16 Pass。真实构建的 .NET 10 chiseled 镜像以 UID 1654、只读根文件系统、无特权和零 capabilities 启动并通过 readiness；Helm 3.18.4 lint/template 及启用后的 PrometheusRule 渲染通过。真实 SQL Server 2022 灾备演练完成多实例强杀/接管、补偿与双人对账后，继续通过备份校验、删库恢复、`DBCC CHECKDB`、历史记忆/Atlas 密文读取和 `Reconciled` 幂等回放。迁移执行器另已验证双发布者单胜者、零变更重跑、脚本/账本篡改与物理架构漂移失败关闭；205 条同时间戳的 `OutcomeUnknown` SQL 分页无重复、无遗漏。
 - 2026-07-15 本地自动化测试 292/292 通过（非 SQL 280、真实 SQL Server 2022 容器 SQL 12）；独立 v2 critical 套件为 16/16 Pass，动作、引用和 Oracle 覆盖率均为 100%。OIDC discovery/JWKS 与 Provider Chat/Embedding/Reranker 均有独立进程网络验收；运营台 BFF、防伪校验、运营动作双人复核、终态 SLA、全工作流大小写租户隔离、按租户容量、SQL 记忆版本化密钥轮换、过期清理、并发单胜者和硬崩溃冻结已加入回归。真实 SQL Server 2022 分布式验收通过 001–013、共享记忆、Atlas 恢复、运营队列脱敏以及补偿审批/执行并发单胜者。
 - 2026-07-15 本机此前从官方仓库及 Public ECR 拉取 `opensearchproject/opensearch:3.5.0` 有界超时；同日 GitHub Ubuntu 容器门禁运行 `29392014780` 已真实通过固定 3.5.0 的 mapping、bulk、count、Alias 发布/查询/切换和回滚。拉取超时会树级终止进程，且不落盘或回显 Registry/代理错误；本机事后无残留进程、临时日志或容器。
 

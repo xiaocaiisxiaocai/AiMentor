@@ -9,6 +9,7 @@ using AiMentor.Api;
 using AiMentor.Application;
 using AiMentor.Domain;
 using AiMentor.Infrastructure;
+using AiMentor.Migrations;
 using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Cookies;
@@ -22,6 +23,7 @@ using Microsoft.Extensions.AI;
 using Microsoft.Extensions.Options;
 using Microsoft.Extensions.Validation;
 using Microsoft.IdentityModel.Tokens;
+using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 
@@ -163,6 +165,8 @@ if (jwtAuthenticationEnabled)
         if (builder.Environment.IsProduction()) dataProtection.DisableAutomaticKeyGeneration();
         if (!string.IsNullOrWhiteSpace(operationsWebOptions.DataProtectionKeyPath))
             dataProtection.PersistKeysToFileSystem(new DirectoryInfo(operationsWebOptions.DataProtectionKeyPath));
+        else if (!builder.Environment.IsProduction())
+            dataProtection.UseEphemeralDataProtectionProvider();
         if (!string.IsNullOrWhiteSpace(operationsWebOptions.DataProtectionCertificatePath))
         {
             var certificate = X509CertificateLoader.LoadPkcs12FromFile(
@@ -263,6 +267,8 @@ if (jwtAuthenticationEnabled)
 }
 else
 {
+    builder.Services.AddDataProtection().SetApplicationName("AiMentor.Operations")
+        .UseEphemeralDataProtectionProvider();
     builder.Services.AddSingleton<IRequestAccessContextProvider>(new DevelopmentAccessContextProvider(authenticationOptions));
 }
 builder.Services.AddAntiforgery(antiforgeryOptions =>
@@ -432,7 +438,6 @@ else
     builder.Services.AddSingleton<IToolExecutionBarrier>(NoOpToolExecutionBarrier.Instance);
 }
 builder.Services.AddSingleton<IToolExecutor, SafeToolExecutor>();
-builder.Services.AddSingleton(new ToolExecutionReconciliationOptions());
 builder.Services.AddSingleton<IToolOutcomeProbe, MemoryDeleteOutcomeProbe>();
 builder.Services.AddSingleton<IToolExecutionReconciliationService, ToolExecutionReconciliationService>();
 builder.Services.AddSingleton<IToolCompensationOutcomeProbe, MemoryCorrectRestoreOutcomeProbe>();
@@ -452,10 +457,19 @@ builder.Services.AddSingleton<ICitationMapper, RuleBasedCitationMapper>();
 builder.Services.AddSingleton<ICitationVerifier, RuleBasedCitationVerifier>();
 builder.Services.AddSingleton<IEvidenceConflictDetector, RuleBasedEvidenceConflictDetector>();
 builder.Services.AddSingleton<IEvidenceSufficiencyEvaluator, RuleBasedEvidenceSufficiencyEvaluator>();
-builder.Services.AddSingleton<InMemoryTraceSink>();
 builder.Services.AddSingleton<OpenTelemetryTraceSink>();
-builder.Services.AddSingleton<ITraceSink>(services => new CompositeTraceSink(
-    services.GetRequiredService<InMemoryTraceSink>(), services.GetRequiredService<OpenTelemetryTraceSink>()));
+builder.Services.AddSingleton<IWorkflowMetrics, OpenTelemetryWorkflowMetrics>();
+if (builder.Environment.IsProduction())
+{
+    // 生产只保留可导出的遥测，避免无界进程内轨迹随流量持续占用内存。
+    builder.Services.AddSingleton<ITraceSink>(services => services.GetRequiredService<OpenTelemetryTraceSink>());
+}
+else
+{
+    builder.Services.AddSingleton<InMemoryTraceSink>();
+    builder.Services.AddSingleton<ITraceSink>(services => new CompositeTraceSink(
+        services.GetRequiredService<InMemoryTraceSink>(), services.GetRequiredService<OpenTelemetryTraceSink>()));
+}
 builder.Services.AddSingleton<IChatClient>(services => new ChatClientBuilder(baseChatClient)
     .UseOpenTelemetry(services.GetRequiredService<ILoggerFactory>(), "AiMentor.Model",
         telemetry => telemetry.EnableSensitiveData = false)
@@ -496,6 +510,22 @@ var memoryFingerprintKey = ResolveMemoryFingerprintKey(
     configuredMemoryFingerprintKey, memoryKeys[memoryKeyVersion], builder.Environment.IsProduction());
 var memoryCipher = new AesGcmMemoryCipher(memoryKeyVersion, memoryKeys, memoryFingerprintKey);
 builder.Services.AddSingleton<IMemoryCipher>(memoryCipher);
+var toolExecutionMaximumPageSize = builder.Configuration.GetValue(
+    "ToolExecutionReconciliation:MaximumPageSize", 100);
+var toolExecutionMaximumOperationsScan = builder.Configuration.GetValue(
+    "ToolExecutionReconciliation:MaximumOperationsScan", 10_000);
+if (toolExecutionMaximumPageSize is < 1 or > 1_000
+    || toolExecutionMaximumOperationsScan < toolExecutionMaximumPageSize
+    || toolExecutionMaximumOperationsScan > 100_000)
+    throw new InvalidOperationException("工具执行对账分页或运营扫描上限配置无效。");
+builder.Services.AddSingleton(new ToolExecutionReconciliationOptions
+{
+    MaximumPageSize = toolExecutionMaximumPageSize,
+    MaximumOperationsScan = toolExecutionMaximumOperationsScan,
+    // 使用跨实例稳定的独立指纹密钥派生游标签名密钥，游标本身不携带租户信息。
+    CursorSigningKey = HMACSHA256.HashData(memoryFingerprintKey,
+        Encoding.UTF8.GetBytes("AiMentor.ToolExecutionCursor.Signing.v1"))
+});
 var workflowKeyVersion = builder.Configuration["Workflow:Encryption:ActiveKeyVersion"] ?? "v1";
 var workflowKeys = ResolveWorkflowKeys(builder.Configuration, workflowKeyVersion, memoryKeys[memoryKeyVersion],
     builder.Environment.IsProduction() && string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase));
@@ -504,8 +534,10 @@ builder.Services.AddSingleton<IWorkflowStateCipher>(
 var sqlConnectionConfigured = false;
 var sqlEncrypt = false;
 var sqlTrustServerCertificate = false;
+string? workflowSqlConnectionString = null;
 var memoryRetentionHealth = new MemoryRetentionHealthState(
-    string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase));
+    string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase), TimeProvider.System,
+    TimeSpan.FromMinutes(memoryRetentionIntervalMinutes * 2));
 builder.Services.AddSingleton(memoryRetentionHealth);
 if (string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreCase))
 {
@@ -514,6 +546,7 @@ if (string.Equals(workflowProvider, "SqlServer", StringComparison.OrdinalIgnoreC
     if (string.IsNullOrWhiteSpace(connectionString))
         throw new InvalidOperationException("Workflow:Provider=SqlServer 时必须配置 ConnectionStrings:WorkflowSqlServer。");
     var sqlConnection = new Microsoft.Data.SqlClient.SqlConnectionStringBuilder(connectionString);
+    workflowSqlConnectionString = connectionString;
     sqlConnectionConfigured = true;
     sqlEncrypt = sqlConnection.Encrypt;
     sqlTrustServerCertificate = sqlConnection.TrustServerCertificate;
@@ -610,6 +643,23 @@ var openSearchUsername = builder.Configuration["OpenSearch:Username"]
     ?? Environment.GetEnvironmentVariable("AIMENTOR_OPENSEARCH_USERNAME");
 var openSearchPassword = builder.Configuration["OpenSearch:Password"]
     ?? Environment.GetEnvironmentVariable("AIMENTOR_OPENSEARCH_PASSWORD");
+var otlpEndpoint = builder.Configuration["Telemetry:OtlpEndpoint"];
+Uri? otlpUri = null;
+if (!string.IsNullOrWhiteSpace(otlpEndpoint))
+{
+    if (!Uri.TryCreate(otlpEndpoint, UriKind.Absolute, out otlpUri)
+        || (otlpUri.Scheme != Uri.UriSchemeHttps && otlpUri.Scheme != Uri.UriSchemeHttp)
+        || (builder.Environment.IsProduction() && otlpUri.Scheme != Uri.UriSchemeHttps))
+        throw new InvalidOperationException("Telemetry:OtlpEndpoint 无效，生产环境必须使用 HTTPS。");
+}
+var migrationReadinessProbe = builder.Environment.IsProduction()
+    ? new WorkflowMigrationReadinessProbe(
+        new SqlServerMigrationVerifier(workflowSqlConnectionString
+            ?? throw new InvalidOperationException("Production 缺少工作流 SQL Server 连接串。")),
+        MigrationDiscovery.Discover(builder.Configuration["Migrations:Root"]
+            ?? Path.Combine(builder.Environment.ContentRootPath, "deploy", "sql")))
+    : new WorkflowMigrationReadinessProbe(null);
+builder.Services.AddSingleton(migrationReadinessProbe);
 builder.Services.AddSingleton(new SystemDoctorOptions
 {
     IsProduction = builder.Environment.IsProduction(),
@@ -632,6 +682,7 @@ builder.Services.AddSingleton(new SystemDoctorOptions
     SqlConnectionConfigured = sqlConnectionConfigured,
     SqlEncrypt = sqlEncrypt,
     SqlTrustServerCertificate = sqlTrustServerCertificate,
+    TelemetryExporterConfigured = otlpUri is not null,
     RagProvider = ragProvider,
     OpenSearchEndpoint = builder.Configuration["OpenSearch:Endpoint"] ?? "http://127.0.0.1:9200",
     OpenSearchAuthenticationConfigured = !string.IsNullOrWhiteSpace(openSearchUsername)
@@ -657,14 +708,21 @@ var telemetryBuilder = builder.Services.AddOpenTelemetry()
         .AddAspNetCoreInstrumentation()
         .AddHttpClientInstrumentation()
         .AddSource(OpenTelemetryTraceSink.SourceName)
-        .AddSource("AiMentor.Model"));
-var otlpEndpoint = builder.Configuration["Telemetry:OtlpEndpoint"];
-if (!string.IsNullOrWhiteSpace(otlpEndpoint))
+        .AddSource("AiMentor.Model"))
+    .WithMetrics(metrics => metrics
+        .AddAspNetCoreInstrumentation()
+        .AddHttpClientInstrumentation()
+        .AddMeter(AiMentorTelemetry.MeterName)
+        // 默认 10 到 25 的大桶无法可靠判断 15 秒 SLO，显式边界同时限制时序数量。
+        .AddView(AiMentorTelemetry.WorkflowDurationName, new ExplicitBucketHistogramConfiguration
+        {
+            Boundaries = [0.1, 0.25, 0.5, 1, 2, 5, 10, 12, 15, 18, 20, 30, 60, 120]
+        }));
+if (otlpUri is not null)
 {
-    if (!Uri.TryCreate(otlpEndpoint, UriKind.Absolute, out var otlpUri)
-        || (builder.Environment.IsProduction() && otlpUri.Scheme != Uri.UriSchemeHttps))
-        throw new InvalidOperationException("Telemetry:OtlpEndpoint 无效，生产环境必须使用 HTTPS。");
-    telemetryBuilder.WithTracing(tracing => tracing.AddOtlpExporter(options => options.Endpoint = otlpUri));
+    telemetryBuilder
+        .WithTracing(tracing => tracing.AddOtlpExporter(options => options.Endpoint = otlpUri))
+        .WithMetrics(metrics => metrics.AddOtlpExporter(options => options.Endpoint = otlpUri));
 }
 
 var app = builder.Build();
@@ -740,6 +798,10 @@ if (builder.Environment.IsProduction())
         ?? throw new InvalidOperationException("Production 记忆存储未注册为 SQL Server 实现。");
     using var sqlProbeTimeout = new CancellationTokenSource(
         TimeSpan.FromSeconds(operationsWebOptions.DiscoveryTimeoutSeconds));
+    var migrationCheck = await app.Services.GetRequiredService<WorkflowMigrationReadinessProbe>()
+        .CheckAsync(sqlProbeTimeout.Token);
+    if (migrationCheck.Status == SystemCheckStatus.Failed)
+        throw new InvalidOperationException($"Production 迁移账本检查失败：{migrationCheck.Code}");
     await sqlMemory.ProbeReadinessAsync(sqlProbeTimeout.Token);
 }
 var systemDoctor = app.Services.GetRequiredService<ISystemDoctor>();
@@ -1000,8 +1062,9 @@ toolCompensations.MapPost("/{compensationId}/reviews", ReviewOutcomeUnknownToolC
 var toolExecutions = v1.MapGroup("/tool-executions").WithTags("AiMentor tool reconciliation v1");
 toolExecutions.MapGet("/outcome-unknown", ListOutcomeUnknownToolExecutionsAsync)
     .WithName("ListOutcomeUnknownToolExecutionsV1")
-    .WithSummary("由当前租户的工具对账人员查看结果不确定执行摘要")
+    .WithSummary("由当前租户的工具对账人员按认证游标查看结果不确定执行摘要")
     .Produces<IReadOnlyList<OutcomeUnknownToolExecution>>()
+    .Produces<OutcomeUnknownToolExecutionPage>()
     .ProducesValidationProblem()
     .ProducesProblem(StatusCodes.Status403Forbidden)
     .RequireRateLimiting("questions");
@@ -1480,15 +1543,20 @@ static async Task<IResult> ReviewOutcomeUnknownToolCompensationAsync(string comp
     }
 }
 
-static async Task<IResult> ListOutcomeUnknownToolExecutionsAsync(int? limit,
+static async Task<IResult> ListOutcomeUnknownToolExecutionsAsync(int? limit, string? cursor,
     IToolExecutionReconciliationService service, IRequestAccessContextProvider accessProvider,
     HttpContext context, CancellationToken cancellationToken)
 {
     try
     {
         var effectiveLimit = limit ?? 50;
-        return Results.Ok(await service.ListOutcomeUnknownAsync(
-            accessProvider.GetAccessContext(context.User), effectiveLimit, cancellationToken));
+        var page = await service.ListOutcomeUnknownPageAsync(
+            accessProvider.GetAccessContext(context.User), effectiveLimit, cursor, cancellationToken);
+        if (cursor is not null) return Results.Ok(page);
+        // 保持旧无 cursor 调用的数组响应；下一页游标通过安全响应头提供给升级中的客户端。
+        if (page.NextCursor is not null)
+            context.Response.Headers["X-AiMentor-Next-Cursor"] = page.NextCursor;
+        return Results.Ok(page.Items);
     }
     catch (ToolExecutionReconciliationException exception)
     {
@@ -1690,10 +1758,30 @@ static async Task WriteEventAsync(HttpResponse response, string eventName, objec
     await response.Body.FlushAsync(cancellationToken);
 }
 
-static async Task<IResult> ReadyAsync(ISystemDoctor doctor, CancellationToken cancellationToken)
+static async Task<IResult> ReadyAsync(ISystemDoctor doctor, WorkflowMigrationReadinessProbe migrationProbe,
+    IMemoryStore memoryStore, CancellationToken cancellationToken)
 {
     var report = await doctor.RunAsync(cancellationToken);
-    return Results.Json(report, statusCode: report.IsReady
+    var migrationCheck = await migrationProbe.CheckAsync(cancellationToken);
+    var checks = report.Checks.Concat([migrationCheck]).ToList();
+    if (memoryStore is SqlServerMemoryStore sqlMemory)
+    {
+        try
+        {
+            await sqlMemory.ProbeReadinessAsync(cancellationToken);
+            checks.Add(new SystemCheckResult("memory.sql.runtime", SystemCheckSeverity.Critical,
+                SystemCheckStatus.Passed, "MEMORY_SQL_RUNTIME_READY", "SQL 记忆结构、权限和密钥样本验证通过。"));
+        }
+        catch (Exception) when (!cancellationToken.IsCancellationRequested)
+        {
+            // SQL 驱动错误可能携带连接信息；readiness 只返回稳定失败码。
+            checks.Add(new SystemCheckResult("memory.sql.runtime", SystemCheckSeverity.Critical,
+                SystemCheckStatus.Failed, "MEMORY_SQL_RUNTIME_FAILED", "SQL 记忆动态验证失败。"));
+        }
+    }
+    var combined = new SystemDiagnosticReport(
+        report.IsReady && checks.All(item => item.Status != SystemCheckStatus.Failed), report.CheckedAt, checks);
+    return Results.Json(combined, statusCode: combined.IsReady
         ? StatusCodes.Status200OK : StatusCodes.Status503ServiceUnavailable);
 }
 

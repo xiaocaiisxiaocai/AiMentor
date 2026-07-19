@@ -35,6 +35,55 @@ public sealed class ToolExecutionReconciliationServiceTests
     }
 
     [Fact]
+    public async Task SignedKeysetCursorShouldReturnEveryRecordAndRejectTamperingOrTenantReuse()
+    {
+        var now = new DateTimeOffset(2026, 7, 16, 1, 0, 0, TimeSpan.Zero);
+        var ledger = new InMemoryToolExecutionLedger(new FixedTimeProvider(now));
+        var expectedKeys = Enumerable.Range(0, 205).Select(index =>
+            index.ToString("X64", System.Globalization.CultureInfo.InvariantCulture)).ToArray();
+        foreach (var key in expectedKeys)
+            await AddUnknownAsync(ledger, key, "tenant-a");
+        var options = new ToolExecutionReconciliationOptions
+        {
+            MaximumPageSize = 100,
+            MaximumOperationsScan = 500,
+            CursorSigningKey = Enumerable.Repeat((byte)0x5A, 32).ToArray()
+        };
+        var service = new ToolExecutionReconciliationService(
+            ledger, new InMemoryTraceSink(), options, new FixedTimeProvider(now), []);
+        var access = AccessContext.Create("tenant-a", "reconciler-a", ["tool-reconcilers"]);
+
+        var first = await service.ListOutcomeUnknownPageAsync(access, 100);
+        var all = new List<OutcomeUnknownToolExecution>(first.Items);
+        var cursor = first.NextCursor;
+        while (cursor is not null)
+        {
+            var page = await service.ListOutcomeUnknownPageAsync(access, 100, cursor);
+            all.AddRange(page.Items);
+            cursor = page.NextCursor;
+        }
+        var tampered = first.NextCursor![..^1]
+                       + (first.NextCursor[^1] == 'A' ? 'B' : 'A');
+        var tamperFailure = await Assert.ThrowsAsync<ToolExecutionReconciliationException>(() =>
+            service.ListOutcomeUnknownPageAsync(access, 100, tampered));
+        var tenantFailure = await Assert.ThrowsAsync<ToolExecutionReconciliationException>(() =>
+            service.ListOutcomeUnknownPageAsync(
+                AccessContext.Create("tenant-b", "reconciler-b", ["tool-reconcilers"]), 100,
+                first.NextCursor));
+
+        Assert.Equal(expectedKeys, all.Select(item => item.ExecutionKey));
+        Assert.Equal(205, all.Select(item => item.ExecutionKey).Distinct(StringComparer.Ordinal).Count());
+        Assert.Equal("TOOL_RECONCILIATION_CURSOR_INVALID", tamperFailure.Code);
+        Assert.Equal("TOOL_RECONCILIATION_CURSOR_INVALID", tenantFailure.Code);
+        var encodedEnvelope = first.NextCursor!.Replace('-', '+').Replace('_', '/');
+        encodedEnvelope += new string('=', (4 - encodedEnvelope.Length % 4) % 4);
+        var envelope = System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(encodedEnvelope));
+        Assert.DoesNotContain("tenant-a", envelope, StringComparison.Ordinal);
+        Assert.DoesNotContain("subject-a", envelope, StringComparison.Ordinal);
+        Assert.DoesNotContain("memory.delete", envelope, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task MemoryDeleteProbeShouldVerifyFingerprintAndReportTargetState()
     {
         var ledger = new InMemoryToolExecutionLedger(TimeProvider.System);
@@ -112,12 +161,19 @@ public sealed class ToolExecutionReconciliationServiceTests
             [new MemoryDeleteOutcomeProbe(memoryStore ?? new InMemoryMemoryStore(), TimeProvider.System)]);
 
     private static async Task AddUnknownAsync(InMemoryToolExecutionLedger ledger, char marker, string tenantId)
+        => await AddUnknownAsync(ledger, new string(marker, 64), tenantId);
+
+    private static async Task AddUnknownAsync(InMemoryToolExecutionLedger ledger, string key, string tenantId)
     {
-        var key = new string(marker, 64);
-        var acquired = await ledger.TryAcquireAsync(new ToolExecutionLedgerRequest(key, new string(marker, 64),
-            $"run-{marker}", tenantId, "subject-a", "memory.delete"), TimeSpan.FromSeconds(30),
-            TimeSpan.FromHours(1), 100);
+        var acquired = await ledger.TryAcquireAsync(new ToolExecutionLedgerRequest(key, new string('A', 64),
+            $"run-{key[..8]}", tenantId, "subject-a", "memory.delete"), TimeSpan.FromSeconds(30),
+            TimeSpan.FromHours(1), 500);
         await ledger.MarkExecutingAsync(key, acquired.LeaseToken!);
         await ledger.MarkOutcomeUnknownAsync(key, acquired.LeaseToken!);
+    }
+
+    private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => now;
     }
 }

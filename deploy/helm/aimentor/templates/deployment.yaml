@@ -1,0 +1,136 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "aimentor.fullname" . }}
+  labels:
+    {{- include "aimentor.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      {{- include "aimentor.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "aimentor.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1654
+        runAsGroup: 1654
+        fsGroup: 1654
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: api
+          image: {{ include "aimentor.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - secretRef:
+                name: {{ include "aimentor.existingSecret" . }}
+            # 非敏感生产不变量后置，避免 Secret 中同名旧键把环境降级为 Development 或沙箱 Provider。
+            - configMapRef:
+                name: {{ include "aimentor.fullname" . }}
+          env:
+            - name: POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            # 每个副本必须拥有唯一 instance，避免累计 Counter 与 Histogram 在 Prometheus 中串流。
+            - name: OTEL_RESOURCE_ATTRIBUTES
+              value: "service.name=AiMentor.Api,service.instance.id=$(POD_UID)"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1654
+            capabilities:
+              drop:
+                - ALL
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            {{- toYaml .Values.probes.startup | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: data-protection-keys
+              mountPath: /var/lib/aimentor/data-protection
+            - name: data-protection-certificate
+              mountPath: /var/run/aimentor/data-protection
+              readOnly: true
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: data-protection-keys
+          persistentVolumeClaim:
+            claimName: {{ include "aimentor.dataProtectionClaim" . }}
+        - name: data-protection-certificate
+          secret:
+            secretName: {{ include "aimentor.dataProtectionCertificateSecret" . }}
+            # 证书只授予 Pod 安全组读取，避免 root 所有的 0400 文件让非 root 进程无法启动。
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.dataProtection.certificateKey | quote }}
+                path: tls.pfx
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - maxSkew: {{ .maxSkew }}
+          topologyKey: {{ .topologyKey | quote }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "aimentor.selectorLabels" $ | nindent 14 }}
+        {{- end }}
+      {{- end }}

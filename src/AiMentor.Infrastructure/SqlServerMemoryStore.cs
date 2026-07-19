@@ -27,7 +27,7 @@ public sealed class SqlServerMemoryStore(SqlServerWorkflowOptions options, IMemo
         command.CommandText = ReadinessSql;
         if (Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken),
                 System.Globalization.CultureInfo.InvariantCulture) != 1)
-            throw new InvalidOperationException("SQL Server 记忆迁移 012 的结构、索引、排序规则或 DML 权限不完整。");
+            throw new InvalidOperationException("SQL Server 记忆迁移 012/014 的结构、索引、排序规则或 DML 权限不完整。");
 
         await using (var versions = connection.CreateCommand())
         {
@@ -431,7 +431,7 @@ public sealed class SqlServerMemoryStore(SqlServerWorkflowOptions options, IMemo
     }
 
     /// <inheritdoc />
-    public async Task<MemoryPurgeResult> PurgeExpiredAsync(DateTimeOffset now, int maximumRowsPerTable,
+    public async Task<MemoryPurgeResult> PurgeExpiredAsync(int maximumRowsPerTable,
         CancellationToken cancellationToken = default)
     {
         if (maximumRowsPerTable is < 1 or > 10_000)
@@ -454,9 +454,16 @@ public sealed class SqlServerMemoryStore(SqlServerWorkflowOptions options, IMemo
                 var result = Convert.ToInt32(await acquire.ExecuteScalarAsync(cancellationToken),
                     System.Globalization.CultureInfo.InvariantCulture);
                 if (result < 0)
-                    return await CommitAsync(transaction, new MemoryPurgeResult(false, 0, 0), cancellationToken);
+                {
+                    var state = await ReadRetentionStateAsync(connection, transaction, cancellationToken);
+                    return await CommitAsync(transaction,
+                        new MemoryPurgeResult(false, 0, 0, state.LastCompletedAt, state.MonitoringStartedAt),
+                        cancellationToken);
+                }
             }
 
+            // 永久删除的截止时间必须来自数据库，不能信任任一应用节点可能漂移的本机时钟。
+            var now = await ReadDatabaseUtcNowAsync(connection, transaction, cancellationToken);
             var proposalsDeleted = 0;
             proposalsDeleted += await DeleteBatchAsync(connection, transaction, ProposalTable,
                 "Status<>0", now, maximumRowsPerTable - proposalsDeleted, cancellationToken);
@@ -467,8 +474,24 @@ public sealed class SqlServerMemoryStore(SqlServerWorkflowOptions options, IMemo
                 "MemoryExpiresAt<=@now", now, maximumRowsPerTable - proposalsDeleted, cancellationToken);
             var memoriesDeleted = await DeleteBatchAsync(connection, transaction, MemoryTable,
                 "ExpiresAt<=@now", now, maximumRowsPerTable, cancellationToken);
+            RetentionState completedState;
+            await using (var completion = connection.CreateCommand())
+            {
+                completion.Transaction = transaction;
+                completion.CommandText = """
+                    UPDATE dbo.AiMentorMemoryRetentionState
+                    SET LastCompletedAt=SYSUTCDATETIME()
+                    OUTPUT inserted.LastCompletedAt,inserted.MonitoringStartedAt
+                    WHERE Id=1;
+                    """;
+                await using var reader = await completion.ExecuteReaderAsync(cancellationToken);
+                if (!await reader.ReadAsync(cancellationToken))
+                    throw new InvalidOperationException("记忆保留期共享成功状态不存在，拒绝把清理误报为成功。");
+                completedState = new RetentionState(reader.GetDateTimeOffset(0), reader.GetDateTimeOffset(1));
+            }
             return await CommitAsync(transaction,
-                new MemoryPurgeResult(true, proposalsDeleted, memoriesDeleted), cancellationToken);
+                new MemoryPurgeResult(true, proposalsDeleted, memoriesDeleted, completedState.LastCompletedAt,
+                    completedState.MonitoringStartedAt), cancellationToken);
         }
         catch
         {
@@ -476,6 +499,34 @@ public sealed class SqlServerMemoryStore(SqlServerWorkflowOptions options, IMemo
             throw;
         }
     }
+
+    private static async Task<RetentionState> ReadRetentionStateAsync(SqlConnection connection,
+        SqlTransaction transaction, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = """
+            SELECT LastCompletedAt,MonitoringStartedAt
+            FROM dbo.AiMentorMemoryRetentionState WHERE Id=1;
+            """;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+            throw new InvalidOperationException("记忆保留期共享状态行不存在。");
+        return new RetentionState(reader.IsDBNull(0) ? null : reader.GetDateTimeOffset(0),
+            reader.GetDateTimeOffset(1));
+    }
+
+    private static async Task<DateTimeOffset> ReadDatabaseUtcNowAsync(SqlConnection connection,
+        SqlTransaction transaction, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.Transaction = transaction;
+        command.CommandText = "SELECT CONVERT(datetimeoffset(7),SYSUTCDATETIME());";
+        return (DateTimeOffset)(await command.ExecuteScalarAsync(cancellationToken)
+            ?? throw new InvalidOperationException("无法读取 SQL Server UTC 时间。"));
+    }
+
+    private sealed record RetentionState(DateTimeOffset? LastCompletedAt, DateTimeOffset MonitoringStartedAt);
 
     public void Dispose() => _initializationGate.Dispose();
 
@@ -761,7 +812,8 @@ public sealed class SqlServerMemoryStore(SqlServerWorkflowOptions options, IMemo
         DECLARE @ready int=1;
         DECLARE @proposalId int=OBJECT_ID(N'dbo.AiMentorMemoryProposals',N'U');
         DECLARE @memoryId int=OBJECT_ID(N'dbo.AiMentorMemories',N'U');
-        IF @proposalId IS NULL OR @memoryId IS NULL SET @ready=0;
+        DECLARE @retentionId int=OBJECT_ID(N'dbo.AiMentorMemoryRetentionState',N'U');
+        IF @proposalId IS NULL OR @memoryId IS NULL OR @retentionId IS NULL SET @ready=0;
 
         IF EXISTS (
             SELECT 1 FROM (VALUES
@@ -777,6 +829,13 @@ public sealed class SqlServerMemoryStore(SqlServerWorkflowOptions options, IMemo
                 (N'ExpiresAt'),(N'RowVersion')) required(Name)
             WHERE NOT EXISTS (SELECT 1 FROM sys.columns c WHERE c.object_id=@memoryId AND c.name=required.Name))
             SET @ready=0;
+        IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id=@retentionId AND name=N'Id'
+            AND system_type_id=48 AND is_nullable=0) SET @ready=0;
+        IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id=@retentionId AND name=N'LastCompletedAt'
+            AND system_type_id=43 AND scale=7 AND is_nullable=1) SET @ready=0;
+        IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id=@retentionId AND name=N'MonitoringStartedAt'
+            AND system_type_id=43 AND scale=7 AND is_nullable=0) SET @ready=0;
+        IF NOT EXISTS (SELECT 1 FROM dbo.AiMentorMemoryRetentionState WHERE Id=1) SET @ready=0;
 
         IF EXISTS (SELECT 1 FROM sys.columns c WHERE c.object_id IN (@proposalId,@memoryId)
             AND c.name IN (N'Id',N'TenantId',N'SubjectId',N'SessionId',N'KeyVersion',N'KeyCipher',N'KeyFingerprint',N'ValueCipher')
@@ -836,7 +895,9 @@ public sealed class SqlServerMemoryStore(SqlServerWorkflowOptions options, IMemo
             OR ISNULL(HAS_PERMS_BY_NAME(N'dbo.AiMentorMemories',N'OBJECT',N'SELECT'),0)<>1
             OR ISNULL(HAS_PERMS_BY_NAME(N'dbo.AiMentorMemories',N'OBJECT',N'INSERT'),0)<>1
             OR ISNULL(HAS_PERMS_BY_NAME(N'dbo.AiMentorMemories',N'OBJECT',N'UPDATE'),0)<>1
-            OR ISNULL(HAS_PERMS_BY_NAME(N'dbo.AiMentorMemories',N'OBJECT',N'DELETE'),0)<>1 SET @ready=0;
+            OR ISNULL(HAS_PERMS_BY_NAME(N'dbo.AiMentorMemories',N'OBJECT',N'DELETE'),0)<>1
+            OR ISNULL(HAS_PERMS_BY_NAME(N'dbo.AiMentorMemoryRetentionState',N'OBJECT',N'SELECT'),0)<>1
+            OR ISNULL(HAS_PERMS_BY_NAME(N'dbo.AiMentorMemoryRetentionState',N'OBJECT',N'UPDATE'),0)<>1 SET @ready=0;
         SELECT @ready;
         """;
 
@@ -968,6 +1029,20 @@ public sealed class SqlServerMemoryStore(SqlServerWorkflowOptions options, IMemo
         IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE object_id=OBJECT_ID(N'dbo.AiMentorMemories')
             AND name=N'IX_AiMentorMemories_KeyVersion')
             CREATE INDEX IX_AiMentorMemories_KeyVersion ON dbo.AiMentorMemories(KeyVersion);
+        IF OBJECT_ID(N'dbo.AiMentorMemoryRetentionState',N'U') IS NULL
+        BEGIN
+            CREATE TABLE dbo.AiMentorMemoryRetentionState(
+                Id tinyint NOT NULL CONSTRAINT PK_AiMentorMemoryRetentionState PRIMARY KEY,
+                LastCompletedAt datetimeoffset(7) NULL,
+                MonitoringStartedAt datetimeoffset(7) NOT NULL
+                    CONSTRAINT DF_AiMentorMemoryRetentionState_MonitoringStartedAt DEFAULT SYSUTCDATETIME(),
+                CONSTRAINT CK_AiMentorMemoryRetentionState_Singleton CHECK (Id=1));
+        END;
+        IF COL_LENGTH(N'dbo.AiMentorMemoryRetentionState',N'MonitoringStartedAt') IS NULL
+            ALTER TABLE dbo.AiMentorMemoryRetentionState ADD MonitoringStartedAt datetimeoffset(7) NOT NULL
+                CONSTRAINT DF_AiMentorMemoryRetentionState_MonitoringStartedAt DEFAULT SYSUTCDATETIME() WITH VALUES;
+        IF NOT EXISTS (SELECT 1 FROM dbo.AiMentorMemoryRetentionState WITH (UPDLOCK,HOLDLOCK) WHERE Id=1)
+            INSERT INTO dbo.AiMentorMemoryRetentionState(Id,LastCompletedAt) VALUES(1,NULL);
         COMMIT TRANSACTION;
         """;
 }

@@ -1,0 +1,133 @@
+# 镜像仓库、OCI manifest digest 与同值发布标识必须由发布流水线显式注入。
+image:
+  repository: ""
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+releaseId: ""
+
+replicaCount: 2
+revisionHistoryLimit: 3
+
+# 此 Secret 由外部密钥管理流程创建，至少提供 ConnectionStrings__WorkflowSqlServer、
+# Memory__Encryption__Keys__v1、Memory__Encryption__FingerprintKey、Workflow__Encryption__Keys__v1、
+# Operations__Web__ClientSecret、DataProtection 集群标识/指纹/证书密码、OpenSearch 凭据与三个 AI API key。
+# Chart 只引用 Secret，绝不接收或生成明文敏感值；SQL 连接串必须启用 Encrypt 并禁用 TrustServerCertificate。
+existingSecret: ""
+
+service:
+  type: ClusterIP
+  port: 80
+
+application:
+  authentication:
+    authority: ""
+    audience: ""
+  openSearch:
+    endpoint: ""
+    indexName: aimentor-knowledge-current
+  telemetry:
+    otlpEndpoint: ""
+  operationsWeb:
+    enabled: true
+    clientId: ""
+  # API key 只能通过 existingSecret 的 Model__ApiKey 等环境变量注入。
+  ai:
+    model:
+      provider: OpenAI
+      endpoint: ""
+      model: ""
+    embedding:
+      provider: OpenAI
+      endpoint: ""
+      model: ""
+      dimensions: 0
+      indexVersion: ""
+    reranker:
+      provider: HttpSemantic
+      endpoint: ""
+      model: ""
+
+dataProtection:
+  # 多副本必须使用支持 ReadWriteMany 的现有 PVC 共享密钥环。
+  existingClaim: ""
+  existingCertificateSecret: ""
+  certificateKey: tls.pfx
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 384Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+probes:
+  startup:
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 30
+  liveness:
+    initialDelaySeconds: 10
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 3
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  enabled: true
+  # 默认仅允许同命名空间工作负载访问；跨命名空间 Ingress 控制器需在覆盖值中显式声明。
+  ingressFrom:
+    - podSelector: {}
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: ""
+  path: /
+  tlsSecretName: ""
+
+migration:
+  # 迁移器使用独立最小权限 Secret，只读取工作流数据库连接串。
+  existingSecret: ""
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 3600
+
+# PrometheusRule 默认关闭，使未安装 Prometheus Operator CRD 的集群仍可部署。
+# 启用时 runbook 必须指向值班人员可访问的版本化处置文档，不能保留占位地址。
+monitoring:
+  prometheusRule:
+    enabled: false
+    namespace: ""
+    team: ""
+    runbook: ""
+    # 必须匹配 OTel 业务指标映射后的实际 job 标签。
+    targetJobRegex: ""
+    # 必须单独匹配 Prometheus 抓取 Collector exporter 的 up job；它通常不同于业务 job。
+    collectorJobRegex: ""
+    evaluationInterval: 1m
+    thresholds:
+      workflowFailureRatio: 0.05
+      workflowMinimumExecutions: 20
+      workflowP95DurationSeconds: 15
+      telemetryHeartbeatMaxAgeSeconds: 120
+      ruleEvaluationMaxAgeSeconds: 300
+
+podAnnotations: {}
+podLabels: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints:
+  - maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway

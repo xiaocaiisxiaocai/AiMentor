@@ -10,6 +10,7 @@
     <ProjectReference Include="..\..\src\AiMentor.Domain\AiMentor.Domain.csproj" />
     <ProjectReference Include="..\..\src\AiMentor.Evaluation\AiMentor.Evaluation.csproj" />
     <ProjectReference Include="..\..\src\AiMentor.Infrastructure\AiMentor.Infrastructure.csproj" />
+    <ProjectReference Include="..\..\src\AiMentor.Migrations\AiMentor.Migrations.csproj" />
     <ProjectReference Include="..\AiMentor.AtlasCrashHelper\AiMentor.AtlasCrashHelper.csproj"
                       ReferenceOutputAssembly="false" />
     <ProjectReference Include="..\AiMentor.ProviderHttpFixture\AiMentor.ProviderHttpFixture.csproj"

@@ -14,12 +14,9 @@ public sealed class LinuxContainerCiTests
         Assert.Contains("runs-on: ubuntu-latest", workflow, StringComparison.Ordinal);
         Assert.Contains("mcr.microsoft.com/mssql/server:2022-latest", workflow, StringComparison.Ordinal);
         Assert.Contains("job.services.sqlserver.id", workflow, StringComparison.Ordinal);
-        Assert.Contains("SqlServerAtlasIncidentStoreTests", workflow, StringComparison.Ordinal);
-        Assert.Contains("SqlServerOperationsActionStoreTests", workflow, StringComparison.Ordinal);
-        Assert.Contains("SqlServerMemoryStoreTests", workflow, StringComparison.Ordinal);
-        Assert.Contains("SqlServerOrdinalIdentityIsolationTests", workflow, StringComparison.Ordinal);
-        Assert.Contains("SqlServerWorkflowIntegrationTests", workflow, StringComparison.Ordinal);
         Assert.Contains("Category!=RequiresSqlServer", workflow, StringComparison.Ordinal);
+        Assert.Contains("Category=RequiresSqlServer", workflow, StringComparison.Ordinal);
+        Assert.DoesNotContain("FullyQualifiedName~SqlServer", workflow, StringComparison.Ordinal);
         Assert.Contains("Test-DistributedReconciliation.ps1", workflow, StringComparison.Ordinal);
         Assert.Contains("-Configuration Release", workflow, StringComparison.Ordinal);
         Assert.Contains("Test-OpenSearchContainerAcceptance.ps1 -PullImage", workflow, StringComparison.Ordinal);
@@ -29,6 +26,16 @@ public sealed class LinuxContainerCiTests
         Assert.Contains("--format json", workflow, StringComparison.Ordinal);
         Assert.Contains("ConvertFrom-Json", workflow, StringComparison.Ordinal);
         Assert.Contains("VULNERABLE_DEPENDENCIES_FOUND", workflow, StringComparison.Ordinal);
+        Assert.Contains("azure/setup-helm@v4.3.0", workflow, StringComparison.Ordinal);
+        Assert.Contains("helm lint --strict deploy/helm/aimentor", workflow, StringComparison.Ordinal);
+        Assert.Contains("migration.existingSecret=aimentor-migration", workflow, StringComparison.Ordinal);
+        Assert.Contains("image.digest=\"${image_digest}\"", workflow, StringComparison.Ordinal);
+        Assert.Contains("releaseId=\"${image_digest}\"", workflow, StringComparison.Ordinal);
+        Assert.Contains("monitoring.prometheusRule.enabled=true", workflow, StringComparison.Ordinal);
+        Assert.Contains("monitoring.prometheusRule.collectorJobRegex", workflow, StringComparison.Ordinal);
+        Assert.Contains("kind: PrometheusRule", workflow, StringComparison.Ordinal);
+        Assert.Contains("docker build --pull --tag aimentor:ci", workflow, StringComparison.Ordinal);
+        Assert.Contains("--read-only --cap-drop ALL", workflow, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -49,11 +56,10 @@ public sealed class LinuxContainerCiTests
         Assert.DoesNotContain("src\\AiMentor.Api\\bin\\Debug", script, StringComparison.Ordinal);
         Assert.Contains("127.0.0.1::1433", script, StringComparison.Ordinal);
         Assert.Contains("docker port $SqlContainer 1433/tcp", script, StringComparison.Ordinal);
-        Assert.Contains("009_atlas_incident_runs.sql", script, StringComparison.Ordinal);
-        Assert.Contains("010_operations_actions.sql", script, StringComparison.Ordinal);
-        Assert.Contains("011_operations_action_ordinal_identifiers.sql", script, StringComparison.Ordinal);
-        Assert.Contains("012_memory_store.sql", script, StringComparison.Ordinal);
-        Assert.Contains("013_workflow_ordinal_identities.sql", script, StringComparison.Ordinal);
+        Assert.Contains("AiMentor.Migrations.dll", script, StringComparison.Ordinal);
+        Assert.Contains("AIMENTOR_MIGRATIONS_ROOT", script, StringComparison.Ordinal);
+        Assert.Contains("AIMENTOR_RELEASE_ID", script, StringComparison.Ordinal);
+        Assert.DoesNotContain("foreach ($migration", script, StringComparison.Ordinal);
         Assert.Contains("Authentication__Development__Groups__*", script, StringComparison.Ordinal);
         Assert.DoesNotContain("Remove-Item Env:Authentication__Development__Groups__0", script,
             StringComparison.Ordinal);
@@ -63,6 +69,9 @@ public sealed class LinuxContainerCiTests
         Assert.Contains("ConcurrentCompensationExecutionWinners", script, StringComparison.Ordinal);
         Assert.Contains("Assert-Equal 1 $stressDecisionWinners.Count", script, StringComparison.Ordinal);
         Assert.Contains("Assert-Equal 1 $stressExecutionWinners.Count", script, StringComparison.Ordinal);
+        Assert.Contains("RESTORE VERIFYONLY", script, StringComparison.Ordinal);
+        Assert.Contains("DBCC CHECKDB", script, StringComparison.Ordinal);
+        Assert.Contains("RestoredReplay", script, StringComparison.Ordinal);
         Assert.Contains("AIMENTOR_SQLSERVER_TEST_CONNECTION", atlasTests, StringComparison.Ordinal);
         Assert.DoesNotContain("if (!OperatingSystem.IsWindows()) return;", atlasTests, StringComparison.Ordinal);
         Assert.Contains("AIMENTOR_SQLSERVER_TEST_CONNECTION", operationsTests, StringComparison.Ordinal);

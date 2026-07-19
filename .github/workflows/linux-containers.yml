@@ -67,13 +67,86 @@ jobs:
           }
           Write-Output 'VULNERABLE_DEPENDENCIES=0'
 
+  deployment-artifacts:
+    name: Production image and Helm chart
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Helm
+        uses: azure/setup-helm@v4.3.0
+        with:
+          version: v3.18.4
+      - name: Lint and render production chart
+        shell: bash
+        run: |
+          image_digest="sha256:$(printf '%064d' 0)"
+          values=(
+            --set-string image.repository=aimentor
+            --set-string image.digest="${image_digest}"
+            --set-string releaseId="${image_digest}"
+            --set-string existingSecret=aimentor-production
+            --set-string migration.existingSecret=aimentor-migration
+            --set-string dataProtection.existingClaim=aimentor-data-protection
+            --set-string dataProtection.existingCertificateSecret=aimentor-data-protection-certificate
+            --set-string application.authentication.authority=https://identity.example
+            --set-string application.authentication.audience=aimentor
+            --set-string application.openSearch.endpoint=https://opensearch.example:9200
+            --set-string application.telemetry.otlpEndpoint=https://otel.example:4317
+            --set-string application.operationsWeb.clientId=aimentor-operations
+            --set-string application.ai.model.endpoint=https://model.example/v1
+            --set-string application.ai.model.model=production-chat
+            --set-string application.ai.embedding.endpoint=https://embedding.example/v1
+            --set-string application.ai.embedding.model=production-embedding
+            --set application.ai.embedding.dimensions=1536
+            --set-string application.ai.embedding.indexVersion=aimentor-knowledge-current
+            --set-string application.ai.reranker.endpoint=https://reranker.example/v1
+            --set-string application.ai.reranker.model=production-reranker
+            --set monitoring.prometheusRule.enabled=true
+            --set-string monitoring.prometheusRule.team=ai-platform
+            --set-string monitoring.prometheusRule.runbook=https://runbooks.example/aimentor
+            --set-string 'monitoring.prometheusRule.targetJobRegex=.*aimentor.*'
+            --set-string 'monitoring.prometheusRule.collectorJobRegex=.*otel-collector.*'
+          )
+          helm lint --strict deploy/helm/aimentor "${values[@]}"
+          helm template verify deploy/helm/aimentor "${values[@]}" >/tmp/aimentor-rendered.yaml
+          grep -q 'kind: Deployment' /tmp/aimentor-rendered.yaml
+          grep -q '"helm.sh/hook": pre-install,pre-upgrade' /tmp/aimentor-rendered.yaml
+          grep -q 'kind: PrometheusRule' /tmp/aimentor-rendered.yaml
+      - name: Build non-root production image
+        run: docker build --pull --tag aimentor:ci .
+      - name: Smoke test read-only container
+        shell: bash
+        run: |
+          container_id=$(docker run --detach --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --publish 127.0.0.1::8080 \
+            --env ASPNETCORE_ENVIRONMENT=Development \
+            --env AIMENTOR_MEMORY_ENCRYPTION_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA= \
+            --env Memory__StorePath=/tmp/aimentor-memory.json \
+            aimentor:ci)
+          trap 'docker logs "$container_id"; docker rm --force "$container_id" >/dev/null' EXIT
+          test "$(docker inspect --format '{{.Config.User}}' "$container_id")" = 1654
+          port_binding=$(docker port "$container_id" 8080/tcp | tail -n 1)
+          host_port=${port_binding##*:}
+          ready=false
+          for _ in $(seq 1 60); do
+            if curl --fail --silent --show-error "http://127.0.0.1:${host_port}/health/ready" >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+
   sql-atlas-operations:
     name: SQL memory, Atlas and operations queue
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 35
     services:
       sqlserver:
-        image: mcr.microsoft.com/mssql/server:2022-latest
+        image: mcr.microsoft.com/mssql/server:2022-latest@sha256:e07b9699a2b749969f19d86563ceeea22bd3a69f7f1db85a8d1ac4bdaf0c6f56
         env:
           ACCEPT_EULA: "Y"
           MSSQL_SA_PASSWORD: ${{ format('AiMentor_CI_{0}!9z', github.run_id) }}
@@ -103,7 +176,7 @@ jobs:
           SQL_HOST_PORT: ${{ job.services.sqlserver.ports[1433] }}
         run: |
           $env:AIMENTOR_SQLSERVER_TEST_CONNECTION = "Server=127.0.0.1,$env:SQL_HOST_PORT;Initial Catalog=master;User ID=sa;Password=$env:AIMENTOR_SQLSERVER_SA_PASSWORD;Encrypt=True;TrustServerCertificate=True"
-          dotnet test tests/AiMentor.Tests/AiMentor.Tests.csproj --configuration Release --no-build --filter "FullyQualifiedName~SqlServerMemoryStoreTests|FullyQualifiedName~SqlServerAtlasIncidentStoreTests|FullyQualifiedName~SqlServerOperationsActionStoreTests|FullyQualifiedName~SqlServerOrdinalIdentityIsolationTests|FullyQualifiedName~SqlServerWorkflowIntegrationTests" --logger "console;verbosity=normal"
+          dotnet test tests/AiMentor.Tests/AiMentor.Tests.csproj --configuration Release --no-build --filter "Category=RequiresSqlServer" --logger "console;verbosity=normal"
       - name: Verify distributed reconciliation and redacted operations queue
         shell: pwsh
         env:

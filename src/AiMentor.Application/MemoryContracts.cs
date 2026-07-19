@@ -30,7 +30,7 @@ public interface IMemoryStore
 /// </summary>
 public interface IMemoryRetentionStore
 {
-    Task<MemoryPurgeResult> PurgeExpiredAsync(DateTimeOffset now, int maximumRowsPerTable,
+    Task<MemoryPurgeResult> PurgeExpiredAsync(int maximumRowsPerTable,
         CancellationToken cancellationToken = default);
 }
 
@@ -41,8 +41,9 @@ public interface IMemoryRetentionService
         CancellationToken cancellationToken = default);
 }
 
-/// <summary>描述一次显式保留期清理是否取得分布式锁及实际删除的行数。</summary>
-public sealed record MemoryPurgeResult(bool LockAcquired, int ProposalsDeleted, int MemoriesDeleted);
+/// <summary>描述一次显式保留期清理、删除行数及数据库中最近成功提交的共享时间。</summary>
+public sealed record MemoryPurgeResult(bool LockAcquired, int ProposalsDeleted, int MemoriesDeleted,
+    DateTimeOffset? LastCompletedAt, DateTimeOffset MonitoringStartedAt);
 
 /// <summary>描述删除工具目标在当前所有权边界内的可验证状态，不返回记忆正文。</summary>
 public enum MemoryTargetState { Absent, PresentAtExpectedVersion, PresentAtDifferentVersion, Inaccessible }

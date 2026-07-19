@@ -8,10 +8,52 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$managedEnvironmentNames = @(
+    'ASPNETCORE_ENVIRONMENT', 'Workflow__Provider', 'Workflow__InitializeSchema',
+    'ConnectionStrings__WorkflowSqlServer', 'AIMENTOR_MEMORY_ENCRYPTION_KEY',
+    'Workflow__Encryption__ActiveKeyVersion', 'Workflow__Encryption__Keys__v1',
+    'Authentication__Development__TenantId', 'Authentication__Development__SubjectId',
+    'Testing__ToolExecutionBarrier__SignalPath', 'Testing__ToolExecutionBarrier__ReleasePath',
+    'Memory__StorePath', 'AIMENTOR_MIGRATIONS_ROOT', 'AIMENTOR_RELEASE_ID',
+    'AIMENTOR_MIGRATIONS_VERIFY_ONLY', 'AIMENTOR_SQLSERVER_SA_PASSWORD'
+)
+$originalEnvironment = @{}
+foreach ($name in $managedEnvironmentNames) {
+    $item = Get-Item "Env:$name" -ErrorAction SilentlyContinue
+    if ($null -ne $item) { $originalEnvironment[$name] = $item.Value }
+}
+Get-ChildItem Env: | Where-Object Name -Like 'Authentication__Development__Groups__*' |
+    ForEach-Object { $originalEnvironment[$_.Name] = $_.Value }
+
+function Restore-ProcessEnvironment {
+    foreach ($name in $managedEnvironmentNames) {
+        Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+    }
+    Get-ChildItem Env: | Where-Object Name -Like 'Authentication__Development__Groups__*' |
+        Remove-Item -ErrorAction SilentlyContinue
+    foreach ($entry in $originalEnvironment.GetEnumerator()) {
+        Set-Item "Env:$($entry.Key)" $entry.Value
+    }
+}
+
+function Stop-EphemeralSqlContainerAfterSetupFailure([string]$Message) {
+    $cleanupFailed = $false
+    docker inspect $SqlContainer 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        docker rm -f $SqlContainer 2>$null | Out-Null
+        $cleanupFailed = $LASTEXITCODE -ne 0
+    }
+    Restore-ProcessEnvironment
+    if ($cleanupFailed) { throw "$Message 临时 SQL Server 容器清理失败。" }
+    throw $Message
+}
+
 Add-Type -AssemblyName System.Net.Http
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $apiDll = [IO.Path]::Combine($repositoryRoot, 'src', 'AiMentor.Api', 'bin', $Configuration, 'net10.0',
     'AiMentor.Api.dll')
+$migrationDll = [IO.Path]::Combine($repositoryRoot, 'src', 'AiMentor.Migrations', 'bin', $Configuration, 'net10.0',
+    'AiMentor.Migrations.dll')
 $ownsSqlContainer = $false
 if ($UseEphemeralSqlServer) {
     $SqlContainer = 'aimentor-sqlserver-distributed-' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
@@ -19,14 +61,17 @@ if ($UseEphemeralSqlServer) {
     $env:AIMENTOR_SQLSERVER_SA_PASSWORD = $password
     $portBinding = if ($SqlHostPort -eq 0) { '127.0.0.1::1433' } else { "127.0.0.1:${SqlHostPort}:1433" }
     docker run -d --name $SqlContainer -e ACCEPT_EULA=Y -e "MSSQL_SA_PASSWORD=$password" `
-        -p $portBinding mcr.microsoft.com/mssql/server:2022-latest | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw '无法启动临时 SQL Server 容器。' }
+        -p $portBinding `
+        mcr.microsoft.com/mssql/server:2022-latest@sha256:e07b9699a2b749969f19d86563ceeea22bd3a69f7f1db85a8d1ac4bdaf0c6f56 |
+        Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Stop-EphemeralSqlContainerAfterSetupFailure '无法启动临时 SQL Server 容器。'
+    }
     $ownsSqlContainer = $true
     if ($SqlHostPort -eq 0) {
         $publishedPort = docker port $SqlContainer 1433/tcp
         if ($LASTEXITCODE -ne 0 -or $publishedPort -notmatch ':(\d+)\s*$') {
-            docker rm -f $SqlContainer 2>$null | Out-Null
-            throw '无法解析临时 SQL Server 的动态宿主端口。'
+            Stop-EphemeralSqlContainerAfterSetupFailure '无法解析临时 SQL Server 的动态宿主端口。'
         }
         $SqlHostPort = [int]$Matches[1]
     }
@@ -40,8 +85,7 @@ if ($UseEphemeralSqlServer) {
         Start-Sleep -Seconds 1
     }
     if (-not $ready) {
-        docker rm -f $SqlContainer 2>$null | Out-Null
-        throw '临时 SQL Server 容器未就绪。'
+        Stop-EphemeralSqlContainerAfterSetupFailure '临时 SQL Server 容器未就绪。'
     }
 } else {
     if ($SqlHostPort -eq 0) { $SqlHostPort = 1433 }
@@ -55,7 +99,9 @@ if ($UseEphemeralSqlServer) {
 }
 
 $database = 'AiMentorDistributedTest_' + [Guid]::NewGuid().ToString('N')
-$remoteMigrations = '/tmp/aimentor-migrations-' + [Guid]::NewGuid().ToString('N')
+$backupFile = "/var/opt/mssql/data/$database-disaster-recovery.bak"
+$restoredDataFile = "/var/opt/mssql/data/$database-restored.mdf"
+$restoredLogFile = "/var/opt/mssql/data/$database-restored_log.ldf"
 $temporaryRoot = Join-Path ([IO.Path]::GetTempPath()) ('aimentor-distributed-' + [Guid]::NewGuid().ToString('N'))
 $processes = [System.Collections.Generic.List[System.Diagnostics.Process]]::new()
 $client = [System.Net.Http.HttpClient]::new()
@@ -175,18 +221,21 @@ try {
 
     Invoke-Sql "CREATE DATABASE [$database];"
     $migrationRoot = [IO.Path]::Combine($repositoryRoot, 'deploy', 'sql')
-    docker cp $migrationRoot "${SqlContainer}:$remoteMigrations" | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw '无法把 SQL 迁移复制到测试容器。' }
-    foreach ($migration in @('001_workflow.sql', '002_workflow_key_version.sql',
-            '003_tool_execution_ledger.sql', '004_tool_execution_reconciliation.sql',
-            '005_tool_reconciliation_reviews.sql', '006_agent_run_cancellation.sql',
-            '007_tool_compensations.sql', '008_tool_compensation_reconciliation.sql',
-            '009_atlas_incident_runs.sql', '010_operations_actions.sql',
-            '011_operations_action_ordinal_identifiers.sql', '012_memory_store.sql',
-            '013_workflow_ordinal_identities.sql')) {
-        docker exec -e "SQLCMDPASSWORD=$password" $SqlContainer /opt/mssql-tools18/bin/sqlcmd `
-            -S localhost -U sa -C -b -d $database -i "$remoteMigrations/$migration" | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "迁移失败：$migration" }
+    $quotedDatabase = ConvertTo-SqlConnectionValue $database
+    $quotedPassword = ConvertTo-SqlConnectionValue $password
+    $env:ConnectionStrings__WorkflowSqlServer =
+        "Server=127.0.0.1,$SqlHostPort;Initial Catalog=$quotedDatabase;User ID=sa;" +
+        "Password=$quotedPassword;Encrypt=True;TrustServerCertificate=True"
+    $env:AIMENTOR_MIGRATIONS_ROOT = $migrationRoot
+    $env:AIMENTOR_RELEASE_ID = "distributed-reconciliation-$database"
+    try {
+        # 真实验收必须使用与 Helm Hook 相同的账本迁移器，不能用无哈希的 sqlcmd 循环制造伪生产库。
+        dotnet $migrationDll | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw '统一 SQL 迁移器执行失败。' }
+    }
+    finally {
+        Remove-Item Env:AIMENTOR_MIGRATIONS_ROOT -ErrorAction SilentlyContinue
+        Remove-Item Env:AIMENTOR_RELEASE_ID -ErrorAction SilentlyContinue
     }
 
     $requester = Start-Api 'requester' $BasePort 'requester-a' @('users')
@@ -210,6 +259,29 @@ try {
     if (([string]$atlasOperations.Content).IndexOf($atlasPrivateNode, [StringComparison]::Ordinal) -ge 0) {
         throw '运营任务队列泄露 Atlas 安全输入。'
     }
+    $atlasObservedAt = [DateTimeOffset]::UtcNow
+    $atlasDiagnosis = Send-Request 'POST' `
+        "http://127.0.0.1:$BasePort/api/v1/incidents/atlasid/runs/$($atlasRun.Json.runId)/resume" @{
+        expectedVersion = $atlasRun.Json.version
+        input = @{
+            # 显式使用 ISO 8601，避免 Windows PowerShell 5 把时间序列化为 System.Text.Json 不接受的 /Date(...)/。
+            observedAt = $atlasObservedAt.ToString('O', [Globalization.CultureInfo]::InvariantCulture)
+            tokenMetadata = @{
+                expiresAt = $atlasObservedAt.AddHours(1).ToString(
+                    'O', [Globalization.CultureInfo]::InvariantCulture)
+                notBefore = $atlasObservedAt.AddMinutes(-1).ToString(
+                    'O', [Globalization.CultureInfo]::InvariantCulture)
+                issuerMatches = $true
+                audienceMatches = $true
+                signatureValid = $true
+            }
+            nodeUtcOffsetSeconds = 0
+            jwksCacheStale = $false
+            recentIdentityConfigurationChange = $false
+        }
+    }
+    Assert-Equal 200 $atlasDiagnosis.StatusCode 'Atlas SQL 排查推进失败'
+    Assert-Equal 'DiagnosisReady' $atlasDiagnosis.Json.status 'Atlas SQL 排查未形成可恢复诊断终态'
 
     # 仅 Testing 实例启用执行屏障，在 SQL 已持久化 Executing 后、真实工具调用前暴露确定窗口。
     $barrierDirectory = Join-Path $temporaryRoot 'executing-kill-barrier'
@@ -522,6 +594,71 @@ try {
         throw '滚动恢复后的运营任务队列泄露 Atlas 安全输入。'
     }
 
+    # 灾备验收在一致性检查点停止所有写入者；恢复后只允许从 SQL 耐久状态和原密钥环重建服务。
+    foreach ($process in $processes) { Stop-Api $process }
+    $dataLogicalName = Invoke-SqlScalar `
+        "SELECT TOP (1) name FROM sys.master_files WHERE database_id=DB_ID(N'$database') AND type=0 ORDER BY file_id;" `
+        'master'
+    $logLogicalName = Invoke-SqlScalar `
+        "SELECT TOP (1) name FROM sys.master_files WHERE database_id=DB_ID(N'$database') AND type=1 ORDER BY file_id;" `
+        'master'
+    if ([string]::IsNullOrWhiteSpace($dataLogicalName) -or [string]::IsNullOrWhiteSpace($logLogicalName)) {
+        throw '备份前无法确定数据库逻辑文件名。'
+    }
+    $executionRowsBeforeBackup = Invoke-SqlScalar `
+        "SELECT COUNT_BIG(*) FROM dbo.AiMentorToolExecutions WHERE ExecutionKey='$executionKey';"
+    Assert-Equal '1' $executionRowsBeforeBackup '备份前幂等执行账本记录不唯一'
+
+    Invoke-Sql "BACKUP DATABASE [$database] TO DISK=N'$backupFile' WITH COPY_ONLY, INIT, CHECKSUM;" 'master'
+    Invoke-Sql "RESTORE VERIFYONLY FROM DISK=N'$backupFile' WITH CHECKSUM;" 'master'
+    $backupVerified = $true
+
+    # MOVE 使用本次验收独有的目标文件，避免宿主默认数据目录和旧物理文件名造成环境耦合。
+    Invoke-Sql "ALTER DATABASE [$database] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [$database];" `
+        'master'
+    Invoke-Sql (
+        "RESTORE DATABASE [$database] FROM DISK=N'$backupFile' WITH " +
+        "MOVE N'$dataLogicalName' TO N'$restoredDataFile', " +
+        "MOVE N'$logLogicalName' TO N'$restoredLogFile', REPLACE, RECOVERY, CHECKSUM;") 'master'
+    Invoke-Sql "DBCC CHECKDB([$database]) WITH NO_INFOMSGS, ALL_ERRORMSGS;" 'master'
+    $databaseCheckPassed = $true
+    $env:AIMENTOR_MIGRATIONS_ROOT = $migrationRoot
+    $env:AIMENTOR_MIGRATIONS_VERIFY_ONLY = 'true'
+    try {
+        # 恢复后必须复用发布包的只读账本与物理契约验证，行数相同不能证明索引、外键和列仍正确。
+        dotnet $migrationDll | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw '灾备恢复后的迁移账本或物理架构验证失败。' }
+    }
+    finally {
+        Remove-Item Env:AIMENTOR_MIGRATIONS_ROOT -ErrorAction SilentlyContinue
+        Remove-Item Env:AIMENTOR_MIGRATIONS_VERIFY_ONLY -ErrorAction SilentlyContinue
+    }
+    $restoredMigrationRows = Invoke-SqlScalar 'SELECT COUNT_BIG(*) FROM dbo.AiMentorSchemaMigrations;'
+    Assert-Equal '14' $restoredMigrationRows '灾备恢复后的迁移账本不完整'
+
+    $restoredApi = Start-Api 'disaster-recovery-restored' $BasePort 'requester-a' @('users')
+    $restoredMemoriesResponse = Send-Request 'GET' "http://127.0.0.1:$BasePort/api/v1/memories"
+    Assert-Equal 200 $restoredMemoriesResponse.StatusCode '灾备恢复后历史加密记忆查询失败'
+    $restoredMemory = @($restoredMemoriesResponse.Json | Where-Object { $_.id -eq $memory.Json.id })
+    Assert-Equal 1 $restoredMemory.Count '灾备恢复后历史加密记忆不可见'
+    Assert-Equal 'after' $restoredMemory[0].value '灾备恢复后历史加密记忆无法用原密钥环解密'
+
+    $restoredReplay = Send-Request 'POST' "http://127.0.0.1:$BasePort/api/v1/tools/memory.delete/execute" @{
+        arguments = $arguments
+    } @{ 'Idempotency-Key' = 'distributed-reconciliation-001' }
+    Assert-Equal 200 $restoredReplay.StatusCode '灾备恢复后幂等终态回放失败'
+    Assert-Equal 'Reconciled' $restoredReplay.Json.status '灾备恢复错误地重复执行了已对账工具'
+    Assert-Equal $true $restoredReplay.Json.idempotentReplay '灾备恢复后的工具结果未标记为幂等回放'
+    $executionRowsAfterRestore = Invoke-SqlScalar `
+        "SELECT COUNT_BIG(*) FROM dbo.AiMentorToolExecutions WHERE ExecutionKey='$executionKey';"
+    Assert-Equal '1' $executionRowsAfterRestore '灾备恢复后的工具回放产生了重复账本记录'
+
+    $restoredAtlas = Send-Request 'GET' `
+        "http://127.0.0.1:$BasePort/api/v1/incidents/atlasid/runs/$($atlasRun.Json.runId)"
+    Assert-Equal 200 $restoredAtlas.StatusCode '灾备恢复后 Atlas SQL 检查点不可见'
+    Assert-Equal 'DiagnosisReady' $restoredAtlas.Json.status '灾备恢复后 Atlas 诊断终态发生漂移'
+    Assert-Equal $atlasPrivateNode $restoredAtlas.Json.safeInput.node '灾备恢复后 Atlas 加密检查点内容异常'
+
     $succeeded = $true
 
     [pscustomobject]@{
@@ -543,20 +680,45 @@ try {
         AtlasSqlRecovery = $atlasRecovered.Json.status
         OperationsAtlasTasks = $recoveredAtlasTask.Count
         OperationsPayloadRedacted = $true
+        BackupVerified = $backupVerified
+        DatabaseCheckPassed = $databaseCheckPassed
+        RestoredMemoryValue = $restoredMemory[0].value
+        RestoredReplay = $restoredReplay.Json.status
+        RestoredAtlasStatus = $restoredAtlas.Json.status
+        RestoredExecutionRows = [long]$executionRowsAfterRestore
+        RestoredMigrationRows = [long]$restoredMigrationRows
         Passed = $true
     } | ConvertTo-Json -Compress
 }
 finally {
+    $cleanupFailures = [System.Collections.Generic.List[string]]::new()
     foreach ($process in $processes) { Stop-Api $process }
     $client.Dispose()
-    try { Invoke-Sql "ALTER DATABASE [$database] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [$database];" } catch { }
-    try { docker exec -u 0 $SqlContainer rm -rf $remoteMigrations 2>$null | Out-Null } catch { }
-    if ($ownsSqlContainer) {
-        try { docker rm -f $SqlContainer 2>$null | Out-Null } catch { }
+    try {
+        Invoke-Sql "ALTER DATABASE [$database] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [$database];"
+    } catch { $cleanupFailures.Add('测试数据库删除失败') }
+    foreach ($sqlFile in @($backupFile, $restoredDataFile, $restoredLogFile)) {
+        try {
+            docker exec -u 0 $SqlContainer rm -f -- $sqlFile 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { $cleanupFailures.Add("SQL 容器文件删除失败：$sqlFile") }
+        } catch { $cleanupFailures.Add("SQL 容器文件删除失败：$sqlFile") }
     }
+    if ($ownsSqlContainer) {
+        try {
+            docker rm -f $SqlContainer 2>$null | Out-Null
+            if ($LASTEXITCODE -ne 0) { $cleanupFailures.Add('临时 SQL Server 容器删除失败') }
+        } catch { $cleanupFailures.Add('临时 SQL Server 容器删除失败') }
+    }
+    Restore-ProcessEnvironment
+    Remove-Variable -Scope Script -Name masterKey -ErrorAction SilentlyContinue
     if ($succeeded) {
         Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction SilentlyContinue
     } else {
         Write-Warning "分布式验收失败，诊断日志保留于：$temporaryRoot"
+    }
+    if ($cleanupFailures.Count -gt 0) {
+        $cleanupMessage = $cleanupFailures -join '；'
+        if ($succeeded) { throw "分布式验收清理失败：$cleanupMessage" }
+        Write-Warning "分布式验收清理不完整：$cleanupMessage"
     }
 }

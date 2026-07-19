@@ -74,9 +74,10 @@ public sealed class SystemDoctorTests
     [Fact]
     public async Task RetentionFailureKeepsReadinessRedUntilNextSuccessfulPurge()
     {
-        var health = new MemoryRetentionHealthState(true);
+        var clock = new ManualTimeProvider(new DateTimeOffset(2026, 7, 16, 8, 0, 0, TimeSpan.Zero));
+        var health = new MemoryRetentionHealthState(true, clock, TimeSpan.FromMinutes(1));
         health.MarkFailure();
-        var doctor = new SystemDoctor(ProductionOptions(), TimeProvider.System, health);
+        var doctor = new SystemDoctor(ProductionOptions(), clock, health);
 
         var failed = await doctor.RunAsync();
         Assert.False(failed.IsReady);
@@ -86,6 +87,24 @@ public sealed class SystemDoctorTests
         var recovered = await doctor.RunAsync();
         Assert.True(recovered.IsReady);
         Assert.Contains(recovered.Checks, item => item.Code == "MEMORY_RETENTION_HEALTHY");
+
+        clock.Advance(TimeSpan.FromMinutes(2));
+        var stale = await doctor.RunAsync();
+        Assert.False(stale.IsReady);
+        Assert.Contains(stale.Checks, item => item.Code == "MEMORY_RETENTION_STALE");
+
+        // 其他副本读到旧的共享完成时间时必须继续陈旧，不能用本次争锁时间刷新健康状态。
+        health.MarkSuccess(clock.GetUtcNow().AddMinutes(-2));
+        var sharedHeartbeatStillStale = await doctor.RunAsync();
+        Assert.False(sharedHeartbeatStillStale.IsReady);
+        Assert.Contains(sharedHeartbeatStillStale.Checks, item => item.Code == "MEMORY_RETENTION_STALE");
+
+        // 明显超前的数据库时间不能被反复截成“本机现在”，否则争锁失败副本会永久刷新 readiness。
+        var skewedHealth = new MemoryRetentionHealthState(true, clock, TimeSpan.FromMinutes(1));
+        skewedHealth.MarkSuccess(clock.GetUtcNow().AddMinutes(2));
+        var skewed = await new SystemDoctor(ProductionOptions(), clock, skewedHealth).RunAsync();
+        Assert.False(skewed.IsReady);
+        Assert.Contains(skewed.Checks, item => item.Code == "MEMORY_RETENTION_FAILED");
     }
 
     [Fact]
@@ -97,7 +116,8 @@ public sealed class SystemDoctorTests
             EmbeddingProvider = nameof(DeterministicEmbeddingGenerator),
             RerankerProvider = nameof(LexicalEvidenceReranker),
             EmbeddingDimensions = 256,
-            ExpectedEmbeddingDimensions = 1536
+            ExpectedEmbeddingDimensions = 1536,
+            TelemetryExporterConfigured = false
         });
 
         Assert.False(report.IsReady);
@@ -105,6 +125,7 @@ public sealed class SystemDoctorTests
         Assert.Contains(report.Checks, item => item.Code == "EMBEDDING_SANDBOX_PROVIDER");
         Assert.Contains(report.Checks, item => item.Code == "RERANKER_SANDBOX_PROVIDER");
         Assert.Contains(report.Checks, item => item.Code == "EMBEDDING_DIMENSIONS_MISMATCH");
+        Assert.Contains(report.Checks, item => item.Code == "TELEMETRY_EXPORTER_REQUIRED");
     }
 
     [Fact]
@@ -194,6 +215,7 @@ public sealed class SystemDoctorTests
         SqlConnectionConfigured = true,
         SqlEncrypt = true,
         SqlTrustServerCertificate = false,
+        TelemetryExporterConfigured = true,
         RagProvider = "OpenSearch",
         OpenSearchEndpoint = "https://search.internal:9200",
         OpenSearchAuthenticationConfigured = true,
@@ -208,5 +230,11 @@ public sealed class SystemDoctorTests
         AgentResumeLeaseDuration = TimeSpan.FromSeconds(30),
         AgentResumeLeaseRenewalInterval = TimeSpan.FromSeconds(10)
     };
+
+    private sealed class ManualTimeProvider(DateTimeOffset now) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => now;
+        public void Advance(TimeSpan duration) => now += duration;
+    }
 
 }

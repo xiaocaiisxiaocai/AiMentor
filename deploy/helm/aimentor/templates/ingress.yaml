@@ -1,0 +1,33 @@
+{{- if .Values.ingress.enabled }}
+{{- $host := required "启用 Ingress 时 ingress.host 必须设置" .Values.ingress.host }}
+{{- $tlsSecret := required "启用 Ingress 时 ingress.tlsSecretName 必须引用现有 TLS Secret" .Values.ingress.tlsSecretName }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "aimentor.fullname" . }}
+  labels:
+    {{- include "aimentor.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  tls:
+    - hosts:
+        - {{ $host | quote }}
+      secretName: {{ $tlsSecret | quote }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: {{ .Values.ingress.path | quote }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "aimentor.fullname" . }}
+                port:
+                  name: http
+{{- end }}

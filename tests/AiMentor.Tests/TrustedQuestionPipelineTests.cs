@@ -13,6 +13,7 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
     private readonly MarkdownKnowledgeRepository _repository = new(WorkspacePathLocator.FindKnowledgeRoot());
     private readonly DeterministicGroundedChatClient _chatClient = new();
     private RecordingKnowledgeRepository _recordingRepository = null!;
+    private readonly RecordingWorkflowMetrics _workflowMetrics = new();
     private RuleBasedQueryNormalizer _queryNormalizer = null!;
     private TrustedQuestionService _service = null!;
 
@@ -26,7 +27,8 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
             new LexicalEvidenceReranker(), new RuleBasedEvidenceSufficiencyEvaluator(),
             new AgentFrameworkAnswerComposer(_chatClient), new RuleBasedOutputSafetyService(),
             new InMemoryTraceSink(), new TrustedQuestionOptions(), new EmptyMemoryContextProvider(),
-            new RuleBasedCitationMapper(), new RuleBasedCitationVerifier(), new RuleBasedEvidenceConflictDetector());
+            new RuleBasedCitationMapper(), new RuleBasedCitationVerifier(), new RuleBasedEvidenceConflictDetector(),
+            _workflowMetrics);
     }
 
     public Task DisposeAsync() => Task.CompletedTask;
@@ -107,6 +109,7 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
         Assert.Contains("30 分钟", result.Answer, StringComparison.Ordinal);
         Assert.Contains(result.Citations, citation => citation.DocumentId == "BK-POL-002");
         Assert.True(result.EvidenceSufficient);
+        Assert.Equal(("trusted_question", "success"), Assert.Single(_workflowMetrics.Entries));
     }
 
     [Fact]
@@ -130,6 +133,37 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
         Assert.Equal(AnswerDecision.Refused, result.Decision);
         Assert.Equal(expectedCode, result.Safety.Code);
         Assert.Empty(result.Citations);
+        Assert.Equal(("trusted_question", "refused"), Assert.Single(_workflowMetrics.Entries));
+    }
+
+    [Fact]
+    public async Task WorkflowMetricsCoverDependencyFailureBeforeAnswerComposition()
+    {
+        var metrics = new RecordingWorkflowMetrics();
+        var service = new TrustedQuestionService(new ThrowingKnowledgeRepository(), _queryNormalizer,
+            new RuleBasedInputSafetyService(), new RuleBasedRetrievedContentSafetyService(),
+            new LexicalEvidenceReranker(), new RuleBasedEvidenceSufficiencyEvaluator(),
+            new AgentFrameworkAnswerComposer(_chatClient), new RuleBasedOutputSafetyService(),
+            new InMemoryTraceSink(), new TrustedQuestionOptions(), new EmptyMemoryContextProvider(),
+            new RuleBasedCitationMapper(), new RuleBasedCitationVerifier(), new RuleBasedEvidenceConflictDetector(),
+            metrics);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => service.AskAsync(new TrustedQuestion(
+            "Access Token 默认有效多久？", AccessContext.Create("demo-beichen", "test-user", ["all-rnd"]))));
+
+        Assert.Equal(("trusted_question", "failure"), Assert.Single(metrics.Entries));
+
+        var timeoutMetrics = new RecordingWorkflowMetrics();
+        var timeoutService = new TrustedQuestionService(new TimedOutKnowledgeRepository(), _queryNormalizer,
+            new RuleBasedInputSafetyService(), new RuleBasedRetrievedContentSafetyService(),
+            new LexicalEvidenceReranker(), new RuleBasedEvidenceSufficiencyEvaluator(),
+            new AgentFrameworkAnswerComposer(_chatClient), new RuleBasedOutputSafetyService(),
+            new InMemoryTraceSink(), new TrustedQuestionOptions(), new EmptyMemoryContextProvider(),
+            new RuleBasedCitationMapper(), new RuleBasedCitationVerifier(), new RuleBasedEvidenceConflictDetector(),
+            timeoutMetrics);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => timeoutService.AskAsync(new TrustedQuestion(
+            "Access Token 默认有效多久？", AccessContext.Create("demo-beichen", "test-user", ["all-rnd"]))));
+        Assert.Equal(("trusted_question", "failure"), Assert.Single(timeoutMetrics.Entries));
     }
 
     [Fact]
@@ -178,5 +212,35 @@ public sealed class TrustedQuestionPipelineTests : IAsyncLifetime, IDisposable
     {
         _chatClient.Dispose();
         _repository.Dispose();
+    }
+
+    private sealed class RecordingWorkflowMetrics : IWorkflowMetrics
+    {
+        public List<(string Kind, string Outcome)> Entries { get; } = [];
+
+        public void RecordCompleted(string workflowKind, string outcomeClass, TimeSpan duration,
+            IReadOnlyList<TraceStep> trace) => Entries.Add((workflowKind, outcomeClass));
+    }
+
+    private sealed class ThrowingKnowledgeRepository : IKnowledgeRepository
+    {
+        public KnowledgeStatistics Statistics => new(0, 0);
+
+        public Task InitializeAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public Task<IReadOnlyList<Evidence>> SearchAsync(string query, AccessContext access, int limit,
+            CancellationToken cancellationToken = default) =>
+            throw new InvalidOperationException("模拟检索依赖失败。");
+    }
+
+    private sealed class TimedOutKnowledgeRepository : IKnowledgeRepository
+    {
+        public KnowledgeStatistics Statistics => new(0, 0);
+
+        public Task InitializeAsync(CancellationToken cancellationToken = default) => Task.CompletedTask;
+
+        public Task<IReadOnlyList<Evidence>> SearchAsync(string query, AccessContext access, int limit,
+            CancellationToken cancellationToken = default) =>
+            throw new TaskCanceledException("模拟依赖超时，但调用方未取消请求。");
     }
 }

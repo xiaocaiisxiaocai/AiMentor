@@ -15,6 +15,7 @@ public sealed class MemoryRetentionBackgroundService(
     IMemoryRetentionService retentionService,
     MemoryRetentionBackgroundOptions options,
     MemoryRetentionHealthState healthState,
+    TimeProvider timeProvider,
     ILogger<MemoryRetentionBackgroundService> logger) : BackgroundService
 {
     private static readonly Action<ILogger, int, int, Exception?> PurgeCompleted =
@@ -34,10 +35,16 @@ public sealed class MemoryRetentionBackgroundService(
 
     private async Task PurgeOnceAsync(CancellationToken cancellationToken)
     {
+        var startedAt = timeProvider.GetTimestamp();
         try
         {
             var result = await retentionService.PurgeExpiredAsync(options.MaximumRowsPerTable, cancellationToken);
-            healthState.MarkSuccess();
+            // 争锁失败只在读到数据库中真实的成功提交时间后恢复健康，不能用一次空转刷新新鲜度。
+            if (result.LastCompletedAt is { } completedAt)
+                healthState.MarkSuccess(completedAt);
+            AiMentorTelemetry.RecordMemoryRetention(result.LockAcquired ? "completed" : "lock_not_acquired",
+                result.ProposalsDeleted, result.MemoriesDeleted, timeProvider.GetElapsedTime(startedAt),
+                result.LastCompletedAt, result.MonitoringStartedAt);
             if (result.LockAcquired && (result.ProposalsDeleted > 0 || result.MemoriesDeleted > 0))
                 PurgeCompleted(logger, result.ProposalsDeleted, result.MemoriesDeleted, null);
         }
@@ -48,6 +55,7 @@ public sealed class MemoryRetentionBackgroundService(
         catch (Exception exception)
         {
             healthState.MarkFailure();
+            AiMentorTelemetry.RecordMemoryRetention("failed", 0, 0, timeProvider.GetElapsedTime(startedAt));
             PurgeFailed(logger, exception);
         }
     }

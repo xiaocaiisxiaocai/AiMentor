@@ -1,0 +1,183 @@
+{{- if .Values.monitoring.prometheusRule.enabled }}
+{{- $rule := .Values.monitoring.prometheusRule -}}
+{{- $team := required "monitoring.prometheusRule.team 必须设置告警责任团队" $rule.team -}}
+{{- $runbook := required "monitoring.prometheusRule.runbook 必须设置可访问的处置手册地址" $rule.runbook -}}
+{{- $targetJobRegex := required "monitoring.prometheusRule.targetJobRegex 必须设置遥测目标 job 正则" $rule.targetJobRegex -}}
+{{- $collectorJobRegex := required "monitoring.prometheusRule.collectorJobRegex 必须设置 Collector 抓取目标 job 正则" $rule.collectorJobRegex -}}
+{{- $interval := required "monitoring.prometheusRule.evaluationInterval 必须设置规则评估周期" $rule.evaluationInterval -}}
+{{- $failureRatio := required "monitoring.prometheusRule.thresholds.workflowFailureRatio 必须设置" $rule.thresholds.workflowFailureRatio -}}
+{{- $minimumExecutions := required "monitoring.prometheusRule.thresholds.workflowMinimumExecutions 必须设置" $rule.thresholds.workflowMinimumExecutions -}}
+{{- $p95Duration := required "monitoring.prometheusRule.thresholds.workflowP95DurationSeconds 必须设置" $rule.thresholds.workflowP95DurationSeconds -}}
+{{- $heartbeatMaxAge := required "monitoring.prometheusRule.thresholds.telemetryHeartbeatMaxAgeSeconds 必须设置" $rule.thresholds.telemetryHeartbeatMaxAgeSeconds -}}
+{{- $maximumEvaluationAge := required "monitoring.prometheusRule.thresholds.ruleEvaluationMaxAgeSeconds 必须设置" $rule.thresholds.ruleEvaluationMaxAgeSeconds -}}
+{{- $expectedReplicas := int .Values.replicaCount -}}
+{{- if or (le (float64 $failureRatio) 0.0) (ge (float64 $failureRatio) 1.0) -}}
+{{- fail "monitoring.prometheusRule.thresholds.workflowFailureRatio 必须大于 0 且小于 1" -}}
+{{- end -}}
+{{- if lt (int $minimumExecutions) 1 -}}
+{{- fail "monitoring.prometheusRule.thresholds.workflowMinimumExecutions 必须至少为 1" -}}
+{{- end -}}
+{{- if le (float64 $p95Duration) 0.0 -}}
+{{- fail "monitoring.prometheusRule.thresholds.workflowP95DurationSeconds 必须大于 0" -}}
+{{- end -}}
+{{- if lt (int $heartbeatMaxAge) 60 -}}
+{{- fail "monitoring.prometheusRule.thresholds.telemetryHeartbeatMaxAgeSeconds 必须至少为 60" -}}
+{{- end -}}
+{{- if lt (int $maximumEvaluationAge) 60 -}}
+{{- fail "monitoring.prometheusRule.thresholds.ruleEvaluationMaxAgeSeconds 必须至少为 60" -}}
+{{- end -}}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "aimentor.fullname" . }}-slo
+  {{- with $rule.namespace }}
+  namespace: {{ . | quote }}
+  {{- end }}
+  labels:
+    {{- include "aimentor.labels" . | nindent 4 }}
+    app.kubernetes.io/component: observability
+spec:
+  groups:
+    - name: aimentor-slo
+      interval: {{ $interval | quote }}
+      rules:
+        # 只有达到最小样本量才判断失败率，避免低流量下单次失败造成噪声。
+        - alert: AiMentorWorkflowFailureRatioHigh
+          expr: |
+            (
+              sum(rate(aimentor_workflow_executions_total{aimentor_workflow_kind="trusted_question",aimentor_outcome_class="failure"}[5m]))
+              /
+              clamp_min(sum(rate(aimentor_workflow_executions_total{aimentor_workflow_kind="trusted_question",aimentor_outcome_class=~"success|failure"}[5m])), 0.001)
+            ) > {{ $failureRatio }}
+            and
+            sum(increase(aimentor_workflow_executions_total{aimentor_workflow_kind="trusted_question",aimentor_outcome_class=~"success|failure"}[5m])) >= {{ $minimumExecutions }}
+          for: 5m
+          labels:
+            severity: warning
+            team: {{ $team | quote }}
+            runbook: {{ $runbook | quote }}
+          annotations:
+            summary: "AI Mentor 工作流失败率超过 SLO"
+            description: "最近 5 分钟可信问答的服务失败率持续超过 {{ $failureRatio }}，且成功/失败样本数不少于 {{ $minimumExecutions }}；业务拒绝和客户端取消不进入该分母。"
+            runbook_url: {{ $runbook | quote }}
+
+        - alert: AiMentorWorkflowP95DurationHigh
+          expr: |
+            histogram_quantile(
+              0.95,
+              sum by (le) (rate(aimentor_workflow_duration_seconds_bucket{aimentor_workflow_kind="trusted_question",aimentor_outcome_class=~"success|failure"}[10m]))
+            ) > {{ $p95Duration }}
+            and
+            sum(increase(aimentor_workflow_executions_total{aimentor_workflow_kind="trusted_question",aimentor_outcome_class=~"success|failure"}[10m])) >= {{ $minimumExecutions }}
+          for: 10m
+          labels:
+            severity: warning
+            team: {{ $team | quote }}
+            runbook: {{ $runbook | quote }}
+          annotations:
+            summary: "AI Mentor 工作流 P95 延迟超过 SLO"
+            description: "最近 10 分钟工作流 P95 持续时间超过 {{ $p95Duration }} 秒；请按阶段检查模型、检索、工具执行与数据库延迟。"
+            runbook_url: {{ $runbook | quote }}
+
+        - alert: AiMentorMemoryRetentionFailed
+          expr: |
+            sum(increase(aimentor_memory_retention_runs_total{aimentor_result="failed"}[5m])) > 0
+          for: 1m
+          labels:
+            severity: critical
+            team: {{ $team | quote }}
+            runbook: {{ $runbook | quote }}
+          annotations:
+            summary: "AI Mentor 记忆保留期清理失败"
+            description: "最近 5 分钟出现记忆保留期清理失败；应检查 SQL 可用性、应用锁、超时与后台服务日志，禁止通过关闭清理任务恢复绿色。"
+            runbook_url: {{ $runbook | quote }}
+
+        # 共享成功时间可区分“其他副本完成”和持续争锁；首次部署只给一个完整 30 分钟窗口。
+        - alert: AiMentorMemoryRetentionNoCompleted
+          expr: |
+            (
+              max by (job) (aimentor_memory_retention_last_completed_at{job=~{{ $targetJobRegex | quote }}}) > 0
+              and
+              time() - max by (job) (aimentor_memory_retention_last_completed_at{job=~{{ $targetJobRegex | quote }}}) > 1800
+            )
+            or
+            (
+              max by (job) (aimentor_memory_retention_last_completed_at{job=~{{ $targetJobRegex | quote }}}) == 0
+              and
+              max by (job) (aimentor_memory_retention_monitoring_started_at{job=~{{ $targetJobRegex | quote }}}) > 0
+              and
+              time() - max by (job) (aimentor_memory_retention_monitoring_started_at{job=~{{ $targetJobRegex | quote }}}) > 1800
+            )
+            or
+            absent(aimentor_memory_retention_last_completed_at{job=~{{ $targetJobRegex | quote }}}) == 1
+            or
+            absent(aimentor_memory_retention_monitoring_started_at{job=~{{ $targetJobRegex | quote }}}) == 1
+            or
+            max by (job) (aimentor_memory_retention_monitoring_started_at{job=~{{ $targetJobRegex | quote }}}) == 0
+          for: 2m
+          labels:
+            severity: critical
+            team: {{ $team | quote }}
+            runbook: {{ $runbook | quote }}
+          annotations:
+            summary: "AI Mentor 记忆清理 30 分钟没有成功完成"
+            description: "数据库共享的最近清理完成时间已超过 30 分钟、共享监控截止已到仍从未成功，或任一必需新鲜度指标缺失；连续锁竞争不能视为健康。"
+            runbook_url: {{ $runbook | quote }}
+
+        # Gauge 携带应用侧 Unix 秒；即使 Collector 重放缓存值，也会因值不再推进而告警。
+        - alert: AiMentorBusinessTelemetryMissing
+          expr: |
+            absent(aimentor_telemetry_heartbeat{job=~{{ $targetJobRegex | quote }}}) == 1
+            or
+            count(count by (job, instance) (
+              max_over_time(aimentor_telemetry_heartbeat{job=~{{ $targetJobRegex | quote }}}[2m])
+            )) < {{ $expectedReplicas }}
+            or
+            (
+              time()
+              - max by (job, instance) (aimentor_telemetry_heartbeat{job=~{{ $targetJobRegex | quote }}})
+            ) > {{ $heartbeatMaxAge }}
+          for: 1m
+          labels:
+            severity: critical
+            team: {{ $team | quote }}
+            runbook: {{ $runbook | quote }}
+          annotations:
+            summary: "AI Mentor 自定义业务指标缺失或陈旧"
+            description: {{ printf "匹配 job=%s 的业务指标心跳实例少于 %v，或应用侧时间已超过 %v 秒没有推进；应用到 Collector、Collector 到 Prometheus 或名称转换链路至少一处不可用。" $targetJobRegex $expectedReplicas $heartbeatMaxAge | quote }}
+            runbook_url: {{ $runbook | quote }}
+
+        - alert: AiMentorTelemetryTargetMissing
+          expr: |
+            up{job=~{{ $collectorJobRegex | quote }}} == 0
+            or
+            absent(up{job=~{{ $collectorJobRegex | quote }}}) == 1
+          for: 5m
+          labels:
+            severity: critical
+            team: {{ $team | quote }}
+            runbook: {{ $runbook | quote }}
+          annotations:
+            summary: "AI Mentor 遥测目标缺失"
+            description: {{ printf "Prometheus 连续 5 分钟没有发现匹配 job=%s 的 Collector exporter 采集目标；缺失数据不能解释为零失败。" $collectorJobRegex | quote }}
+            runbook_url: {{ $runbook | quote }}
+
+        # Prometheus 自监控指标缺失或长期未更新都意味着本组规则不可被信任。
+        - alert: AiMentorRuleGroupEvaluationMissing
+          expr: |
+            absent(prometheus_rule_group_last_evaluation_timestamp_seconds{rule_group=~".*aimentor-slo.*"}) == 1
+            or
+            (
+              time()
+              - max(prometheus_rule_group_last_evaluation_timestamp_seconds{rule_group=~".*aimentor-slo.*"})
+            ) > {{ $maximumEvaluationAge }}
+          for: 5m
+          labels:
+            severity: critical
+            team: {{ $team | quote }}
+            runbook: {{ $runbook | quote }}
+          annotations:
+            summary: "AI Mentor SLO 规则评估缺失或过期"
+            description: "Prometheus 未暴露本规则组的最近评估时间，或最后评估已超过 {{ $maximumEvaluationAge }} 秒；所有业务 SLO 状态应立即视为未知。"
+            runbook_url: {{ $runbook | quote }}
+{{- end }}

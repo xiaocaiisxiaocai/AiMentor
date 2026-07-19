@@ -1,1 +1,2 @@
 AI-Agent-V1合成数据包/evaluation/*.jsonl text eol=lf
+deploy/sql/*.sql text eol=lf

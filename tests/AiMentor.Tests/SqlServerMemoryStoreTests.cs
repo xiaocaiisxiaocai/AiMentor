@@ -233,13 +233,16 @@ public sealed class SqlServerMemoryStoreTests
             var migration = await File.ReadAllTextAsync(Path.Combine(FindRepositoryRoot(), "deploy", "sql",
                 "012_memory_store.sql"));
             await ExecuteAsync(connectionString, migration);
+            var retentionStateMigration = await File.ReadAllTextAsync(Path.Combine(FindRepositoryRoot(), "deploy",
+                "sql", "014_memory_retention_state.sql"));
+            await ExecuteAsync(connectionString, retentionStateMigration);
             var storeOptions = new SqlServerWorkflowOptions
             { ConnectionString = connectionString, InitializeSchema = false };
             var retentionOptions = new MemoryWorkflowOptions
             { MaximumPendingProposalsPerTenant = 10, RequestCleanupBatchSize = 1 };
             using var store = new SqlServerMemoryStore(storeOptions, new AesGcmMemoryCipher(CipherKey),
                 retentionOptions);
-            var retention = new MemoryRetentionService(store, new FixedTimeProvider(Now.AddMinutes(2)));
+            var retention = new MemoryRetentionService(store);
             var activeTenant = AccessContext.Create("tenant-active", "user-a", []);
             var dormantTenant = AccessContext.Create("tenant-dormant", "user-b", []);
 
@@ -277,6 +280,7 @@ public sealed class SqlServerMemoryStoreTests
                 SELECT COUNT_BIG(1) FROM dbo.AiMentorMemories WHERE TenantId=N'tenant-active';
                 """));
 
+            var monitoringStartedAt = default(DateTimeOffset);
             await using (var lockConnection = new SqlConnection(connectionString))
             {
                 await lockConnection.OpenAsync();
@@ -291,16 +295,24 @@ public sealed class SqlServerMemoryStoreTests
                     """;
                 Assert.True(Convert.ToInt32(await lockCommand.ExecuteScalarAsync(),
                     System.Globalization.CultureInfo.InvariantCulture) >= 0);
-                Assert.False((await retention.PurgeExpiredAsync(1)).LockAcquired);
+                var blocked = await retention.PurgeExpiredAsync(1);
+                Assert.False(blocked.LockAcquired);
+                Assert.Null(blocked.LastCompletedAt);
+                Assert.NotEqual(default, blocked.MonitoringStartedAt);
+                monitoringStartedAt = blocked.MonitoringStartedAt;
                 await lockTransaction.RollbackAsync();
             }
 
             var first = await retention.PurgeExpiredAsync(1);
             Assert.True(first.LockAcquired);
+            Assert.NotNull(first.LastCompletedAt);
+            Assert.Equal(monitoringStartedAt, first.MonitoringStartedAt);
             Assert.Equal(1, first.ProposalsDeleted);
             Assert.Equal(1, first.MemoriesDeleted);
             var second = await retention.PurgeExpiredAsync(1);
             Assert.True(second.LockAcquired);
+            Assert.True(second.LastCompletedAt >= first.LastCompletedAt);
+            Assert.Equal(first.MonitoringStartedAt, second.MonitoringStartedAt);
             Assert.Equal(0, second.ProposalsDeleted);
             Assert.Equal(1, second.MemoriesDeleted);
             Assert.Equal(0L, await ScalarInt64Async(connectionString,
@@ -341,6 +353,9 @@ public sealed class SqlServerMemoryStoreTests
             var migration = await File.ReadAllTextAsync(Path.Combine(FindRepositoryRoot(), "deploy", "sql",
                 "012_memory_store.sql"));
             await ExecuteAsync(connectionString, migration);
+            var retentionStateMigration = await File.ReadAllTextAsync(Path.Combine(FindRepositoryRoot(), "deploy",
+                "sql", "014_memory_retention_state.sql"));
+            await ExecuteAsync(connectionString, retentionStateMigration);
             var v2 = RandomNumberGenerator.GetBytes(32);
             var fingerprintKey = RandomNumberGenerator.GetBytes(32);
             var options = new SqlServerWorkflowOptions
